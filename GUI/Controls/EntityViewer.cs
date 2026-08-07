@@ -93,6 +93,10 @@ namespace GUI.Types.Viewers
             public string Class { get; set; } = string.Empty;
             public string Key { get; set; } = string.Empty;
             public string Value { get; set; } = string.Empty;
+            public string Output { get; set; } = string.Empty;
+            public string Target { get; set; } = string.Empty;
+            public string Input { get; set; } = string.Empty;
+            public string Parameter { get; set; } = string.Empty;
         }
 
         internal EntityViewer(VrfGuiContext guiContext, List<Entity> entities, Action<Entity>? selectAndFocusEntity = null)
@@ -208,6 +212,12 @@ namespace GUI.Types.Viewers
                     }
                 }
 
+                // search by entity I/O
+                if (!MatchesEntityIo(entity))
+                {
+                    continue;
+                }
+
                 var targetname = entity.GetStringProperty("targetname", string.Empty);
                 filteredEntities.Add((entity, classname, targetname));
             }
@@ -264,6 +274,18 @@ namespace GUI.Types.Viewers
 
             return false;
         }
+
+        private bool MatchesEntityIo(Entity entity)
+        {
+            return entity.Connections?.Any(connection =>
+                MatchesFilter(connection.GetStringProperty("m_outputName"), SearchData.Output)
+                && MatchesFilter(connection.GetStringProperty("m_targetName"), SearchData.Target)
+                && MatchesFilter(connection.GetStringProperty("m_inputName"), SearchData.Input)
+                && MatchesFilter(connection.GetStringProperty("m_overrideParam"), SearchData.Parameter)) == true;
+        }
+
+        private static bool MatchesFilter(string value, string filter)
+            => string.IsNullOrEmpty(filter) || value.Contains(filter, StringComparison.OrdinalIgnoreCase);
 
         private bool ContainsValue(Entity entity, string value)
         {
@@ -368,6 +390,30 @@ namespace GUI.Types.Viewers
 
         private void KeyValue_MatchWholeValue_CheckedChanged(object sender, EventArgs e)
         {
+            UpdateGrid();
+        }
+
+        private void EntityIo_Output_TextChanged(object sender, EventArgs e)
+        {
+            SearchData.Output = ((TextBox)sender).Text;
+            UpdateGrid();
+        }
+
+        private void EntityIo_Target_TextChanged(object sender, EventArgs e)
+        {
+            SearchData.Target = ((TextBox)sender).Text;
+            UpdateGrid();
+        }
+
+        private void EntityIo_Input_TextChanged(object sender, EventArgs e)
+        {
+            SearchData.Input = ((TextBox)sender).Text;
+            UpdateGrid();
+        }
+
+        private void EntityIo_Parameter_TextChanged(object sender, EventArgs e)
+        {
+            SearchData.Parameter = ((TextBox)sender).Text;
             UpdateGrid();
         }
 

@@ -51,6 +51,16 @@ partial class EntityViewer
         KeyValue_MatchWholeValue = new System.Windows.Forms.CheckBox();
         label1 = new System.Windows.Forms.Label();
         label3 = new System.Windows.Forms.Label();
+        groupBoxEntityIo = new ThemedGroupBox();
+        tableLayoutPanelEntityIo = new System.Windows.Forms.TableLayoutPanel();
+        EntityIo_Output = new ThemedTextBox();
+        EntityIo_Target = new ThemedTextBox();
+        EntityIo_Input = new ThemedTextBox();
+        EntityIo_Parameter = new ThemedTextBox();
+        labelEntityIoOutput = new System.Windows.Forms.Label();
+        labelEntityIoTarget = new System.Windows.Forms.Label();
+        labelEntityIoInput = new System.Windows.Forms.Label();
+        labelEntityIoParameter = new System.Windows.Forms.Label();
         groupBox2 = new ThemedGroupBox();
         tableLayoutPanelObjects = new System.Windows.Forms.TableLayoutPanel();
         ObjectsToInclude_Everything = new System.Windows.Forms.RadioButton();
@@ -67,6 +77,8 @@ partial class EntityViewer
         tableLayoutPanelKeysContainers.SuspendLayout();
         groupBox3.SuspendLayout();
         tableLayoutPanelKeys.SuspendLayout();
+        groupBoxEntityIo.SuspendLayout();
+        tableLayoutPanelEntityIo.SuspendLayout();
         groupBox2.SuspendLayout();
         tableLayoutPanelObjects.SuspendLayout();
         EntityPropertiesGroup.SuspendLayout();
@@ -87,8 +99,8 @@ partial class EntityViewer
         tableLayoutPanelLeft.Margin = new System.Windows.Forms.Padding(0);
         tableLayoutPanelLeft.Name = "tableLayoutPanelLeft";
         tableLayoutPanelLeft.RowCount = 2;
-        tableLayoutPanelLeft.RowStyles.Add(new System.Windows.Forms.RowStyle(System.Windows.Forms.SizeType.Percent, 75F));
-        tableLayoutPanelLeft.RowStyles.Add(new System.Windows.Forms.RowStyle(System.Windows.Forms.SizeType.Percent, 25F));
+        tableLayoutPanelLeft.RowStyles.Add(new System.Windows.Forms.RowStyle(System.Windows.Forms.SizeType.Percent, 70F));
+        tableLayoutPanelLeft.RowStyles.Add(new System.Windows.Forms.RowStyle(System.Windows.Forms.SizeType.Percent, 30F));
         tableLayoutPanelLeft.Size = new System.Drawing.Size(512, 733);
         tableLayoutPanelLeft.TabIndex = 1;
         // 
@@ -105,7 +117,7 @@ partial class EntityViewer
         groupBox5.Location = new System.Drawing.Point(0, 0);
         groupBox5.Margin = new System.Windows.Forms.Padding(0);
         groupBox5.Name = "groupBox5";
-        groupBox5.Size = new System.Drawing.Size(512, 549);
+        groupBox5.Size = new System.Drawing.Size(512, 513);
         groupBox5.TabIndex = 3;
         groupBox5.TabStop = false;
         groupBox5.Text = "Entity List";
@@ -117,7 +129,7 @@ partial class EntityViewer
         EntityViewerGrid.FullRowSelect = true;
         EntityViewerGrid.Location = new System.Drawing.Point(3, 19);
         EntityViewerGrid.Name = "EntityViewerGrid";
-        EntityViewerGrid.Size = new System.Drawing.Size(506, 527);
+        EntityViewerGrid.Size = new System.Drawing.Size(506, 491);
         EntityViewerGrid.TabIndex = 0;
         EntityViewerGrid.UseCompatibleStateImageBehavior = false;
         EntityViewerGrid.View = System.Windows.Forms.View.Details;
@@ -145,13 +157,13 @@ partial class EntityViewer
         tableLayoutPanelFiltersContainer.Controls.Add(tableLayoutPanelKeysContainers, 1, 0);
         tableLayoutPanelFiltersContainer.Controls.Add(groupBox2, 0, 0);
         tableLayoutPanelFiltersContainer.Dock = System.Windows.Forms.DockStyle.Fill;
-        tableLayoutPanelFiltersContainer.Location = new System.Drawing.Point(0, 549);
+        tableLayoutPanelFiltersContainer.Location = new System.Drawing.Point(0, 513);
         tableLayoutPanelFiltersContainer.Margin = new System.Windows.Forms.Padding(0);
         tableLayoutPanelFiltersContainer.Name = "tableLayoutPanelFiltersContainer";
         tableLayoutPanelFiltersContainer.RowCount = 1;
         tableLayoutPanelFiltersContainer.RowStyles.Add(new System.Windows.Forms.RowStyle(System.Windows.Forms.SizeType.Percent, 100F));
-        tableLayoutPanelFiltersContainer.RowStyles.Add(new System.Windows.Forms.RowStyle(System.Windows.Forms.SizeType.Absolute, 184F));
-        tableLayoutPanelFiltersContainer.Size = new System.Drawing.Size(512, 184);
+        tableLayoutPanelFiltersContainer.RowStyles.Add(new System.Windows.Forms.RowStyle(System.Windows.Forms.SizeType.Absolute, 220F));
+        tableLayoutPanelFiltersContainer.Size = new System.Drawing.Size(512, 220);
         tableLayoutPanelFiltersContainer.TabIndex = 0;
         // 
         // tableLayoutPanelKeysContainers
@@ -159,15 +171,15 @@ partial class EntityViewer
         tableLayoutPanelKeysContainers.ColumnCount = 1;
         tableLayoutPanelKeysContainers.ColumnStyles.Add(new System.Windows.Forms.ColumnStyle(System.Windows.Forms.SizeType.Percent, 100F));
         tableLayoutPanelKeysContainers.Controls.Add(groupBox3, 0, 0);
+        tableLayoutPanelKeysContainers.Controls.Add(groupBoxEntityIo, 0, 1);
         tableLayoutPanelKeysContainers.Dock = System.Windows.Forms.DockStyle.Fill;
         tableLayoutPanelKeysContainers.Location = new System.Drawing.Point(256, 0);
         tableLayoutPanelKeysContainers.Margin = new System.Windows.Forms.Padding(0);
         tableLayoutPanelKeysContainers.Name = "tableLayoutPanelKeysContainers";
-        tableLayoutPanelKeysContainers.RowCount = 1;
-        tableLayoutPanelKeysContainers.RowStyles.Add(new System.Windows.Forms.RowStyle());
-        tableLayoutPanelKeysContainers.RowStyles.Add(new System.Windows.Forms.RowStyle(System.Windows.Forms.SizeType.Absolute, 184F));
-        tableLayoutPanelKeysContainers.RowStyles.Add(new System.Windows.Forms.RowStyle(System.Windows.Forms.SizeType.Absolute, 184F));
-        tableLayoutPanelKeysContainers.Size = new System.Drawing.Size(256, 184);
+        tableLayoutPanelKeysContainers.RowCount = 2;
+        tableLayoutPanelKeysContainers.RowStyles.Add(new System.Windows.Forms.RowStyle(System.Windows.Forms.SizeType.Percent, 55F));
+        tableLayoutPanelKeysContainers.RowStyles.Add(new System.Windows.Forms.RowStyle(System.Windows.Forms.SizeType.Percent, 45F));
+        tableLayoutPanelKeysContainers.Size = new System.Drawing.Size(256, 220);
         tableLayoutPanelKeysContainers.TabIndex = 0;
         // 
         // groupBox3
@@ -182,7 +194,7 @@ partial class EntityViewer
         groupBox3.ForeColor = System.Drawing.Color.Black;
         groupBox3.Location = new System.Drawing.Point(3, 3);
         groupBox3.Name = "groupBox3";
-        groupBox3.Size = new System.Drawing.Size(250, 178);
+        groupBox3.Size = new System.Drawing.Size(250, 115);
         groupBox3.TabIndex = 1;
         groupBox3.TabStop = false;
         groupBox3.Text = "Key / Value";
@@ -205,7 +217,7 @@ partial class EntityViewer
         tableLayoutPanelKeys.RowStyles.Add(new System.Windows.Forms.RowStyle());
         tableLayoutPanelKeys.RowStyles.Add(new System.Windows.Forms.RowStyle());
         tableLayoutPanelKeys.RowStyles.Add(new System.Windows.Forms.RowStyle());
-        tableLayoutPanelKeys.Size = new System.Drawing.Size(244, 156);
+        tableLayoutPanelKeys.Size = new System.Drawing.Size(244, 93);
         tableLayoutPanelKeys.TabIndex = 0;
         // 
         // KeyValue_Key
@@ -267,6 +279,140 @@ partial class EntityViewer
         label3.TabIndex = 4;
         label3.Text = "Value";
         label3.TextAlign = System.Drawing.ContentAlignment.MiddleLeft;
+        //
+        // groupBoxEntityIo
+        //
+        groupBoxEntityIo.BackColor = System.Drawing.SystemColors.Control;
+        groupBoxEntityIo.BorderColor = System.Drawing.Color.FromArgb(188, 188, 188);
+        groupBoxEntityIo.BorderWidth = 2;
+        groupBoxEntityIo.Controls.Add(tableLayoutPanelEntityIo);
+        groupBoxEntityIo.CornerRadius = 5;
+        groupBoxEntityIo.Dock = System.Windows.Forms.DockStyle.Fill;
+        groupBoxEntityIo.FlatStyle = System.Windows.Forms.FlatStyle.Flat;
+        groupBoxEntityIo.ForeColor = System.Drawing.Color.Black;
+        groupBoxEntityIo.Location = new System.Drawing.Point(3, 124);
+        groupBoxEntityIo.Name = "groupBoxEntityIo";
+        groupBoxEntityIo.Size = new System.Drawing.Size(250, 93);
+        groupBoxEntityIo.TabIndex = 2;
+        groupBoxEntityIo.TabStop = false;
+        groupBoxEntityIo.Text = "Entity I/O";
+        //
+        // tableLayoutPanelEntityIo
+        //
+        tableLayoutPanelEntityIo.ColumnCount = 4;
+        tableLayoutPanelEntityIo.ColumnStyles.Add(new System.Windows.Forms.ColumnStyle());
+        tableLayoutPanelEntityIo.ColumnStyles.Add(new System.Windows.Forms.ColumnStyle(System.Windows.Forms.SizeType.Percent, 50F));
+        tableLayoutPanelEntityIo.ColumnStyles.Add(new System.Windows.Forms.ColumnStyle());
+        tableLayoutPanelEntityIo.ColumnStyles.Add(new System.Windows.Forms.ColumnStyle(System.Windows.Forms.SizeType.Percent, 50F));
+        tableLayoutPanelEntityIo.Controls.Add(labelEntityIoOutput, 0, 0);
+        tableLayoutPanelEntityIo.Controls.Add(EntityIo_Output, 1, 0);
+        tableLayoutPanelEntityIo.Controls.Add(labelEntityIoTarget, 2, 0);
+        tableLayoutPanelEntityIo.Controls.Add(EntityIo_Target, 3, 0);
+        tableLayoutPanelEntityIo.Controls.Add(labelEntityIoInput, 0, 1);
+        tableLayoutPanelEntityIo.Controls.Add(EntityIo_Input, 1, 1);
+        tableLayoutPanelEntityIo.Controls.Add(labelEntityIoParameter, 2, 1);
+        tableLayoutPanelEntityIo.Controls.Add(EntityIo_Parameter, 3, 1);
+        tableLayoutPanelEntityIo.Dock = System.Windows.Forms.DockStyle.Fill;
+        tableLayoutPanelEntityIo.Location = new System.Drawing.Point(3, 19);
+        tableLayoutPanelEntityIo.Name = "tableLayoutPanelEntityIo";
+        tableLayoutPanelEntityIo.RowCount = 3;
+        tableLayoutPanelEntityIo.RowStyles.Add(new System.Windows.Forms.RowStyle());
+        tableLayoutPanelEntityIo.RowStyles.Add(new System.Windows.Forms.RowStyle());
+        tableLayoutPanelEntityIo.RowStyles.Add(new System.Windows.Forms.RowStyle());
+        tableLayoutPanelEntityIo.Size = new System.Drawing.Size(244, 71);
+        tableLayoutPanelEntityIo.TabIndex = 0;
+        //
+        // EntityIo_Output
+        //
+        EntityIo_Output.BackColor = System.Drawing.Color.FromArgb(236, 236, 236);
+        EntityIo_Output.Dock = System.Windows.Forms.DockStyle.Fill;
+        EntityIo_Output.ForeColor = System.Drawing.Color.Black;
+        EntityIo_Output.Location = new System.Drawing.Point(45, 3);
+        EntityIo_Output.Margin = new System.Windows.Forms.Padding(0, 3, 3, 3);
+        EntityIo_Output.Name = "EntityIo_Output";
+        EntityIo_Output.Size = new System.Drawing.Size(72, 23);
+        EntityIo_Output.TabIndex = 0;
+        EntityIo_Output.TextChanged += EntityIo_Output_TextChanged;
+        //
+        // EntityIo_Target
+        //
+        EntityIo_Target.BackColor = System.Drawing.Color.FromArgb(236, 236, 236);
+        EntityIo_Target.Dock = System.Windows.Forms.DockStyle.Fill;
+        EntityIo_Target.ForeColor = System.Drawing.Color.Black;
+        EntityIo_Target.Location = new System.Drawing.Point(164, 3);
+        EntityIo_Target.Margin = new System.Windows.Forms.Padding(0, 3, 0, 3);
+        EntityIo_Target.Name = "EntityIo_Target";
+        EntityIo_Target.Size = new System.Drawing.Size(80, 23);
+        EntityIo_Target.TabIndex = 1;
+        EntityIo_Target.TextChanged += EntityIo_Target_TextChanged;
+        //
+        // EntityIo_Input
+        //
+        EntityIo_Input.BackColor = System.Drawing.Color.FromArgb(236, 236, 236);
+        EntityIo_Input.Dock = System.Windows.Forms.DockStyle.Fill;
+        EntityIo_Input.ForeColor = System.Drawing.Color.Black;
+        EntityIo_Input.Location = new System.Drawing.Point(45, 32);
+        EntityIo_Input.Margin = new System.Windows.Forms.Padding(0, 3, 3, 3);
+        EntityIo_Input.Name = "EntityIo_Input";
+        EntityIo_Input.Size = new System.Drawing.Size(72, 23);
+        EntityIo_Input.TabIndex = 2;
+        EntityIo_Input.TextChanged += EntityIo_Input_TextChanged;
+        //
+        // EntityIo_Parameter
+        //
+        EntityIo_Parameter.BackColor = System.Drawing.Color.FromArgb(236, 236, 236);
+        EntityIo_Parameter.Dock = System.Windows.Forms.DockStyle.Fill;
+        EntityIo_Parameter.ForeColor = System.Drawing.Color.Black;
+        EntityIo_Parameter.Location = new System.Drawing.Point(164, 32);
+        EntityIo_Parameter.Margin = new System.Windows.Forms.Padding(0, 3, 0, 3);
+        EntityIo_Parameter.Name = "EntityIo_Parameter";
+        EntityIo_Parameter.Size = new System.Drawing.Size(80, 23);
+        EntityIo_Parameter.TabIndex = 3;
+        EntityIo_Parameter.TextChanged += EntityIo_Parameter_TextChanged;
+        //
+        // labelEntityIoOutput
+        //
+        labelEntityIoOutput.AutoSize = true;
+        labelEntityIoOutput.Dock = System.Windows.Forms.DockStyle.Fill;
+        labelEntityIoOutput.Location = new System.Drawing.Point(3, 0);
+        labelEntityIoOutput.Name = "labelEntityIoOutput";
+        labelEntityIoOutput.Size = new System.Drawing.Size(39, 29);
+        labelEntityIoOutput.TabIndex = 4;
+        labelEntityIoOutput.Text = "Output";
+        labelEntityIoOutput.TextAlign = System.Drawing.ContentAlignment.MiddleLeft;
+        //
+        // labelEntityIoTarget
+        //
+        labelEntityIoTarget.AutoSize = true;
+        labelEntityIoTarget.Dock = System.Windows.Forms.DockStyle.Fill;
+        labelEntityIoTarget.Location = new System.Drawing.Point(123, 0);
+        labelEntityIoTarget.Name = "labelEntityIoTarget";
+        labelEntityIoTarget.Size = new System.Drawing.Size(38, 29);
+        labelEntityIoTarget.TabIndex = 5;
+        labelEntityIoTarget.Text = "Target";
+        labelEntityIoTarget.TextAlign = System.Drawing.ContentAlignment.MiddleLeft;
+        //
+        // labelEntityIoInput
+        //
+        labelEntityIoInput.AutoSize = true;
+        labelEntityIoInput.Dock = System.Windows.Forms.DockStyle.Fill;
+        labelEntityIoInput.Location = new System.Drawing.Point(3, 29);
+        labelEntityIoInput.Name = "labelEntityIoInput";
+        labelEntityIoInput.Size = new System.Drawing.Size(39, 29);
+        labelEntityIoInput.TabIndex = 6;
+        labelEntityIoInput.Text = "Input";
+        labelEntityIoInput.TextAlign = System.Drawing.ContentAlignment.MiddleLeft;
+        //
+        // labelEntityIoParameter
+        //
+        labelEntityIoParameter.AutoSize = true;
+        labelEntityIoParameter.Dock = System.Windows.Forms.DockStyle.Fill;
+        labelEntityIoParameter.Location = new System.Drawing.Point(123, 29);
+        labelEntityIoParameter.Name = "labelEntityIoParameter";
+        labelEntityIoParameter.Size = new System.Drawing.Size(38, 29);
+        labelEntityIoParameter.TabIndex = 7;
+        labelEntityIoParameter.Text = "Param";
+        labelEntityIoParameter.TextAlign = System.Drawing.ContentAlignment.MiddleLeft;
         // 
         // groupBox2
         // 
@@ -280,7 +426,7 @@ partial class EntityViewer
         groupBox2.ForeColor = System.Drawing.Color.Black;
         groupBox2.Location = new System.Drawing.Point(3, 3);
         groupBox2.Name = "groupBox2";
-        groupBox2.Size = new System.Drawing.Size(250, 178);
+        groupBox2.Size = new System.Drawing.Size(250, 214);
         groupBox2.TabIndex = 0;
         groupBox2.TabStop = false;
         groupBox2.Text = "Objects To Include";
@@ -303,7 +449,7 @@ partial class EntityViewer
         tableLayoutPanelObjects.RowStyles.Add(new System.Windows.Forms.RowStyle(System.Windows.Forms.SizeType.Percent, 20F));
         tableLayoutPanelObjects.RowStyles.Add(new System.Windows.Forms.RowStyle(System.Windows.Forms.SizeType.Percent, 20F));
         tableLayoutPanelObjects.RowStyles.Add(new System.Windows.Forms.RowStyle(System.Windows.Forms.SizeType.Percent, 20F));
-        tableLayoutPanelObjects.Size = new System.Drawing.Size(244, 156);
+        tableLayoutPanelObjects.Size = new System.Drawing.Size(244, 192);
         tableLayoutPanelObjects.TabIndex = 0;
         // 
         // ObjectsToInclude_Everything
@@ -425,6 +571,9 @@ partial class EntityViewer
         groupBox3.ResumeLayout(false);
         tableLayoutPanelKeys.ResumeLayout(false);
         tableLayoutPanelKeys.PerformLayout();
+        groupBoxEntityIo.ResumeLayout(false);
+        tableLayoutPanelEntityIo.ResumeLayout(false);
+        tableLayoutPanelEntityIo.PerformLayout();
         groupBox2.ResumeLayout(false);
         tableLayoutPanelObjects.ResumeLayout(false);
         tableLayoutPanelObjects.PerformLayout();
@@ -453,6 +602,16 @@ partial class EntityViewer
     private System.Windows.Forms.CheckBox KeyValue_MatchWholeValue;
     private System.Windows.Forms.Label label1;
     private System.Windows.Forms.Label label3;
+    private ThemedGroupBox groupBoxEntityIo;
+    private System.Windows.Forms.TableLayoutPanel tableLayoutPanelEntityIo;
+    private ThemedTextBox EntityIo_Output;
+    private ThemedTextBox EntityIo_Target;
+    private ThemedTextBox EntityIo_Input;
+    private ThemedTextBox EntityIo_Parameter;
+    private System.Windows.Forms.Label labelEntityIoOutput;
+    private System.Windows.Forms.Label labelEntityIoTarget;
+    private System.Windows.Forms.Label labelEntityIoInput;
+    private System.Windows.Forms.Label labelEntityIoParameter;
     private System.Windows.Forms.SplitContainer splitContainer;
     private ThemedGroupBox groupBox2;
     private ThemedGroupBox groupBox3;
