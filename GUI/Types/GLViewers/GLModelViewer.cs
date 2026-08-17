@@ -25,6 +25,7 @@ namespace GUI.Types.GLViewers
         public ComboBox? animationComboBox { get; protected set; }
         protected CheckBox? animationPlayPause;
         private CheckBox? rootMotionCheckBox;
+        private CheckBox? additiveCheckBox;
         private CheckBox? showSkeletonCheckbox;
         private CheckBox? showParticlesCheckbox;
         private ComboBox? hitboxComboBox;
@@ -35,8 +36,8 @@ namespace GUI.Types.GLViewers
         public ComboBox? materialGroupListBox { get; private set; }
         private ComboBox? lodComboBox;
         private bool hasSelectableLods;
-        private bool modelStatsShown;
         private bool modelStatsDirty;
+        private bool modelStatsPosted;
         private int statsLod = -1;
         private ModelSceneNode? modelSceneNode;
         protected AnimationController? animationController;
@@ -75,17 +76,16 @@ namespace GUI.Types.GLViewers
             lodComboBox?.Dispose();
             physicsGroupsComboBox?.Dispose();
             rootMotionCheckBox?.Dispose();
+            additiveCheckBox?.Dispose();
             showSkeletonCheckbox?.Dispose();
             showParticlesCheckbox?.Dispose();
             hitboxComboBox?.Dispose();
         }
 
-        protected void AddAnimationControls()
+        private void AddAnimationListComboBox()
         {
             Debug.Assert(UiControl != null);
             Debug.Assert(animationController != null);
-
-            using var _ = UiControl.BeginGroup("Animation");
 
             animationComboBox = UiControl.AddSelection("Animation", (animation, i) =>
             {
@@ -101,7 +101,6 @@ namespace GUI.Types.GLViewers
                     return;
                 }
 
-                // Check if this is a header item (ThemedComboBoxItem with IsHeader = true)
                 if (animationComboBox!.Items[i] is ThemedComboBoxItem item && item.IsHeader)
                 {
                     // Skip header selection and jump to adjacent non-header item
@@ -124,9 +123,21 @@ namespace GUI.Types.GLViewers
                     }
                 }
 
-                rootMotionCheckBox!.Enabled = animationController.ActiveAnimation?.HasMovementData() ?? false;
-                enableRootMotion = rootMotionCheckBox.Enabled && rootMotionCheckBox.Checked;
+                SyncAnimationToggles();
             });
+        }
+
+        protected void AddAnimationControls(bool includeAnimationList = true)
+        {
+            Debug.Assert(UiControl != null);
+            Debug.Assert(animationController != null);
+
+            using var _ = UiControl.BeginGroup("Animation");
+
+            if (includeAnimationList)
+            {
+                AddAnimationListComboBox();
+            }
 
             animationTimeLabel = new Label()
             {
@@ -143,9 +154,9 @@ namespace GUI.Types.GLViewers
             });
             animationTrackBar = UiControl.AddTrackBar(frame =>
             {
-                if (animationController != null && animationController.ActiveAnimation != null)
+                if (animationController?.ActiveAnimation is { CycleFrames: > 0 } animation)
                 {
-                    animationController.Frame = (int)(frame * animationController.ActiveAnimation.FrameCount);
+                    animationController.Frame = (int)MathF.Round(frame * animation.CycleFrames);
                 }
             });
 
@@ -173,12 +184,39 @@ namespace GUI.Types.GLViewers
             rootMotionCheckBox = UiControl.AddCheckBox("Show Root Motion", enableRootMotion, (isChecked) =>
             {
                 enableRootMotion = isChecked;
-                Debug.Assert(modelSceneNode != null);
-                LastRootMotionPosition = modelSceneNode.Transform.Translation;
+                rootMotionResetPending = true;
             });
 
             rootMotionCheckBox.Checked = false;
             rootMotionCheckBox.Enabled = false;
+
+            additiveCheckBox = UiControl.AddCheckBox("Additive (over bind pose)", false, isChecked =>
+            {
+                animationController.ApplyAdditive = isChecked;
+            });
+
+            additiveCheckBox.Enabled = false;
+        }
+
+        /// <summary>
+        /// Syncs the root motion and additive toggles to the active animation: root motion defaults
+        /// on for animations that carry it, the additive checkbox mirrors the player state.
+        /// </summary>
+        protected void SyncAnimationToggles()
+        {
+            Debug.Assert(animationController != null);
+
+            var activeAnimation = animationController.ActiveAnimation;
+            var hasRootMotion = activeAnimation?.HasMovementData() ?? false;
+            rootMotionCheckBox!.Enabled = hasRootMotion;
+            rootMotionCheckBox.Checked = hasRootMotion;
+            enableRootMotion = hasRootMotion;
+
+            rootMotionResetPending = true;
+
+            additiveCheckBox!.Enabled = activeAnimation is not null
+                && (activeAnimation is not ClipAnimation || activeAnimation.IsAdditive);
+            additiveCheckBox.Checked = animationController.ApplyAdditive;
         }
 
         protected override void LoadScene()
@@ -488,10 +526,10 @@ namespace GUI.Types.GLViewers
 
                     frame = 0;
                 }
-                else if (animation != null && animationPlayPause.Checked && (int)(animationTrackBar.Slider.Value / animation.FrameCount) != frame)
+                else if (animation is { CycleFrames: > 0 } && animationPlayPause.Checked
+                    && (int)MathF.Round(animationTrackBar.Slider.Value * animation.CycleFrames) != frame)
                 {
-                    animationTrackBar.Slider.Value = (float)frame / animation.FrameCount;
-
+                    animationTrackBar.Slider.Value = (float)frame / animation.CycleFrames;
                 }
 
                 if (animationController.ActiveAnimation == null)
@@ -500,20 +538,17 @@ namespace GUI.Types.GLViewers
                     return;
                 }
 
-                var frameCount = animationController.ActiveAnimation.FrameCount;
-                var fps = animationController.ActiveAnimation.Fps;
-                var totalTime = frameCount / fps;
-                var time = animationController.Time % totalTime;
+                var activeAnimation = animationController.ActiveAnimation;
+                var frameCount = activeAnimation.FrameCount;
+                var fps = activeAnimation.Fps;
+                var totalTime = activeAnimation.Duration;
+                var (cycle, _, _) = activeAnimation.GetCyclePosition(animationController.Time);
+                var time = animationController.Time - cycle * totalTime;
                 var frameNumber = animationController.Frame + 1;
-
-                var additive = animationController.ActiveAnimation.IsAdditive
-                    ? "Additive: true\n"
-                    : string.Empty;
 
                 animationTimeLabel.Text = $"Frame: {frameNumber,4} / {frameCount}\n" +
                     $"Time: {time:F2} / {totalTime:F2}\n" +
-                    $"FPS: {fps:F2}\n" +
-                    additive;
+                    $"FPS: {fps:F2}\n";
             }
 
             void UpdateUiAnimationState(Animation? animation, int frame)
@@ -617,7 +652,13 @@ namespace GUI.Types.GLViewers
             SkyboxScene?.UpdateOctrees();
         }
 
-        private Vector3 LastRootMotionPosition;
+        private Matrix4x4 rootMotionBase = Matrix4x4.Identity;
+        private Matrix4x4 rootMotionTotal = Matrix4x4.Identity;
+
+        private Vector3 rootMotionCameraOffset;
+
+        private bool rootMotionLatched;
+        private bool rootMotionResetPending;
         private bool enableRootMotion;
 
         /// <summary>
@@ -645,35 +686,150 @@ namespace GUI.Types.GLViewers
                 : $"LOD {level} ({minText}+)";
         }
 
-        protected override void OnPaint(float frameTime)
+        /// <summary>
+        /// Walks the model and the camera along the root motion the player advanced through since the last
+        /// frame. The player unrolls looping, and reports no motion when playback did not advance.
+        /// </summary>
+        private void UpdateRootMotion()
         {
-            if (enableRootMotion && animationController != null && animationController.AnimationFrame is Frame animationFrame && modelSceneNode != null)
+            if (!enableRootMotion || animationController == null)
             {
-                var rootMotionDelta = animationFrame.Movement.Position - LastRootMotionPosition;
-
-                modelSceneNode.Transform = modelSceneNode.Transform with
-                {
-                    Translation = modelSceneNode.Transform.Translation + rootMotionDelta,
-                };
-
-                Input.Camera.Location += rootMotionDelta;
-                LastRootMotionPosition = animationFrame.Movement.Position;
+                return;
             }
 
-            // The stats overlay reflects whatever meshes are currently drawn, so it only needs rebuilding
-            // when that set changes (a LoD switch, or a mesh/material group change), not every frame.
-            if (modelStatsShown && modelSceneNode != null && SelectedNodeRenderer != null)
+            var delta = animationController.ConsumeRootMotionDelta();
+
+            if (delta.IsIdentity)
             {
-                if (modelSceneNode.ActiveLod != statsLod)
+                return;
+            }
+
+            if (!rootMotionLatched)
+            {
+                rootMotionBase = modelSceneNode?.Transform ?? skeletonSceneNode?.Transform ?? Matrix4x4.Identity;
+                rootMotionTotal = Matrix4x4.Identity;
+                rootMotionCameraOffset = Vector3.Zero;
+                rootMotionLatched = true;
+            }
+
+            var previousTranslation = (rootMotionTotal * rootMotionBase).Translation;
+
+            rootMotionTotal *= delta;
+
+            var transform = rootMotionTotal * rootMotionBase;
+
+            MoveRootMotionCamera(transform.Translation - previousTranslation);
+            SetRootMotionTransform(transform);
+        }
+
+        /// <summary>
+        /// Returns the model and the camera to where root motion picked them up.
+        /// </summary>
+        private void ResetRootMotion()
+        {
+            if (rootMotionLatched)
+            {
+                SetRootMotionTransform(rootMotionBase);
+                MoveRootMotionCamera(-rootMotionCameraOffset);
+            }
+
+            // Discard motion banked up while nothing was consuming it.
+            animationController?.ConsumeRootMotionDelta();
+
+            rootMotionTotal = Matrix4x4.Identity;
+            rootMotionCameraOffset = Vector3.Zero;
+            rootMotionLatched = false;
+        }
+
+        /// <summary>
+        /// Places the animated nodes at <paramref name="transform"/>, keeping the dynamic octree in step.
+        /// </summary>
+        private void SetRootMotionTransform(Matrix4x4 transform)
+        {
+            static void Move(SceneNode? node, Matrix4x4 transform)
+            {
+                if (node == null)
                 {
-                    statsLod = modelSceneNode.ActiveLod;
-                    modelStatsDirty = true;
+                    return;
                 }
 
-                if (modelStatsDirty)
+                var oldBounds = node.BoundingBox;
+                node.Transform = transform;
+
+                if (node.LayerEnabled)
                 {
-                    SelectedNodeRenderer.ScreenDebugText = GetModelStatsText();
-                    modelStatsDirty = false;
+                    node.Scene.DynamicOctree.Update(node, oldBounds);
+                }
+            }
+
+            Move(modelSceneNode, transform);
+            Move(skeletonSceneNode, transform);
+        }
+
+        /// <summary>
+        /// Carries the camera along with the model, keeping any orbit anchor pinned to it.
+        /// </summary>
+        private void MoveRootMotionCamera(Vector3 delta)
+        {
+            Input.Camera.Location += delta;
+
+            if (Input.OrbitTarget is Vector3 orbitTarget)
+            {
+                Input.OrbitTarget = orbitTarget + delta;
+            }
+
+            // The input tick is skipped while the cursor is over the side panel, and it is what commits the camera.
+            Input.ForceUpdate = true;
+
+            rootMotionCameraOffset += delta;
+        }
+
+        /// <summary>
+        /// Placed ahead of the input tick, which commits the camera. Any later and the model would move this
+        /// frame but the camera only on the next one.
+        /// </summary>
+        protected override void OnUpdate(float frameTime)
+        {
+            if (rootMotionResetPending)
+            {
+                rootMotionResetPending = false;
+                ResetRootMotion();
+            }
+
+            UpdateRootMotion();
+
+            base.OnUpdate(frameTime);
+        }
+
+        protected override void OnPaint(float frameTime)
+        {
+            // The stats overlay reflects whatever meshes are currently drawn, so it only needs rebuilding
+            // when that set changes (a LoD switch, or a mesh/material group change), not every frame.
+            if (modelSceneNode != null && SelectedNodeRenderer != null)
+            {
+                if (!SelectedNodeRenderer.HasSelectedNodes)
+                {
+                    if (modelStatsPosted)
+                    {
+                        SelectedNodeRenderer.ScreenDebugText = string.Empty;
+                        modelStatsPosted = false;
+                        modelStatsDirty = true;
+                    }
+                }
+                else
+                {
+                    if (modelSceneNode.ActiveLod != statsLod)
+                    {
+                        statsLod = modelSceneNode.ActiveLod;
+                        modelStatsDirty = true;
+                    }
+
+                    if (modelStatsDirty)
+                    {
+                        SelectedNodeRenderer.ScreenDebugText = GetModelStatsText();
+                        modelStatsDirty = false;
+                        modelStatsPosted = true;
+                    }
                 }
             }
 
@@ -710,8 +866,6 @@ namespace GUI.Types.GLViewers
             if (pickingResponse.PixelInfo.ObjectId == 0)
             {
                 SelectedNodeRenderer.SelectNode(null);
-                SelectedNodeRenderer.ScreenDebugText = string.Empty;
-                modelStatsShown = false;
                 return;
             }
 
@@ -719,7 +873,6 @@ namespace GUI.Types.GLViewers
             {
                 var sceneNode = Scene.Find(pickingResponse.PixelInfo.ObjectId);
                 SelectedNodeRenderer.SelectNode(sceneNode);
-                modelStatsShown = true;
                 modelStatsDirty = true;
                 return;
             }

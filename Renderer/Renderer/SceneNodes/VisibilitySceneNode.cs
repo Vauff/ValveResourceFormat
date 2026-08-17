@@ -1,5 +1,6 @@
 using OpenTK.Graphics.OpenGL;
 using ValveResourceFormat.Blocks;
+using ValveResourceFormat.CompiledShader;
 using ValveResourceFormat.ThirdParty;
 
 namespace ValveResourceFormat.Renderer.SceneNodes
@@ -12,7 +13,7 @@ namespace ValveResourceFormat.Renderer.SceneNodes
         private readonly record struct ClusterDrawRange(int Start, int Count, ushort ClusterId);
 
         private readonly Shader shader;
-        private readonly RenderVao vao;
+        private readonly int vao;
         private readonly int totalVertexCount;
         private readonly ClusterDrawRange[] clusterDrawRanges;
 
@@ -47,15 +48,15 @@ namespace ValveResourceFormat.Renderer.SceneNodes
 
             GL.CreateBuffers(1, out int vboHandle);
 
-            GL.NamedBufferData(vboHandle, totalVertexCount * SimpleVertex.SizeInBytes,
-                ListAccessors<SimpleVertex>.GetBackingArray(vertices), BufferUsageHint.StaticDraw);
-
-            vao = new RenderVao(Scene.RendererContext.MeshBufferCache, nameof(VisibilitySceneNode), vboHandle, SimpleVertex.SizeInBytes, SimpleVertex.InputLayout);
-
 #if DEBUG
             var label = nameof(VisibilitySceneNode);
             GL.ObjectLabel(ObjectLabelIdentifier.Buffer, vboHandle, label.Length, label);
 #endif
+
+            GL.NamedBufferData(vboHandle, totalVertexCount * SimpleVertex.InputLayout.Stride,
+                ListAccessors<SimpleVertex>.GetBackingArray(vertices), BufferUsageHint.StaticDraw);
+
+            vao = SimpleVertex.InputLayout.CreateVertexArray(nameof(VisibilitySceneNode), vboHandle);
 
             LocalBoundingBox = new AABB(voxelVisibility.MinBounds, voxelVisibility.MaxBounds);
         }
@@ -73,9 +74,9 @@ namespace ValveResourceFormat.Renderer.SceneNodes
             renderShader.SetUniform3x4("transform", Transform);
             renderShader.SetBoneAnimationData(false);
 
-            GL.DepthMask(false);
-            GL.BlendFunc(BlendingFactor.SrcAlpha, BlendingFactor.OneMinusSrcAlpha);
-            GL.BindVertexArray(vao.Get(renderShader));
+            using var _ = Scene.RendererContext.RenderState.Scope(depthWrite: false);
+
+            VertexArray.Bind(vao, renderShader);
 
             if (Scene.CurrentFramePvs == null)
             {
@@ -91,8 +92,6 @@ namespace ValveResourceFormat.Renderer.SceneNodes
                     }
                 }
             }
-
-            GL.DepthMask(true);
         }
 
         private static Color32 GetClusterColor(ushort clusterId)

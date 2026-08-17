@@ -111,19 +111,10 @@ namespace ValveResourceFormat.Renderer.SceneNodes
             {
                 foreach (var skeletonName in nmSkelRefs)
                 {
-                    var resource = Scene.RendererContext.FileLoader.LoadFileCompiled(skeletonName);
-                    if (resource?.DataBlock is not BinaryKV3 skeletonData)
+                    if (Skeleton.FromSkeletonResource(Scene.RendererContext.FileLoader, skeletonName) is { } skeleton)
                     {
-                        continue;
+                        AnimationController.RegisterExternalSkeleton(skeletonName, skeleton);
                     }
-
-                    var skeleton = Skeleton.FromSkeletonData(skeletonData.Data);
-                    AnimationController.RegisterExternalSkeleton(skeletonName, skeleton);
-                }
-
-                foreach (var clipName in AnimationGraphLoader.GetClipNames(model, Scene.RendererContext.FileLoader))
-                {
-                    LoadAnimationClip(clipName);
                 }
             }
 
@@ -249,19 +240,16 @@ namespace ValveResourceFormat.Renderer.SceneNodes
             {
                 Debug.Assert(boneMatricesGpu != null, "boneMatricesGpu should not be null when IsAnimated is true");
 
-                // Update animation matrices
                 var meshBoneCount = remappingTable.Length;
 
                 var floatBufferSizeMeshBones = meshBoneCount * 12;
                 var floatBufferSizeModelBones = boneCount * 16;
 
-                var floatBuffer = ArrayPool<float>.Shared.Rent(floatBufferSizeMeshBones + floatBufferSizeModelBones);
-
-                var meshBones = MemoryMarshal.Cast<float, OpenTK.Mathematics.Matrix3x4>(floatBuffer.AsSpan(0, floatBufferSizeMeshBones));
-                var modelBones = MemoryMarshal.Cast<float, Matrix4x4>(floatBuffer.AsSpan(floatBufferSizeMeshBones));
-
-                try
+                using (var floatBuffer = new RentedFloatBuffer<float>(floatBufferSizeMeshBones + floatBufferSizeModelBones))
                 {
+                    var meshBones = MemoryMarshal.Cast<float, OpenTK.Mathematics.Matrix3x4>(floatBuffer.Span[..floatBufferSizeMeshBones]);
+                    var modelBones = MemoryMarshal.Cast<float, Matrix4x4>(floatBuffer.Span[floatBufferSizeMeshBones..]);
+
                     AnimationController.GetSkinningMatrices(modelBones);
 
                     for (var i = 0; i < meshBoneCount; i++)
@@ -275,13 +263,9 @@ namespace ValveResourceFormat.Renderer.SceneNodes
                         }
                     }
 
-                    boneMatricesGpu.Update(floatBuffer, 0, floatBufferSizeMeshBones * sizeof(float));
+                    boneMatricesGpu.Update(floatBuffer.FloatArray, 0, floatBufferSizeMeshBones * sizeof(float));
 
                     UpdateAnimatedBoundingBox();
-                }
-                finally
-                {
-                    ArrayPool<float>.Shared.Return(floatBuffer);
                 }
             }
 
@@ -419,6 +403,8 @@ namespace ValveResourceFormat.Renderer.SceneNodes
                 ? model.GetEmbeddedAnimations()
                 : model.GetAllAnimations(Scene.RendererContext.FileLoader)).ToList();
 
+            animations.RemoveAll(animation => !AnimationController.IsPlayable(animation));
+
             AddAnimations(animations);
 
             if (Animations.Count != 0)
@@ -498,7 +484,6 @@ namespace ValveResourceFormat.Renderer.SceneNodes
                 meshRenderers.Add(new RenderableMesh(mesh, refMesh.MeshIndex, Scene, model, materialTable));
             }
 
-            // Set active meshes to default
             SetActiveMeshGroups(model.GetDefaultMeshGroups());
         }
 
@@ -509,7 +494,7 @@ namespace ValveResourceFormat.Renderer.SceneNodes
                 return;
             }
 
-            boneMatricesGpu = new StorageBuffer(ReservedBufferSlots.BoneTransforms);
+            boneMatricesGpu = new StorageBuffer(ReservedBufferSlots.BoneTransforms, nameof(ReservedBufferSlots.BoneTransforms));
         }
 
         /// <summary>Activates the animation with the given name, or stops animation if not found.</summary>
@@ -556,7 +541,6 @@ namespace ValveResourceFormat.Renderer.SceneNodes
             {
                 foreach (var renderer in meshRenderers)
                 {
-                    // renderer.SetMaterialCombo(("D_ANIMATED", 1));
                     renderer.SetBoneMatricesBuffer(boneMatricesGpu);
                 }
             }
@@ -564,7 +548,6 @@ namespace ValveResourceFormat.Renderer.SceneNodes
             {
                 foreach (var renderer in meshRenderers)
                 {
-                    // renderer.SetMaterialCombo(("D_ANIMATED", 0));
                     renderer.SetBoneMatricesBuffer(null);
                 }
             }
@@ -882,7 +865,6 @@ namespace ValveResourceFormat.Renderer.SceneNodes
                     SlaveAxis = (int)constraintData.GetIntegerProperty("m_nSlaveAxis"),
                 };
 
-                // Parse slaves
                 var slaves = constraintData.GetArray("m_slaves");
                 constraint.Slaves = slaves.Select(s =>
                 {
@@ -899,7 +881,6 @@ namespace ValveResourceFormat.Renderer.SceneNodes
                     };
                 }).ToArray();
 
-                // Parse targets
                 var targets = constraintData.GetArray("m_targets");
                 constraint.Targets = targets.Select(t =>
                 {

@@ -301,7 +301,8 @@ public class ViewmodelSceneNode : ModelSceneNode
 
                 if (trace is { Hit: true } hit)
                 {
-                    Sound.Play(KnifeHitWallSound, hit.HitPosition, volume: AttackSoundVolume);
+                    // this is played in-ear but i'd like to keep it positional
+                    Sound.Play(KnifeHitWallSound, hit.HitPosition - new Vector3(0, 0, 60), volume: AttackSoundVolume);
                 }
                 else
                 {
@@ -363,7 +364,7 @@ public class ViewmodelSceneNode : ModelSceneNode
     private const string MuzzleFlashAttachment = "muzzle_flash2";
 
     internal ViewmodelSceneNode(Scene scene, Model model)
-        : base(scene, model, null, true)
+        : base(scene, model)
     {
         AnimationController.EnableFirstPersonConstraints = true;
         SetState(AnimationState.Idle);
@@ -866,13 +867,10 @@ public class ViewmodelSceneNode : ModelSceneNode
         var forward = Vector3.Normalize(camera.Forward);
         var worldUp = Vector3.UnitZ;
 
-        var right = Vector3.Normalize(Vector3.Cross(worldUp, forward));
-        if (right.LengthSquared() < 1e-4f)
-        {
-            // Looking straight up/down: fallback to camera's right vector.
-            right = Vector3.Normalize(camera.Right);
-        }
-
+        // This is the +Y (left) axis rather than right, which is why the rows below come out cyclically
+        // permuted; viewmodelOffsetRot is tuned against that frame, so leave it be. Taken from the camera
+        // rather than as Cross(worldUp, forward), which is the same vector but collapses looking straight down.
+        var right = -camera.Right;
         var up = Vector3.Cross(forward, right);
 
         var cameraRotation = Quaternion.CreateFromRotationMatrix(new Matrix4x4(
@@ -932,9 +930,7 @@ public class ViewmodelSceneNode : ModelSceneNode
         PlayerTransform = Matrix4x4.CreateFromQuaternion(playerRotation) * Matrix4x4.CreateTranslation(input.PlayerMovement.Position);
     }
 
-    /// <summary>
-    /// Update
-    /// </summary>
+    /// <inheritdoc/>
     public override void Update(Scene.UpdateContext context)
     {
         Transform = TargetTransform;

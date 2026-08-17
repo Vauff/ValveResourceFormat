@@ -1,4 +1,5 @@
 using OpenTK.Graphics.OpenGL;
+using ValveResourceFormat.CompiledShader;
 
 namespace ValveResourceFormat.Renderer
 {
@@ -9,6 +10,7 @@ namespace ValveResourceFormat.Renderer
     {
         private readonly int vao;
         private readonly Shader shader;
+        private readonly RenderStateTracker renderState;
 
         /// <summary>Initializes the grid geometry and loads the grid shader.</summary>
         /// <param name="scene">Scene providing the renderer context.</param>
@@ -25,37 +27,30 @@ namespace ValveResourceFormat.Renderer
             };
 
             shader = scene.RendererContext.ShaderLoader.LoadShader("grid");
+            renderState = scene.RendererContext.RenderState;
 
-            // Create VAO
-            GL.CreateVertexArrays(1, out vao);
             GL.CreateBuffers(1, out int buffer);
-            GL.NamedBufferData(buffer, vertices.Length * sizeof(float), vertices, BufferUsageHint.StaticDraw);
-            GL.VertexArrayVertexBuffer(vao, 0, buffer, 0, sizeof(float) * 2);
-
-            var attributeLocation = GL.GetAttribLocation(shader.Program, "aVertexPosition");
-            GL.EnableVertexArrayAttrib(vao, attributeLocation);
-            GL.VertexArrayAttribFormat(vao, attributeLocation, 2, VertexAttribType.Float, false, 0);
-            GL.VertexArrayAttribBinding(vao, attributeLocation, 0);
 
 #if DEBUG
             var vaoLabel = nameof(InfiniteGrid);
-            GL.ObjectLabel(ObjectLabelIdentifier.VertexArray, vao, vaoLabel.Length, vaoLabel);
             GL.ObjectLabel(ObjectLabelIdentifier.Buffer, buffer, vaoLabel.Length, vaoLabel);
 #endif
+
+            GL.NamedBufferData(buffer, vertices.Length * sizeof(float), vertices, BufferUsageHint.StaticDraw);
+
+            var format = new VertexInputLayout(sizeof(float) * 2, new VertexAttribute(VertexSlot.Position, DXGI_FORMAT.R32G32_FLOAT));
+            vao = format.CreateVertexArray(nameof(InfiniteGrid), buffer);
         }
 
         /// <summary>Renders the infinite grid for the current frame.</summary>
         public void Render()
         {
-            GL.Enable(EnableCap.Blend);
-            GL.BlendFunc(BlendingFactor.SrcAlpha, BlendingFactor.OneMinusSrcAlpha);
+            using var _ = renderState.Scope(blend: true);
 
             shader.Use();
-            GL.BindVertexArray(vao);
+            VertexArray.Bind(vao, shader);
 
             GL.DrawArrays(PrimitiveType.Triangles, 0, 6);
-
-            GL.Disable(EnableCap.Blend);
         }
     }
 }

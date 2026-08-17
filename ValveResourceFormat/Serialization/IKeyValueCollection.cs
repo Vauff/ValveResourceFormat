@@ -258,6 +258,13 @@ namespace ValveResourceFormat.Serialization.KeyValues
                         result[i] = (ulong)(int)elem;
                     }
                 }
+                else if (elem.ValueType == KVValueType.Int64)
+                {
+                    unchecked
+                    {
+                        result[i] = (ulong)(long)elem;
+                    }
+                }
                 else
                 {
                     result[i] = (ulong)elem;
@@ -271,7 +278,7 @@ namespace ValveResourceFormat.Serialization.KeyValues
         /// Gets an enum value from the key-value object.
         /// </summary>
         public static TEnum GetEnumValue<TEnum>(this KVObject obj, string name, bool normalize = false, string stripExtension = "Flags")
-            where TEnum : Enum
+            where TEnum : struct, Enum
         {
             if (!obj.TryGetValue(name, out var value))
             {
@@ -290,9 +297,9 @@ namespace ValveResourceFormat.Serialization.KeyValues
                 enumString = NormalizeEnumName<TEnum>(enumString, stripExtension);
             }
 
-            if (Enum.TryParse(typeof(TEnum), enumString, false, out var result))
+            if (Enum.TryParse<TEnum>(enumString, false, out var result))
             {
-                return (TEnum)result;
+                return result;
             }
 
             throw new ArgumentException($"Unable to map {enumString} to a member of enum {typeof(TEnum).Name}");

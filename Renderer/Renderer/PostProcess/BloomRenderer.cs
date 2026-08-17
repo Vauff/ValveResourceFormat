@@ -59,7 +59,11 @@ public class BloomRenderer
         var framebuffer = Framebuffer.Prepare(name, 4, 4, 0, PostProcessRenderer.DefaultColorFormat, null);
         framebuffer.NumMips = mips;
         framebuffer.Initialize();
-        framebuffer.CheckStatus_ThrowIfIncomplete();
+        framebuffer.SetColorSamplerState(
+            mips > 1 ? TextureMinFilter.LinearMipmapLinear : TextureMinFilter.Linear,
+            TextureMagFilter.Linear,
+            TextureWrapMode.ClampToEdge
+        );
         return framebuffer;
     }
 
@@ -99,15 +103,6 @@ public class BloomRenderer
         Accumulation.Resize(maxBloomRes.X, maxBloomRes.Y);
         Ping.Resize(maxBloomRes.X, maxBloomRes.Y);
         Pong.Resize(maxBloomRes.X, maxBloomRes.Y);
-
-        // todo: only set these when size actually changes (texture re-allocation)
-        Accumulation.Color.SetFiltering(TextureMinFilter.LinearMipmapLinear, TextureMagFilter.Linear);
-        Accumulation.Color.SetWrapMode(TextureWrapMode.ClampToEdge);
-
-        Ping.Color.SetFiltering(TextureMinFilter.Linear, TextureMagFilter.Linear);
-        Ping.Color.SetWrapMode(TextureWrapMode.ClampToEdge);
-        Pong.Color.SetFiltering(TextureMinFilter.Linear, TextureMagFilter.Linear);
-        Pong.Color.SetWrapMode(TextureWrapMode.ClampToEdge);
 
         using (new GLDebugGroup("Bloom Downsample Threshold Pass"))
         {

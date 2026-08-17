@@ -12,6 +12,7 @@ using SkiaSharp;
 using Svg.Skia;
 using ValveResourceFormat;
 using ValveResourceFormat.CompiledShader;
+using ValveResourceFormat.Graphs;
 using ValveResourceFormat.Renderer;
 using ValveResourceFormat.Renderer.Input;
 using ValveResourceFormat.Renderer.Materials;
@@ -116,8 +117,8 @@ namespace GUI.Types.GLViewers
         private bool IsZoomedIn;
         private bool MovedFromOrigin_Unzoomed;
 
-        private int LastRenderHash;
-        private int NumRendersLastHash;
+        protected int LastRenderHash;
+        protected int NumRendersLastHash;
 
         static readonly (ChannelMapping Channels, ChannelSplitting ChannelSplitMode, string ChoiceString)[] ChannelsComboBoxOrder = [
             (ChannelMapping.R, ChannelSplitting.None, "Red"),
@@ -139,6 +140,8 @@ namespace GUI.Types.GLViewers
 #endif
         }
 
+        protected virtual bool ShowResetZoomButton => true;
+
         protected override void AddUiControls()
         {
             Debug.Assert(UiControl != null);
@@ -152,15 +155,18 @@ namespace GUI.Types.GLViewers
 
             UpdateZoomLabel();
 
-            var resetButton = new ThemedButton
+            if (ShowResetZoomButton)
             {
-                Text = "Reset zoom",
-                AutoSize = true,
-            };
+                var resetButton = new ThemedButton
+                {
+                    Text = "Reset zoom",
+                    AutoSize = true,
+                };
 
-            resetButton.Click += (_, __) => ResetZoom();
+                resetButton.Click += (_, __) => ResetZoom();
 
-            UiControl.AddControl(resetButton);
+                UiControl.AddControl(resetButton);
+            }
 
             AddSaveButton();
 
@@ -181,6 +187,9 @@ namespace GUI.Types.GLViewers
 
             base.AddUiControls();
         }
+
+        /// <summary>The save/copy row, exposed so a viewer can reorder it within its sidebar.</summary>
+        protected Control? SaveSection { get; private set; }
 
         private void AddSaveButton()
         {
@@ -214,6 +223,7 @@ namespace GUI.Types.GLViewers
             saveTable.Controls.Add(saveButton, 0, 0);
             saveTable.Controls.Add(copyLabel, 1, 0);
             UiControl.AddControl(saveTable);
+            SaveSection = saveTable;
         }
 
         private void InitializeUIControlsForResource()
@@ -621,9 +631,15 @@ namespace GUI.Types.GLViewers
             base.Dispose();
         }
 
+        /// <summary>
+        /// Whether there is anything to write out. Viewers that draw their own content instead of
+        /// a texture override this and answer with <see cref="ReadPixelsToBitmap"/>.
+        /// </summary>
+        protected virtual bool CanSaveVisual => Resource != null || Svg != null || Bitmap != null;
+
         private void OnSaveButtonClick(object? sender, EventArgs e)
         {
-            if (Resource == null && Svg == null && Bitmap == null)
+            if (!CanSaveVisual)
             {
                 return;
             }
@@ -661,7 +677,7 @@ namespace GUI.Types.GLViewers
 
             if (isHdrTexture && selectedFilterIndex == 1)
             {
-                using var hdrBitmap = ReadPixelsToBitmap(hdr: true);
+                using var hdrBitmap = ReadTexturePixels(hdr: true);
                 fs.Write(ValveResourceFormat.IO.TextureExtract.ToExrImage(hdrBitmap));
                 return;
             }
@@ -729,10 +745,10 @@ namespace GUI.Types.GLViewers
                 return RasterizeSvg(Svg.Picture, svgWidth, svgHeight);
             }
 
-            return ReadPixelsToBitmap(hdr: false);
+            return ReadTexturePixels(hdr: false);
         }
 
-        protected SKBitmap ReadPixelsToBitmap(bool hdr = false)
+        private SKBitmap ReadTexturePixels(bool hdr)
         {
             var removeFlags = hdr
                 ? (TextureCodec.ColorSpaceLinear | TextureCodec.ColorSpaceSrgb)
@@ -757,7 +773,7 @@ namespace GUI.Types.GLViewers
                 // extract pixels from framebuffer
                 GL.Viewport(0, 0, bitmap.Width, bitmap.Height);
 
-                var fboFormat = GLTextureDecoder.GetPreferredFramebufferFormat(hdr);
+                var fboFormat = hdr ? GLTextureDecoder.HDRFormat : GLTextureDecoder.LDRFormat;
 
                 if (SaveAsFbo is not null)
                 {
@@ -787,7 +803,8 @@ namespace GUI.Types.GLViewers
 
                 SaveAsFbo.Bind(FramebufferTarget.ReadFramebuffer);
                 GL.ReadBuffer(ReadBufferMode.ColorAttachment0);
-                GL.ReadPixels(0, 0, bitmap.Width, bitmap.Height, SaveAsFbo.ColorFormat!.PixelFormat, SaveAsFbo.ColorFormat.PixelType, pixels);
+                var readFormat = MaterialLoader.GetImageExportFormat(hdr);
+                GL.ReadPixels(0, 0, bitmap.Width, bitmap.Height, readFormat.ToGLPixelFormat(), readFormat.ToGLPixelType(), pixels);
 
                 Debug.Assert(MainFramebuffer is not null);
                 MainFramebuffer.Bind(FramebufferTarget.Framebuffer);
@@ -822,7 +839,7 @@ namespace GUI.Types.GLViewers
             }
         }
 
-        private void UpdateZoomLabel() => SetMoveSpeedOrZoomLabel($"Zoom: {TextureScale * 100:0.0}% (scroll to change)");
+        protected void UpdateZoomLabel() => SetMoveSpeedOrZoomLabel($"Zoom: {TextureScale * 100:0.0}% (scroll to change)");
 
         protected override void OnKeyDown(Keys keyData)
         {
@@ -1025,8 +1042,9 @@ namespace GUI.Types.GLViewers
             var scaleMinMax = new Vector2(0.1f, 50f);
             scaleMinMax *= 256 / MathF.Max(ActualTextureSize.X, ActualTextureSize.Y);
 
-            if (this is GLNodeGraphViewer)
+            if (this is GLGraphViewer graphViewer)
             {
+                scaleMinMax.X = graphViewer.MinTextureScale();
                 scaleMinMax.Y = 2f;
             }
 
@@ -1201,7 +1219,7 @@ namespace GUI.Types.GLViewers
                 var resolution = postProcessingData.GetColorCorrectionLUTDimension();
                 var data = postProcessingData.GetColorCorrectionLUT();
 
-                texture = new RenderTexture(TextureTarget.Texture3D, resolution, resolution, resolution, 1);
+                texture = new RenderTexture(TextureTarget.Texture3D, resolution, resolution, resolution, 1, "ColorCorrectionLUT");
 
                 GL.TextureStorage3D(texture.Handle, 1, SizedInternalFormat.Rgba8, resolution, resolution, resolution);
                 GL.TextureSubImage3D(texture.Handle, 0, 0, 0, 0, resolution, resolution, resolution, PixelFormat.Rgba, PixelType.UnsignedByte, data);

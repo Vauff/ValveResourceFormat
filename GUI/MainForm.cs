@@ -4,7 +4,6 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Imaging;
-using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
@@ -64,6 +63,7 @@ namespace GUI
 
             Themer.ApplyTheme(this);
 
+#if !SCREENSHOT_MODE
             if (Settings.Config.WindowWidth > 0 && Settings.Config.WindowHeight > 0)
             {
                 StartPosition = FormStartPosition.Manual;
@@ -73,6 +73,7 @@ namespace GUI
                     WindowState = FormWindowState.Maximized;
                 }
             }
+#endif
 
             mainTabs.ImageList = AppIcons.ImageList;
             mainTabs.SelectedIndexChanged += OnMainSelectedTabChanged;
@@ -92,12 +93,12 @@ namespace GUI
                 var versionPlus = version.IndexOf('+', StringComparison.InvariantCulture);
                 string versionDisplay;
 
-                if (versionPlus > 0)
+                if (versionPlus > 1)
                 {
                     // If version ends with ".0", display part of the commit hash, otherwise the zero is replaced with CI build number
                     if (version[versionPlus - 2] == '.' && version[versionPlus - 1] == '0')
                     {
-                        versionPlus += 8;
+                        versionPlus = Math.Min(versionPlus + 8, version.Length);
                     }
 
                     versionDisplay = string.Concat("v", version.AsSpan(0, versionPlus));
@@ -382,19 +383,15 @@ namespace GUI
 
         private void OnMainSelectedTabChanged(object? sender, EventArgs e)
         {
-#if !SCREENSHOT_MODE
             UpdateWindowTitle(mainTabs.SelectedTab?.ToolTipText);
             UpdateBottomPanelKeybindings();
-#endif
         }
 
         private void UpdateWindowTitle(string? toolTipText)
         {
-#if !SCREENSHOT_MODE
             Text = string.IsNullOrEmpty(toolTipText)
                 ? "Source 2 Viewer"
                 : $"Source 2 Viewer - {toolTipText}";
-#endif
         }
 
         /// <summary>
@@ -1009,47 +1006,11 @@ namespace GUI
             mainFormBottomPanel.Text = Text;
         }
 
-        private void CheckForUpdatesIfNecessary()
+        private async void CheckForUpdatesIfNecessary()
         {
-            if (!Settings.Config.Update.CheckAutomatically)
-            {
-                return;
-            }
-
-            if (Settings.Config.Update.UpdateAvailable)
+            if (await UpdateChecker.CheckForUpdatesIfNecessary().ConfigureAwait(true))
             {
                 mainFormBottomPanel.SetNewVersionAvailable();
-                return;
-            }
-
-            var now = DateTime.UtcNow;
-
-            if (DateTime.TryParseExact(Settings.Config.Update.LastCheck, "s", CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var lastCheck))
-            {
-                var diff = now.Subtract(lastCheck);
-
-                // Perform auto update check once a day
-                if (diff.TotalDays < 1)
-                {
-                    return;
-                }
-            }
-
-            Settings.Config.Update.LastCheck = now.ToString("s");
-
-            Task.Run(CheckForUpdates);
-        }
-
-        private async Task CheckForUpdates()
-        {
-            await UpdateChecker.CheckForUpdates().ConfigureAwait(false);
-
-            if (UpdateChecker.IsNewVersionAvailable)
-            {
-                await InvokeAsync(() =>
-                {
-                    mainFormBottomPanel.SetNewVersionAvailable();
-                }).ConfigureAwait(false);
             }
         }
 

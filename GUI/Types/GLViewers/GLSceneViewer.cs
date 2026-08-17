@@ -211,11 +211,10 @@ namespace GUI.Types.GLViewers
 
         protected void UpdateSunAngles()
         {
-            // clamp and wrap angles
             sunAngles.X = Math.Clamp(sunAngles.X, 0f, 89f);
             sunAngles.Y %= 360f;
 
-            Scene.LightingInfo.LightingData.LightToWorld[0] = EntityTransformHelper.CreateRotationMatrixFromEulerAngles(new Vector3(sunAngles.X, sunAngles.Y, 0f));
+            Scene.LightingInfo.SetSunDirectionFromAngles(new Vector3(sunAngles.X, sunAngles.Y, 0f));
         }
 
         public virtual void PostSceneLoad()
@@ -282,6 +281,10 @@ namespace GUI.Types.GLViewers
             base.OnResize(w, h);
 
             Renderer.Camera.SetViewportSize(w, h);
+
+            // The input camera frames objects against its own aspect ratio, so it needs the size too
+            Input.Camera.SetViewportSize(w, h);
+
             Picker?.Resize(w, h);
         }
 
@@ -364,6 +367,9 @@ namespace GUI.Types.GLViewers
             TextRenderer.Load();
             Renderer.Postprocess.Load(NumSamples);
 
+            Renderer.Postprocess.FullScreenGamma = 2.01f; // 100% Brightness
+            Renderer.Postprocess.ExposureCompensation = -0.4f; // eyeballed
+
             baseGrid = new InfiniteGrid(Scene);
             SelectedNodeRenderer = new(Scene.RendererContext);
             Picker = new(Scene.RendererContext, OnPicked);
@@ -386,11 +392,6 @@ namespace GUI.Types.GLViewers
 
             PostSceneLoad();
 
-            if (this is GLWorldViewer)
-            {
-                PrewarmDrawCalls();
-            }
-
             GuiContext.ClearCache();
             GuiContext.GLPostLoadAction?.Invoke(this);
             GuiContext.GLPostLoadAction = null;
@@ -399,6 +400,10 @@ namespace GUI.Types.GLViewers
         /// <summary>
         /// Renders one full frame with culling disabled so the driver specializes every
         /// (program, vertex layout, framebuffer) combination once.
+        ///
+        /// Must run on the render loop thread. Nvidia specializes per thread, so a frame drawn while the
+        /// context still belongs to the loading thread specializes nothing the render loop can use, and every
+        /// program pays for it again on its first real draw.
         /// </summary>
         private void PrewarmDrawCalls()
         {
@@ -407,9 +412,12 @@ namespace GUI.Types.GLViewers
             Scene.RendererContext.ShaderLoader.LinkLoadedShaders();
             Renderer.DisableAllCulling = true;
 
+            Renderer.Camera.CopyFrom(Input.Camera);
+
             try
             {
-                OnPaint(0f);
+                // A non-zero delta so that particles actually simulate
+                OnPaint(1f / 60f);
 
                 foreach (var particleNode in Scene.AllNodes.OfType<ParticleSceneNode>())
                 {
@@ -428,10 +436,11 @@ namespace GUI.Types.GLViewers
 
             if (this is GLWorldViewer)
             {
-                // Fixes compile stutters, but performance is lower!
-                // PrewarmDrawCalls();
-                // var elapsed = Stopwatch.GetElapsedTime(LastUpdate, Stopwatch.GetTimestamp());
-                // Log.Debug(GetType().Name, $"Prewarm time: {elapsed}");
+                var start = Stopwatch.GetTimestamp();
+
+                PrewarmDrawCalls();
+
+                Log.Debug(GetType().Name, $"Prewarm time: {Stopwatch.GetElapsedTime(start)}");
             }
         }
 
@@ -598,11 +607,6 @@ namespace GUI.Types.GLViewers
 
         protected override void BlitFramebufferToScreen()
         {
-            if (MainFramebuffer == GLDefaultFramebuffer)
-            {
-                return; // not required
-            }
-
             Debug.Assert(MainFramebuffer != null);
             Debug.Assert(GLDefaultFramebuffer != null);
 
@@ -621,8 +625,6 @@ namespace GUI.Types.GLViewers
 
             Renderer.PerfStats.MarkFrameBegin();
             GL.BeginQuery(QueryTarget.TimeElapsed, frametimeQuery1);
-
-            UpdateSoundPlayer();
 
             var renderContext = new Scene.RenderContext
             {
@@ -645,6 +647,10 @@ namespace GUI.Types.GLViewers
 
                 SelectedNodeRenderer.Update(renderContext, updateContext);
             }
+
+            // After the update, so the listener is placed with this frame's camera vectors rather than
+            // this frame's position and last frame's facing
+            UpdateSoundPlayer();
 
             Renderer.ForceResolveSceneDepth = ShowBaseGrid;
 
@@ -991,6 +997,7 @@ namespace GUI.Types.GLViewers
             Renderer.Postprocess.Enabled = Renderer.ViewBuffer.Data.RenderMode == 0;
 
             Scene.EnableCompaction = renderMode != "Meshlets";
+            SkyboxScene?.EnableCompaction = Scene.EnableCompaction;
 
             Picker.SetRenderMode(renderMode);
             QuadOverdrawRenderer?.SetRenderMode(renderMode);

@@ -51,10 +51,9 @@ public class NmClipExtract
         }
 
         var animation = new ResourceTypes.ModelAnimation.ClipAnimation(clip);
-        var skeletonResource = fileLoader.LoadFileCompiled(clip.SkeletonName);
-        if (skeletonResource != null)
+        var skeleton = ResourceTypes.ModelAnimation.Skeleton.FromSkeletonResource(fileLoader, clip.SkeletonName);
+        if (skeleton != null)
         {
-            var skeleton = ResourceTypes.ModelAnimation.Skeleton.FromSkeletonData(((BinaryKV3)skeletonResource.DataBlock!).Data);
             var modelSpaceSamplingChain = clip.Data.Root.GetArray("m_modelSpaceSamplingChain");
             // The array below indexes into the bone sampling chain, which in turn indexes into the skeleton bones.
             var modelSpaceBoneSamplingIndices = clip.Data.Root.GetIntegerArray("m_modelSpaceBoneSamplingIndices");
@@ -73,7 +72,18 @@ public class NmClipExtract
 
             contentFile.AddSubFile(Path.GetFileName(sourceFileName), () =>
             {
-                return ModelExtract.ToDmxAnim(skeleton, [], animation, nmSkelAxisFixup: true);
+                // Secondary animations (e.g. the weapon of a viewmodel clip) share the DMX; the compiler
+                // pulls each declared skeleton's tracks out of it by bone name.
+                var secondaryAnimations = new List<(ResourceTypes.ModelAnimation.Skeleton Skeleton, ResourceTypes.ModelAnimation.Animation Animation)>();
+                foreach (var secAnim in clip.SecondaryAnimations)
+                {
+                    if (ResourceTypes.ModelAnimation.Skeleton.FromSkeletonResource(fileLoader, secAnim.SkeletonName) is { } secSkeleton)
+                    {
+                        secondaryAnimations.Add((secSkeleton, new ResourceTypes.ModelAnimation.ClipAnimation(secAnim)));
+                    }
+                }
+
+                return ModelExtract.ToDmxAnim(skeleton, [], animation, secondaryAnimations, nmSkelAxisFixup: true);
             });
         }
 
@@ -106,6 +116,7 @@ public class NmClipExtract
             }
         }
 
+        var frameIntervalCount = Math.Max(0, animation.FrameCount - 1);
         var events = clip.Data.Root.GetArray("m_events")!;
         var docEventTracks = KVObject.Array();
         foreach (var ev in events!)
@@ -115,20 +126,82 @@ public class NmClipExtract
 
             var docEventTrack = BuildDocEventBasedOnEventClass(ev, ev.GetStringProperty("_class"), isSyncTrack);
             var startTimeObj = ev.GetSubCollection("m_flStartTime");
-            var startTimeSeconds = startTimeObj?.GetFloatProperty("m_flValue") ?? 0f;
+            var startTimeFraction = startTimeObj?.GetFloatProperty("m_flValue") ?? 0f;
             var durationObj = ev.GetSubCollection("m_flDuration");
-            var durationSeconds = durationObj?.GetFloatProperty("m_flValue") ?? 0f;
+            var durationFraction = durationObj?.GetFloatProperty("m_flValue") ?? 0f;
             var eventList = docEventTrack!.GetArray("m_events")![0];
-            // Doc file event time stamps are given in frames they can be technically floats, but based on recompilation tests
-            // these seem inconsistent, unless they're floored to int, then it matches up.
-            eventList["m_flStartTime"] = Math.Floor(startTimeSeconds * animation.FrameCount);
-            eventList["m_flDuration"] = Math.Floor(durationSeconds * animation.FrameCount);
+            // Compiled event times are fractions of the clip, denominated in its frame intervals
+            // (FrameCount - 1); doc files give them in frames. The product is exact on shipped data.
+            eventList["m_flStartTime"] = Math.Round(startTimeFraction * frameIntervalCount, MidpointRounding.AwayFromZero);
+            eventList["m_flDuration"] = Math.Round(durationFraction * frameIntervalCount, MidpointRounding.AwayFromZero);
             docEventTracks.Add(docEventTrack);
+        }
+
+        foreach (var curve in clip.FloatCurves)
+        {
+            docEventTracks.Add(BuildFloatCurveDocEventTrack(curve, frameIntervalCount));
         }
 
         kv.Add("m_eventTracks", docEventTracks);
         contentFile.Data = Encoding.UTF8.GetBytes(kv.ToKV3String());
         return contentFile;
+    }
+
+    /// <summary>
+    /// Rebuilds the doc event track a compiled float curve came from. The compiler bakes a
+    /// <c>CNmClipDocEvent_FloatCurve</c> (a name plus a piecewise curve) into per-frame samples and
+    /// stores no event for it, so the curve is reconstructed as a linear knot per frame.
+    /// </summary>
+    private static KVObject BuildFloatCurveDocEventTrack(AnimationFloatCurve curve, int frameIntervalCount)
+    {
+        var kvDocEventTrack = KVObject.Collection();
+        kvDocEventTrack.Add("m_type", "Duration");
+        kvDocEventTrack.Add("m_bIsSyncTrack", false);
+        kvDocEventTrack.Add("m_eventClassName", "CNmClipDocEvent_FloatCurve");
+
+        var spline = KVObject.Array();
+        var tangents = KVObject.Array();
+
+        // Curve x is the normalized position in the clip, matching the domain convention of
+        // curves Valve ships (the compiler copies the curve verbatim into the compiled event).
+        for (var f = 0; f < curve.Values.Length; f++)
+        {
+            var knot = KVObject.Collection();
+            knot.Add("x", frameIntervalCount > 0 ? (double)f / frameIntervalCount : 0d);
+            knot.Add("y", (double)curve.Values[f]);
+            knot.Add("m_flSlopeIncoming", 0d);
+            knot.Add("m_flSlopeOutgoing", 0d);
+            spline.Add(knot);
+
+            var tangent = KVObject.Collection();
+            tangent.Add("m_nIncomingTangent", "CURVE_TANGENT_LINEAR");
+            tangent.Add("m_nOutgoingTangent", "CURVE_TANGENT_LINEAR");
+            tangents.Add(tangent);
+        }
+
+        var kvCurve = KVObject.Collection();
+        kvCurve.Add("m_spline", spline);
+        kvCurve.Add("m_tangents", tangents);
+        var domainMins = KVObject.Array();
+        domainMins.Add(0d);
+        domainMins.Add(0d);
+        kvCurve.Add("m_vDomainMins", domainMins);
+        var domainMaxs = KVObject.Array();
+        domainMaxs.Add(1d);
+        domainMaxs.Add(1d);
+        kvCurve.Add("m_vDomainMaxs", domainMaxs);
+
+        var kvDocEvent = KVObject.Collection();
+        kvDocEvent.Add("_class", "CNmClipDocEvent_FloatCurve");
+        kvDocEvent.Add("m_ID", curve.Name);
+        kvDocEvent.Add("m_flStartTime", 0d);
+        kvDocEvent.Add("m_flDuration", (double)frameIntervalCount);
+        kvDocEvent.Add("m_curve", kvCurve);
+
+        var eventsArray = KVObject.Array();
+        eventsArray.Add(kvDocEvent);
+        kvDocEventTrack.Add("m_events", eventsArray);
+        return kvDocEventTrack;
     }
 
     // Returns a full event track.
@@ -160,7 +233,8 @@ public class NmClipExtract
 
         foreach (var (key, value) in kvCompiledEvent.Children)
         {
-            if (key is "_class")
+            // CNmClipDocEvent_FloatCurve has no sync id field; the compiled event's empty one is not copied.
+            if (key is "_class" || (eventName == "FloatCurve" && key is "m_syncID"))
             {
                 continue;
             }

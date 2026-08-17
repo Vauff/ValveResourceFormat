@@ -68,6 +68,13 @@ namespace ValveResourceFormat.IO
         public bool ExportExtras { get; set; }
 
         /// <summary>
+        /// Gets or sets a value indicating whether additive animations are composed over the bind pose.
+        /// When false they are exported as the delta tracks they are, flagged in the animation's extras
+        /// for the consumer to compose.
+        /// </summary>
+        public bool ComposeAdditiveAnimations { get; set; }
+
+        /// <summary>
         /// Gets the set of animation names to filter during export. An entry matches an animation by its
         /// full name or, for animation graph clips named by resource path, by its leaf name (e.g. "idle_knife"
         /// matches "animation/anims/.../idle_knife"). Empty means export every animation.
@@ -85,6 +92,7 @@ namespace ValveResourceFormat.IO
 
         private string DstDir = string.Empty;
         private CancellationToken CancellationToken;
+        private Vector2 LightmapUvScale = Vector2.One;
         private readonly Dictionary<string, Mesh> ExportedMeshes = [];
         private readonly List<(PhysAggregateData Phys, string? Classname, Matrix4x4 Transform)> PhysicsToExport = [];
         private bool IsExporting;
@@ -160,6 +168,9 @@ namespace ValveResourceFormat.IO
             {
                 matchedAnimationFilter.Clear();
                 ExportedMeshes.Clear();
+                LightmapUvScale = Vector2.One;
+                MaterialInputSignatures.Clear();
+                ScaledLightmapUvAccessors.Clear();
                 PhysicsToExport.Clear();
                 TextureExportingTasks.Clear();
                 ExportedTextures.Clear();
@@ -301,6 +312,8 @@ namespace ValveResourceFormat.IO
         {
             var exportedModel = CreateModelRoot(resourceName, out var scene);
 
+            LightmapUvScale = world.GetLightmapUvScale();
+
             // First the WorldNodes
             foreach (var worldNodeName in world.GetWorldNodeNames())
             {
@@ -399,7 +412,7 @@ namespace ValveResourceFormat.IO
 
             foreach (var (entity, parentTransform, _) in traversed)
             {
-                var transform = EntityTransformHelper.CalculateTransformationMatrix(entity) * parentTransform;
+                var transform = EntityTransformHelper.ToTransformationMatrix(entity) * parentTransform;
                 var modelName = entity.GetStringProperty("model");
                 var className = entity.GetStringProperty("classname");
 
@@ -410,14 +423,15 @@ namespace ValveResourceFormat.IO
                     // TODO: Add point and spot lights
                     if (className == "light_environment")
                     {
-                        if (!Matrix4x4.Decompose(transform, out var _, out var _, out var positionVector))
+                        if (!Matrix4x4.Decompose(transform, out _, out var rotation, out var positionVector))
                         {
                             throw new InvalidOperationException("Matrix decompose failed");
                         }
 
                         // glTF directional lights emit along node-local -Z; orient the node so that
                         // -Z matches the sun's forward (travel) direction, i.e. the entity's local +X.
-                        var rotation = EntityTransformHelper.CreateRotationMatrixFromEulerAngles(entity.GetVector3Property("angles"));
+                        // Taken from the decomposed transform rather than the entity's own angles, so a
+                        // light inside a rotated child lump points where the lump put it.
                         var direction = Vector3.Transform(Vector3.UnitX, rotation);
 
                         var directionGltf = Vector3.Transform(direction, SourceToGltfRotation);
@@ -471,7 +485,6 @@ namespace ValveResourceFormat.IO
                 LoadModel(exportedModel, scene, model, Path.GetFileNameWithoutExtension(modelName),
                     transform, tintColor, skinName, entity);
 
-                // Load model physics
                 var phys = model.GetEmbeddedPhys();
                 if (phys == null)
                 {
@@ -586,7 +599,6 @@ namespace ValveResourceFormat.IO
 
             WriteModelFile(exportedModel, fileName);
 
-            // Add embedded phys
             var phys = model.GetEmbeddedPhys();
             if (phys != null)
             {
@@ -630,10 +642,8 @@ namespace ValveResourceFormat.IO
 
             void ExportAnimationClip(VAnimationClip clip)
             {
-                var skeletonResource = FileLoader.LoadFileCompiled(clip.SkeletonName)
-                ?? throw new InvalidOperationException($"Unable to load skeleton data '{clip.SkeletonName}'.");
-
-                var skeletonData = Skeleton.FromSkeletonData(((BinaryKV3)skeletonResource.DataBlock!).Data);
+                var skeletonData = Skeleton.FromSkeletonResource(FileLoader, clip.SkeletonName)
+                    ?? throw new InvalidOperationException($"Unable to load skeleton data '{clip.SkeletonName}'.");
 
                 var (skeletonNode, joints) = CreateGltfSkeleton(scene, skeletonData, clip.SkeletonName);
                 if (skeletonNode == null || joints == null)
@@ -648,7 +658,7 @@ namespace ValveResourceFormat.IO
                 //if (ExportAnimations)
                 {
                     var animation = new ResourceTypes.ModelAnimation.ClipAnimation(clip);
-                    var animationWriter = new AnimationWriter(skeletonData, []);
+                    var animationWriter = new AnimationWriter(skeletonData, []) { ComposeAdditive = ComposeAdditiveAnimations };
                     animationWriter.WriteAnimation(exportedModel, joints, animation, ClipAnimationName(clip.Name));
                 }
             }
@@ -672,6 +682,21 @@ namespace ValveResourceFormat.IO
 
             CancellationToken.ThrowIfCancellationRequested();
 
+            var animationFilter = AnimationFilter;
+
+            // When exporting map entities, only export the default animation
+            if (entity != null)
+            {
+                var entityAnimation = entity.GetStringProperty("startinganim") ?? entity.GetStringProperty("defaultanim") ?? entity.GetStringProperty("idleanim");
+                if (entityAnimation != null)
+                {
+                    animationFilter = [
+                        entityAnimation,
+                        $"@{entityAnimation}"
+                    ];
+                }
+            }
+
             var (skeletonNode, joints) = ExportAnimations
                 ? CreateGltfSkeleton(scene, model.Skeleton, name)
                 : (null, null);
@@ -681,25 +706,12 @@ namespace ValveResourceFormat.IO
                 Debug.Assert(joints != null);
 
                 var animations = model.GetAllAnimations(FileLoader);
-                var animationWriter = new AnimationWriter(model.Skeleton, model.FlexControllers);
-                var animationFilter = AnimationFilter;
-
-                // When exporting map entities, only export the default animation
-                if (entity != null)
-                {
-                    var entityAnimation = entity.GetStringProperty("defaultanim") ?? entity.GetStringProperty("idleanim");
-                    if (entityAnimation != null)
-                    {
-                        animationFilter = [
-                            entityAnimation,
-                            $"@{entityAnimation}"
-                        ];
-                    }
-                }
+                var animationWriter = new AnimationWriter(model.Skeleton, model.FlexControllers) { ComposeAdditive = ComposeAdditiveAnimations };
 
                 foreach (var animation in animations)
                 {
-                    if (!IncludeAnimation(animationFilter, animation.Name))
+                    // Clips authored on another skeleton are written retargeted by WriteAnimationGraphClips.
+                    if (animation is ClipAnimation || !IncludeAnimation(animationFilter, animation.Name))
                     {
                         continue;
                     }
@@ -708,7 +720,7 @@ namespace ValveResourceFormat.IO
                     CancellationToken.ThrowIfCancellationRequested();
                 }
 
-                WriteAnimationGraphClips(exportedModel, model, joints!, animationFilter);
+                WriteAnimationGraphClips(exportedModel, scene, model, joints!, animationFilter);
             }
             else
             {
@@ -719,11 +731,12 @@ namespace ValveResourceFormat.IO
 
             var skinMaterialPath = skinName != null ? GetSkinPathFromModel(model, skinName) : null;
 
+            var morphedMeshNodes = new List<(Node Node, VMesh Mesh)>();
+
             foreach (var m in LoadModelMeshes(model, name))
             {
                 var meshName = m.Name;
 
-                // Apply mesh filter if specified
                 if (MeshFilter.Count > 0 && !MeshFilter.Contains(meshName.Split('.')[^1]))
                 {
                     continue;
@@ -735,13 +748,25 @@ namespace ValveResourceFormat.IO
                 }
 
                 var boneRemapTable = model.GetRemapTable(m.MeshIndex);
-                var node = AddMeshNode(exportedModel, scene, meshName, tintColor, m.Mesh, m.Mesh.VBIB, joints, boneRemapTable, skinMaterialPath, entity);
+                var node = AddMeshNode(exportedModel, scene, meshName, tintColor, m.Mesh, m.Mesh.VBIB, joints, out var meshNode, boneRemapTable, skinMaterialPath, entity);
                 if (node != null)
                 {
                     node.WorldMatrix = nodeTransform;
 
                     DebugValidateGLTF();
                 }
+
+                // meshNode is set even for skinned meshes, where the returned node is null.
+                if (skeletonNode != null && meshNode != null && m.Mesh.MorphData?.FlexRules.Length > 0)
+                {
+                    morphedMeshNodes.Add((meshNode, m.Mesh));
+                }
+            }
+
+            // Morph weights are written as a second pass over the animations once the mesh nodes exist.
+            if (skeletonNode != null && morphedMeshNodes.Count > 0)
+            {
+                WriteMorphAnimations(exportedModel, model, morphedMeshNodes, animationFilter);
             }
 
             // Even though that's not documented, order matters.
@@ -793,21 +818,24 @@ namespace ValveResourceFormat.IO
         {
             var exportedModel = CreateModelRoot(resourceName, out var scene);
             var name = Path.GetFileName(resourceName);
-            AddMeshNode(exportedModel, scene, name, Vector4.One, mesh, mesh.VBIB, joints: null);
+            AddMeshNode(exportedModel, scene, name, Vector4.One, mesh, mesh.VBIB, joints: null, meshNode: out _);
 
             WriteModelFile(exportedModel, fileName);
         }
 
         private Node? AddMeshNode(ModelRoot exportedModel, Scene scene, string name, Vector4 tintColor,
-            VMesh mesh, Blocks.VBIB vbib, Node[]? joints, int[]? boneRemapTable = null,
+            VMesh mesh, Blocks.VBIB vbib, Node[]? joints, out Node? meshNode, int[]? boneRemapTable = null,
             string? skinMaterialPath = null, EntityLump.Entity? entity = null)
         {
+            meshNode = null;
+
             if (mesh.Data.GetArray("m_sceneObjects").Count == 0)
             {
                 return null;
             }
 
             var newNode = scene.CreateNode(name);
+            meshNode = newNode;
             if (ExportedMeshes.TryGetValue(name, out var exportedMesh))
             {
                 // Make a new node that uses the existing mesh
@@ -945,7 +973,6 @@ namespace ValveResourceFormat.IO
                 .WithLocalRotation(rotation);
             joints[bone.Index] = node;
 
-            // Recurse into children
             foreach (var child in bone.Children)
             {
                 CreateBonesRecursive(child, node, ref joints, isRoot: false);

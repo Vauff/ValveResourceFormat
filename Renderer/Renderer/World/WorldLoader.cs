@@ -8,6 +8,7 @@ using SteamDatabase.ValvePak;
 using ValveResourceFormat.Blocks;
 using ValveResourceFormat.IO;
 using ValveResourceFormat.NavMesh;
+using ValveResourceFormat.Renderer.Entities;
 using ValveResourceFormat.Renderer.SceneEnvironment;
 using ValveResourceFormat.Renderer.SceneNodes;
 using ValveResourceFormat.ResourceTypes;
@@ -44,6 +45,34 @@ namespace ValveResourceFormat.Renderer.World
         public List<string> CameraNames { get; } = [];
         /// <summary>Transform matrices corresponding to each entry in <see cref="CameraNames"/>.</summary>
         public List<Matrix4x4> CameraMatrices { get; } = [];
+
+        /// <summary>
+        /// Camera transform for the best spawn marker entity found, per <see cref="SpawnCameraClasses"/>
+        /// priority, with eye height already applied to ground markers.
+        /// </summary>
+        public Matrix4x4? SpawnCameraMatrix { get; private set; }
+
+        /// <summary>
+        /// Spawn marker classnames in priority order; earlier entries win regardless of entity order.
+        /// team_select and T/CT spawns are CS2, info_team_spawn is Deadlock, goodguys/badguys are
+        /// Dota 2, then the generic player start, then the camera entities as last resorts.
+        /// </summary>
+        private static readonly string[] SpawnCameraClasses =
+        [
+            "team_select",
+            "info_player_terrorist",
+            "info_player_counterterrorist",
+            "info_team_spawn",
+            "info_player_start_goodguys",
+            "info_player_start_badguys",
+            "info_player_start",
+            "point_camera",
+            "point_camera_vertical_fov",
+            "point_devshot_camera",
+        ];
+
+        private const float PlayerEyeHeight = 64f;
+        private int spawnCameraPriority = int.MaxValue;
 
         /// <summary>The 3D skybox scene, if one was found during entity loading.</summary>
         public Scene? SkyboxScene { get; set; }
@@ -224,6 +253,9 @@ namespace ValveResourceFormat.Renderer.World
 
             ResolveAttachmentParenting();
 
+            // Every entity exists now, so the simulated ones can resolve each other by name
+            scene.EntitySystem.Activate();
+
             Action<List<SceneLight>> lightEntityStore = (scene.LightingInfo.LightmapVersionNumber, scene.LightingInfo.LightmapGameVersionNumber) switch
             {
                 (6, 0) or (8, 0) or (8, 1) => scene.LightingInfo.StoreLightMappedLights_V1,
@@ -248,7 +280,7 @@ namespace ValveResourceFormat.Renderer.World
 
             foreach (var model in scene.AllNodes.OfType<ModelSceneNode>())
             {
-                var targetName = model.EntityData?.GetStringProperty("targetname");
+                var targetName = model.EntityData?.TargetName;
 
                 if (targetName != null)
                 {
@@ -259,6 +291,11 @@ namespace ValveResourceFormat.Renderer.World
 
             foreach (var node in scene.AllNodes)
             {
+                if (node.Parent != null || node.EntityInstance != null)
+                {
+                    continue; // already driven by a simulated entity, which owns its transform
+                }
+
                 var parentName = node.EntityData?.GetStringProperty("parentname");
 
                 if (parentName is null || !modelsByTargetName.TryGetValue(parentName, out var parentNode))
@@ -418,11 +455,12 @@ namespace ValveResourceFormat.Renderer.World
             }
 
             var result = scene.LightingInfo;
+            result.UsesLegacyBarnBrightness = RendererContext.FileLoader.GameName == "Aperture Desk Job"; // adj predates the photometric model.
             result.LightmapVersionNumber = worldLightingInfo.GetInt32Property("m_nLightmapVersionNumber");
+            result.LightingData.LightmapUvScale = World.GetLightmapUvScale();
             if (scene.LightingInfo.LightmapVersionNumber == 8)
             {
                 result.LightmapGameVersionNumber = worldLightingInfo.GetInt32Property("m_nLightmapGameVersionNumber");
-                result.LightingData.LightmapUvScale = worldLightingInfo.GetSubCollection("m_vLightmapUvScale").ToVector2();
             }
 
             var lightmaps = worldLightingInfo.GetArray<string>("m_lightMaps") ?? [];
@@ -469,14 +507,6 @@ namespace ValveResourceFormat.Renderer.World
             scene.RenderAttributes.TryAdd("S_LIGHTMAP_VERSION_MINOR", (byte)scene.LightingInfo.LightmapGameVersionNumber);
         }
 
-        static bool IsCamera(string cls)
-            => cls == "sky_camera"
-            || cls == "point_devshot_camera"
-            || cls == "point_camera_vertical_fov"
-            || cls == "point_camera";
-
-        internal const string ToolEntitiesLayerName = "Entities (editor only)";
-
         private void LoadEntitiesFromLump(EntityLump entityLump, string originalLayerName, Matrix4x4 rootTransform)
         {
             static bool IsCubemapOrProbe(string cls)
@@ -503,6 +533,8 @@ namespace ValveResourceFormat.Renderer.World
 
             Entities.AddRange(traversed.Select(t => t.Entity));
 
+            var connectionTargets = new EntityIOTargetResolver(Entities);
+
             void LoadEntity(string classname, Entity entity, Matrix4x4 parentTransform, bool fromTemplate)
             {
                 if (classname == "worldspawn")
@@ -510,18 +542,18 @@ namespace ValveResourceFormat.Renderer.World
                     return; // do not draw
                 }
 
-                var transformationMatrix = EntityTransformHelper.CalculateTransformationMatrix(entity) * parentTransform;
+                var transformationMatrix = EntityTransformHelper.ToTransformationMatrix(entity) * parentTransform;
                 var light = SceneLight.IsAccepted(classname);
 
                 if (entity.Connections != null)
                 {
-                    CreateEntityConnectionLines(entity, transformationMatrix.Translation);
+                    CreateEntityConnectionLines(entity, transformationMatrix.Translation, connectionTargets);
                 }
 
                 var layerName = fromTemplate ? "Template Entities" : originalLayerName;
 
                 // group the point_template marker and its spawned children under the same layer
-                var toolEntityLayer = fromTemplate || classname == "point_template" ? "Template Entities" : ToolEntitiesLayerName;
+                var toolEntityLayer = fromTemplate || classname == "point_template" ? "Template Entities" : EditorEntityNode.LayerName;
 
                 var disabled = entity.GetBooleanProperty("startdisabled");
 
@@ -534,6 +566,18 @@ namespace ValveResourceFormat.Renderer.World
                 {
                     layerName = "Entities (disabled)";
                 }
+
+                // Classnames the entity system implements are spawned as simulated entities, which own
+                // whatever scene nodes they need.
+                if (EntityFactory.IsRegistered(classname))
+                {
+                    scene.EntitySystem.CreateEntity(entity, parentTransform, layerName);
+                    return;
+                }
+
+                var defaultEntityLayer = toolEntityLayer == EditorEntityNode.LayerName && HammerEntities.Get(classname)?.Studio == true
+                    ? layerName
+                    : toolEntityLayer;
 
                 if (classname == "info_world_layer")
                 {
@@ -598,8 +642,8 @@ namespace ValveResourceFormat.Renderer.World
                         scene.Add(new SceneLight(scene)
                         {
                             Type = SceneLight.LightType.Directional,
-                            Transform = EntityTransformHelper.CreateRotationMatrixFromEulerAngles(angles),
-                            Direction = SceneLight.AnglesToDirection(angles),
+                            Transform = EntityTransformHelper.EulerAnglesToRotationMatrix(angles),
+                            Direction = EntityTransformHelper.EulerAnglesToForwardDirection(angles),
                             Color = new Vector3(1.0f, 1.0f, 1.0f),
                             Brightness = 1.0f,
                             LayerName = "world_layer_base",
@@ -742,13 +786,13 @@ namespace ValveResourceFormat.Renderer.World
                                 var skyEntTargetName = entity.GetStringProperty("cubemapfogskyentity");
                                 if (skyEntTargetName != null)
                                 {
-                                    var skyEntity = FindEntityByKeyValue("targetname", skyEntTargetName);
+                                    var skyEntity = FindEntityByTargetName(skyEntTargetName);
 
                                     // env_sky target //  && (scene.Sky.TargetName == skyEntTargetName)
                                     if (skyEntity != null)
                                     {
                                         material = skyEntity.GetStringProperty("skyname") ?? skyEntity.GetStringProperty("skybox_material_day");
-                                        var rotationOnly = EntityTransformHelper.CalculateTransformationMatrix(skyEntity) with { Translation = transformationMatrix.Translation };
+                                        var rotationOnly = EntityTransformHelper.ToTransformationMatrix(skyEntity) with { Translation = transformationMatrix.Translation };
                                         transformationMatrix = rotationOnly;  // steal rotation from env_sky
 
                                         var scale = skyEntity.GetFloatProperty("brightnessscale", 1.0f);
@@ -948,7 +992,7 @@ namespace ValveResourceFormat.Renderer.World
 
                 var model = entity.GetStringProperty("model");
                 var particle = entity.GetStringProperty("effect_name");
-                var animation = entity.GetStringProperty("defaultanim") ?? entity.GetStringProperty("idleanim");
+                var animation = entity.GetStringProperty("startinganim") ?? entity.GetStringProperty("defaultanim") ?? entity.GetStringProperty("idleanim");
 
                 var skin = entity.GetStringProperty("skin");
                 var positionVector = transformationMatrix.Translation;
@@ -974,12 +1018,12 @@ namespace ValveResourceFormat.Renderer.World
                         else
                         {
                             RendererContext.Logger.LogWarning("Skipped degenerate path_particle_rope '{Target}' at ({Origin})",
-                                entity.GetStringProperty("targetname"), entity.GetStringProperty("origin"));
+                                entity.TargetName, entity.GetStringProperty("origin"));
                         }
                     }
                     catch (Exception e)
                     {
-                        RendererContext.Logger.LogError(e, "Failed to setup path_particle_rope '{Target}'", entity.GetStringProperty("targetname"));
+                        RendererContext.Logger.LogError(e, "Failed to setup path_particle_rope '{Target}'", entity.TargetName);
                     }
 
                     // A degenerate or failed cable renders nothing. Never fall through to the
@@ -1007,14 +1051,6 @@ namespace ValveResourceFormat.Renderer.World
                             entity.GetStringProperty("targetname"), entity.GetStringProperty("path_start"));
                     }
 
-                    var moverRendercolor = entity.GetColor32Property("rendercolor");
-                    var moverRenderamt = entity.GetFloatProperty("renderamt", 1.0f);
-
-                    if (moverRenderamt > 1f)
-                    {
-                        moverRenderamt /= 255f;
-                    }
-
                     var moverNode = new XenFloraAnimatedMoverSceneNode(
                         scene,
                         moverModel,
@@ -1024,7 +1060,7 @@ namespace ValveResourceFormat.Renderer.World
                         moverLoopBackIndex,
                         authoredTransform: transformationMatrix)
                     {
-                        Tint = new Vector4(moverRendercolor, moverRenderamt),
+                        Tint = entity.GetRenderTint(),
                         LayerName = layerName,
                         Name = model,
                     };
@@ -1083,10 +1119,15 @@ namespace ValveResourceFormat.Renderer.World
                             var particleNode = new ParticleSceneNode(scene, particleSystem, particleSnapshot)
                             {
                                 Name = particle,
-                                Transform = transformationMatrix,
+                                Transform = ResolveControlPoint0Transform(entity, transformationMatrix),
                                 LayerName = "Particles",
                                 EntityData = entity,
                             };
+
+                            if (classname == "env_particle_glow")
+                            {
+                                ApplyParticleGlowProperties(entity, particleNode);
+                            }
 
                             scene.Add(particleNode, true);
                         }
@@ -1097,11 +1138,34 @@ namespace ValveResourceFormat.Renderer.World
                     }
                 }
 
-                if (IsCamera(classname))
+                if (EditorEntityNode.IsCamera(classname))
                 {
-                    var cameraName = entity.GetStringProperty("cameraname") ?? entity.GetStringProperty("targetname") ?? classname;
+                    var cameraName = entity.GetStringProperty("cameraname") ?? entity.TargetName ?? classname;
                     CameraNames.Add(cameraName);
                     CameraMatrices.Add(transformationMatrix);
+                }
+
+                var spawnPriority = Array.IndexOf(SpawnCameraClasses, classname) * 2;
+                if (spawnPriority >= 0)
+                {
+                    // HLA maps can have several info_player_start entities; spawnflag 1 marks the active one.
+                    if (classname == "info_player_start" && (entity.GetUInt32Property("spawnflags") & 1) != 0)
+                    {
+                        spawnPriority--;
+                    }
+
+                    if (spawnPriority < spawnCameraPriority)
+                    {
+                        var spawnMatrix = transformationMatrix;
+
+                        if (!EditorEntityNode.IsCamera(classname))
+                        {
+                            spawnMatrix.Translation += new Vector3(0, 0, PlayerEyeHeight);
+                        }
+
+                        spawnCameraPriority = spawnPriority;
+                        SpawnCameraMatrix = spawnMatrix;
+                    }
                 }
 
                 if (classname == "post_processing_volume")
@@ -1110,7 +1174,7 @@ namespace ValveResourceFormat.Renderer.World
 
                     var isMaster = entity.GetBooleanProperty("master");
                     var useExposure = entity.GetBooleanProperty("enableexposure");
-                    var fadeTime = entity.GetFloatProperty("fadetime");
+                    var fadeTime = entity.GetFloatProperty("fadetime", 1.0f);
 
                     var postProcess = new ScenePostProcessVolume(scene)
                     {
@@ -1118,6 +1182,7 @@ namespace ValveResourceFormat.Renderer.World
                         FadeTime = fadeTime,
                         UseExposure = useExposure,
                         IsMaster = isMaster,
+                        StartDisabled = entity.GetBooleanProperty("startdisabled"),
                         Transform = transformationMatrix, // needed if model is used
                     };
 
@@ -1142,6 +1207,16 @@ namespace ValveResourceFormat.Renderer.World
                         if (postProcessModel?.DataBlock is Model ppModelResource)
                         {
                             postProcess.ModelVolume = ppModelResource;
+
+                            // Local volumes apply while the camera is inside their trigger shape
+                            var volumePhysics = EntityCollider.LoadPhysics(ppModelResource, RendererContext.FileLoader);
+                            if (volumePhysics != null)
+                            {
+                                postProcess.Collider = new EntityCollider(volumePhysics)
+                                {
+                                    Transform = transformationMatrix,
+                                };
+                            }
 
                             var ppModelNode = new ModelSceneNode(scene, ppModelResource, skin)
                             {
@@ -1201,7 +1276,7 @@ namespace ValveResourceFormat.Renderer.World
 
                 if (model == null)
                 {
-                    CreateDefaultEntity(entity, classname, transformationMatrix, entityFlags, toolEntityLayer);
+                    CreateDefaultEntity(entity, classname, transformationMatrix, entityFlags, defaultEntityLayer);
                     return;
                 }
 
@@ -1227,15 +1302,6 @@ namespace ValveResourceFormat.Renderer.World
                     return;
                 }
 
-                // todo: rendercolor might sometimes be vec4, which holds renderamt
-                var rendercolor = entity.GetColor32Property("rendercolor");
-                var renderamt = entity.GetFloatProperty("renderamt", 1.0f);
-
-                if (renderamt > 1f)
-                {
-                    renderamt /= 255f;
-                }
-
                 if (newEntity.DataBlock is not Model newModel)
                 {
                     return;
@@ -1244,7 +1310,7 @@ namespace ValveResourceFormat.Renderer.World
                 var modelNode = new ModelSceneNode(scene, newModel, skin)
                 {
                     Transform = transformationMatrix,
-                    Tint = new Vector4(rendercolor, renderamt),
+                    Tint = entity.GetRenderTint(),
                     LayerName = layerName,
                     Name = model,
                     EntityData = entity,
@@ -1254,7 +1320,6 @@ namespace ValveResourceFormat.Renderer.World
 
                 if (modelNode.HasMeshes)
                 {
-                    // Animation
                     if (animation != null)
                     {
                         var isAnimated = modelNode.SetAnimationForWorldPreview(animation);
@@ -1319,7 +1384,7 @@ namespace ValveResourceFormat.Renderer.World
                 else if (!modelNode.HasMeshes && modelParticleNodes.Count == 0)
                 {
                     // If the loaded model has no meshes, particles, or physics, fallback to default entity
-                    CreateDefaultEntity(entity, classname, transformationMatrix, layerName: toolEntityLayer);
+                    CreateDefaultEntity(entity, classname, transformationMatrix, layerName: defaultEntityLayer);
                 }
             }
 
@@ -1409,7 +1474,7 @@ namespace ValveResourceFormat.Renderer.World
             var skyboxResult = LoadMap(targetmapname, SkyboxScene);
 
             // Take origin and angles from skybox_reference
-            EntityTransformHelper.DecomposeTransformationMatrix(entity, out _, out var skyboxReferenceRotationMatrix, out var skyboxReferencePositionMatrix);
+            EntityTransformHelper.GetTransformComponents(entity, out _, out var skyboxReferenceRotationMatrix, out var skyboxReferencePositionMatrix);
             var skyboxReference = skyboxReferenceRotationMatrix * Matrix4x4.CreateTranslation(skyboxReferencePositionMatrix);
 
             var offsetTransform = Matrix4x4.CreateTranslation(-skyboxResult.WorldOffset);
@@ -1421,7 +1486,7 @@ namespace ValveResourceFormat.Renderer.World
 
             foreach (var node in SkyboxScene.AllNodes)
             {
-                if (node.LayerName == ToolEntitiesLayerName)
+                if (node.LayerName == EditorEntityNode.LayerName)
                 {
                     node.Transform *= offsetTransform;
                 }
@@ -1497,74 +1562,13 @@ namespace ValveResourceFormat.Renderer.World
             }
         }
 
-        private void CreateDefaultEntity(Entity entity, string classname, Matrix4x4 transformationMatrix, ObjectTypeFlags flags = ObjectTypeFlags.None, string layerName = ToolEntitiesLayerName)
+        private void CreateDefaultEntity(Entity entity, string classname, Matrix4x4 transformationMatrix, ObjectTypeFlags flags = ObjectTypeFlags.None, string layerName = EditorEntityNode.LayerName)
         {
+            var createdNode = EditorEntityNode.Create(scene, entity, classname, transformationMatrix, flags, layerName);
+
+            scene.Add(createdNode, true);
+
             var hammerEntity = HammerEntities.Get(classname);
-            string? filename = null;
-            Resource? resource = null;
-
-            if (hammerEntity?.Icons.Length > 0)
-            {
-                foreach (var file in hammerEntity.Icons)
-                {
-                    filename = file;
-
-                    resource = RendererContext.FileLoader.LoadFileCompiled(file);
-
-                    if (resource != null)
-                    {
-                        break;
-                    }
-                }
-            }
-
-            if (resource == null)
-            {
-                var color = hammerEntity?.Color ?? new Color32(255, 0, 255, 255);
-
-                // Do not use transformationMatrix because scales need to be ignored
-                EntityTransformHelper.DecomposeTransformationMatrix(entity, out _, out var rotationMatrix, out var positionVector);
-
-                var boxNode = new SimpleBoxSceneNode(scene, color, new Vector3(16f))
-                {
-                    Transform = rotationMatrix * Matrix4x4.CreateTranslation(positionVector),
-                    LayerName = layerName,
-                    Name = filename,
-                    EntityData = entity,
-                    Flags = flags,
-                };
-                scene.Add(boxNode, true);
-            }
-            else if (resource.ResourceType == ResourceType.Model && resource.DataBlock is Model modelData)
-            {
-                var modelNode = IsCamera(classname)
-                    ? new CameraSceneNode(scene, modelData)
-                    : new ModelSceneNode(scene, modelData, null, isWorldPreview: true) { Name = filename };
-
-                modelNode.Transform = transformationMatrix;
-                modelNode.LayerName = layerName;
-                modelNode.EntityData = entity;
-                modelNode.Flags |= flags;
-
-                var isAnimated = modelNode.SetAnimationForWorldPreview("tools_preview");
-
-                scene.Add(modelNode, true);
-            }
-            else if (resource.ResourceType == ResourceType.Material)
-            {
-                var spriteNode = new SpriteSceneNode(scene, RendererContext, resource, transformationMatrix.Translation)
-                {
-                    LayerName = layerName,
-                    Name = filename,
-                    EntityData = entity,
-                    Flags = flags,
-                };
-                scene.Add(spriteNode, true);
-            }
-            else
-            {
-                throw new InvalidDataException($"Got resource {resource.ResourceType} for class \"{classname}\"");
-            }
 
             if (hammerEntity?.Lines.Length > 0)
             {
@@ -1583,7 +1587,7 @@ namespace ValveResourceFormat.Renderer.World
                     }
 
                     var end = transformationMatrix.Translation;
-                    var start = EntityTransformHelper.CalculateTransformationMatrix(startEntity).Translation;
+                    var start = EntityTransformHelper.ToTransformationMatrix(startEntity).Translation;
 
                     if (line.EndKey != null && line.EndValueKey != null)
                     {
@@ -1599,7 +1603,7 @@ namespace ValveResourceFormat.Renderer.World
                             continue;
                         }
 
-                        end = EntityTransformHelper.CalculateTransformationMatrix(endEntity).Translation;
+                        end = EntityTransformHelper.ToTransformationMatrix(endEntity).Translation;
                     }
 
                     var origin = (start + end) / 2f;
@@ -1616,7 +1620,7 @@ namespace ValveResourceFormat.Renderer.World
             }
         }
 
-        private void CreateEntityConnectionLines(Entity entity, Vector3 start)
+        private void CreateEntityConnectionLines(Entity entity, Vector3 start, EntityIOTargetResolver connectionTargets)
         {
             if (entity.Connections == null)
             {
@@ -1624,46 +1628,42 @@ namespace ValveResourceFormat.Renderer.World
             }
 
             var alreadySeen = new HashSet<Entity>(entity.Connections.Count);
+            var targets = new List<Entity>();
 
             foreach (var connectionData in entity.Connections)
             {
-                var targetType = connectionData.GetEnumValue<EntityIOTargetType>("m_targetType");
+                targets.Clear();
+                var outcome = connectionTargets.Resolve(connectionData, targets);
 
-                if (targetType != EntityIOTargetType.EntityNameOrClassName)
+                if (outcome != EntityIOTargetOutcome.Matched)
                 {
-                    RendererContext.Logger.LogDebug("Skipping entity i/o type {TargetType}", targetType);
+                    RendererContext.Logger.LogDebug("Skipping entity i/o output {TargetName}: {Outcome}", connectionData.TargetName, outcome);
                     continue;
                 }
 
-                var targetName = connectionData.GetStringProperty("m_targetName");
-                var endEntity = FindEntityByKeyValue("targetname", targetName);
-
-                if (endEntity == null)
+                foreach (var endEntity in targets)
                 {
-                    RendererContext.Logger.LogDebug("Did not find entity i/o output {TargetName}", targetName);
-                    continue;
-                }
+                    if (!alreadySeen.Add(endEntity))
+                    {
+                        continue;
+                    }
 
-                if (!alreadySeen.Add(endEntity))
-                {
-                    continue;
-                }
+                    var end = EntityTransformHelper.ToTransformationMatrix(endEntity).Translation;
 
-                var end = EntityTransformHelper.CalculateTransformationMatrix(endEntity).Translation;
+                    var origin = (start + end) / 2f;
+                    end -= origin;
+                    var lineStart = start - origin;
 
-                var origin = (start + end) / 2f;
-                end -= origin;
-                var lineStart = start - origin;
-
-                var lineNode = new LineSceneNode(scene, lineStart, end, new Color32(0, 255, 0), new Color32(255, 0, 0))
-                {
-                    LayerName = "Entity Connections",
-                    Transform = Matrix4x4.CreateTranslation(origin),
+                    var lineNode = new LineSceneNode(scene, lineStart, end, new Color32(0, 255, 0), new Color32(255, 0, 0))
+                    {
+                        LayerName = "Entity Connections",
+                        Transform = Matrix4x4.CreateTranslation(origin),
 #if DEBUG
-                    Name = $"Line from {entity.GetStringProperty("hammeruniqueid")} to {endEntity.GetStringProperty("hammeruniqueid")}"
+                        Name = $"Line from {entity.GetStringProperty("hammeruniqueid")} to {endEntity.GetStringProperty("hammeruniqueid")}"
 #endif
-                };
-                scene.Add(lineNode, true);
+                    };
+                    scene.Add(lineNode, true);
+                }
             }
         }
 
@@ -1682,7 +1682,7 @@ namespace ValveResourceFormat.Renderer.World
             }
 
             var visited = new Dictionary<Entity, int>();
-            var current = FindEntityByKeyValue("targetname", startName);
+            var current = FindEntityByTargetName(startName);
 
             while (current != null && current.GetStringProperty("classname") == "path_corner")
             {
@@ -1694,15 +1694,54 @@ namespace ValveResourceFormat.Renderer.World
 
                 visited[current] = nodes.Count;
                 nodes.Add(new FloraMoverPathNode(
-                    EntityTransformHelper.CalculateTransformationMatrix(current).Translation,
+                    EntityTransformHelper.ToTransformationMatrix(current).Translation,
                     current.GetFloatProperty("speed"),
                     current.GetFloatProperty("wait")));
 
                 var nextName = current.GetStringProperty("target");
-                current = string.IsNullOrEmpty(nextName) ? null : FindEntityByKeyValue("targetname", nextName);
+                current = string.IsNullOrEmpty(nextName) ? null : FindEntityByTargetName(nextName);
             }
 
             return (nodes, loopBackIndex);
+        }
+
+        // cpoint0 hands the effect's placement to another entity: control point 0 sits at that entity's
+        // location rather than at the particle entity's own origin.
+        private Matrix4x4 ResolveControlPoint0Transform(Entity entity, Matrix4x4 transformationMatrix)
+        {
+            var controlPoint0 = entity.GetStringProperty("cpoint0");
+
+            if (string.IsNullOrEmpty(controlPoint0))
+            {
+                return transformationMatrix;
+            }
+
+            var target = FindEntityByTargetName(controlPoint0);
+
+            if (target == null)
+            {
+                RendererContext.Logger.LogWarning("Particle entity '{Target}' points cpoint0 at '{ControlPoint0}', which does not exist",
+                    entity.TargetName, controlPoint0);
+                return transformationMatrix;
+            }
+
+            return EntityTransformHelper.ToTransformationMatrix(target);
+        }
+
+        private static void ApplyParticleGlowProperties(Entity entity, ParticleSceneNode particleNode)
+        {
+            particleNode.GetControlPoint(16).Position = entity.GetVector3Property("colortint", new Vector3(255f));
+            particleNode.GetControlPoint(17).Position = new Vector3(
+                entity.GetFloatProperty("alphascale", 1f),
+                entity.GetFloatProperty("scale", 1f),
+                entity.GetFloatProperty("selfillumscale", 1f));
+
+            var textureOverride = entity.GetStringProperty("effect_textureOverride");
+
+            if (!string.IsNullOrEmpty(textureOverride))
+            {
+                particleNode.SetTextureOverride(textureOverride);
+            }
         }
 
         private Entity? FindEntityByKeyValue(string keyToFind, string valueToFind)
@@ -1717,6 +1756,31 @@ namespace ValveResourceFormat.Renderer.World
                 if (entity.TryGetValue(keyToFind, out var propertyValue)
                     && propertyValue.ValueType == ValveKeyValue.KVValueType.String
                     && valueToFind.Equals((string)propertyValue, StringComparison.OrdinalIgnoreCase))
+                {
+                    return entity;
+                }
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// Finds the first entity which matches its name with the given pattern.
+        /// </summary>
+        /// <param name="pattern">Targetname to match against, may contain wildcards: `*` and `?` (e.g. <c>door_*</c>).</param>
+        /// <returns>The matching <see cref="Entity"/>, or <see langword="null"/> if not found.</returns>
+        public Entity? FindEntityByTargetName(string pattern)
+        {
+            if (pattern == null)
+            {
+                return null;
+            }
+
+            foreach (var entity in Entities)
+            {
+                if (entity.TryGetValue("targetname", out var propertyValue)
+                    && propertyValue.ValueType == ValveKeyValue.KVValueType.String
+                    && EntityNameMatches(pattern, (string)propertyValue))
                 {
                     return entity;
                 }

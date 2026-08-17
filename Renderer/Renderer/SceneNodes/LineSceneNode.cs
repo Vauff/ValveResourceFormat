@@ -59,11 +59,14 @@ namespace ValveResourceFormat.Renderer.SceneNodes
             }
 
             var renderShader = context.ReplacementShader ?? lineBuffer.Shader;
+
+            using var _ = Scene.RendererContext.RenderState.Scope();
+
             renderShader.Use();
             renderShader.SetUniform3x4("transform", Transform);
             renderShader.SetBoneAnimationData(false);
 
-            lineBuffer.Draw(Id, context.ReplacementShader);
+            lineBuffer.Draw(Id);
         }
     }
 }

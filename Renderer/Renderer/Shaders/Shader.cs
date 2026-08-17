@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Logging;
 using OpenTK.Graphics.OpenGL;
 using ValveResourceFormat.ThirdParty;
 
@@ -104,12 +105,70 @@ namespace ValveResourceFormat.Renderer.Shaders
         /// <summary>Gets the <see cref="MaterialLoader"/> used to resolve fallback textures.</summary>
         internal MaterialLoader MaterialLoader { get; init; }
 
-        /// <summary>Gets a mapping from vertex attribute names to their OpenGL attribute locations.</summary>
-        public Dictionary<string, int> Attributes { get; } = [];
+        /// <summary>Gets the logger for messages about this shader.</summary>
+        internal ILogger Logger { get; init; }
+
+        /// <summary>Gets the renderer context this shader was loaded for.</summary>
+        internal RendererContext RendererContext { get; }
 
         /// <summary>Gets a value indicating whether material data (textures and params) should be skipped during rendering.</summary>
         public bool IgnoreMaterialData { get; }
 
+        /// <summary>Replacement shader that reads the material's color texture.</summary>
+        public bool IsDepthOnlyAlphaTest => Name == "depth_only" && Parameters.GetValueOrDefault("F_ALPHA_TEST") == 1;
+
+        private readonly ShaderLoader shaderLoader;
+        private Dictionary<(string Combo, byte Value), Shader>? variants;
+
+        /// <summary>
+        /// Gets this shader with one combo set differently. Cached, so a pass can pick a variant per draw
+        /// instead of loading every combination up front. Chain the calls to move on more than one combo.
+        /// </summary>
+        public Shader WithCombo(string combo, byte value)
+        {
+            if (Parameters.GetValueOrDefault(combo) == value)
+            {
+                return this;
+            }
+
+            variants ??= [];
+
+            if (!variants.TryGetValue((combo, value), out var variant))
+            {
+                var combos = new Dictionary<string, byte>(Parameters, StringComparer.Ordinal)
+                {
+                    [combo] = value,
+                };
+
+                variant = shaderLoader.LoadShader(Name, combos);
+                variants.Add((combo, value), variant);
+            }
+
+            return variant;
+        }
+
+        /// <summary>Sets a uniform on this shader and on every variant taken from it, which are separate
+        /// programs and so hold their own copy.</summary>
+        public void SetUniform1AllVariants(string name, uint value)
+        {
+            SetUniform1(name, value);
+
+            if (variants == null)
+            {
+                return;
+            }
+
+            foreach (var variant in variants.Values)
+            {
+                variant.SetUniform1(name, value);
+            }
+        }
+
+        /// <summary>Gets the locations this program reads, as a mask. Checked in <see cref="VertexArray"/>.</summary>
+        public int RequiredAttributes { get; private set; }
+
+        /// <summary>Gets those locations declared as an integer type, which need an integer format.</summary>
+        public int IntegerAttributes { get; private set; }
 
 #if DEBUG
         /// <summary>Gets the shader file name on disk (debug builds only).</summary>
@@ -123,8 +182,11 @@ namespace ValveResourceFormat.Renderer.Shaders
         {
             Name = name;
             NameHash = MurmurHash2.Hash(Name, StringToken.MURMUR2SEED);
+            RendererContext = rendererContext;
             Default = new RenderMaterial(this);
             MaterialLoader = rendererContext.MaterialLoader;
+            Logger = rendererContext.Logger;
+            shaderLoader = rendererContext.ShaderLoader;
 
             IgnoreMaterialData = Name is "picking"
                                       or "outline"
@@ -132,7 +194,7 @@ namespace ValveResourceFormat.Renderer.Shaders
                                       or "quad_overdraw";
         }
 
-        /// <summary>Ensures the shader program has been linked and its uniforms and attributes have been cached.</summary>
+        /// <summary>Ensures the shader program has been linked and its uniforms have been cached.</summary>
         /// <returns><see langword="true"/> if the shader linked successfully; otherwise <see langword="false"/>.</returns>
         public bool EnsureLoaded()
         {
@@ -143,17 +205,13 @@ namespace ValveResourceFormat.Renderer.Shaders
                 GL.GetProgram(Program, GetProgramParameterName.LinkStatus, out var linkStatus);
                 IsValid = linkStatus == 1;
 
-                foreach (var obj in ShaderObjects)
-                {
-                    GL.DetachShader(Program, obj);
-                    GL.DeleteShader(obj);
-                }
+                DetachAndDeleteShaderObjects();
 
                 if (IsValid)
                 {
-                    StoreAttributeLocations();
                     StoreUniformLocations();
                     BindReservedTextureSlots();
+                    StoreRequiredAttributes();
 
 #if DEBUG
                     VerifyGlobalsLayout();
@@ -163,6 +221,130 @@ namespace ValveResourceFormat.Renderer.Shaders
 
             return IsValid;
         }
+
+        private void DetachAndDeleteShaderObjects()
+        {
+            foreach (var obj in ShaderObjects)
+            {
+                GL.DetachShader(Program, obj);
+                GL.DeleteShader(obj);
+            }
+        }
+
+        /// <summary>
+        /// Deletes the program and the buffer holding its default globals. Any stage objects that
+        /// <see cref="EnsureLoaded"/> did not get to clean up are deleted with it.
+        /// </summary>
+        public void Delete()
+        {
+            if (Program == 0)
+            {
+                return;
+            }
+
+            if (!IsLoaded)
+            {
+                DetachAndDeleteShaderObjects();
+            }
+
+            GL.DeleteProgram(Program);
+
+            Program = 0;
+            IsLoaded = true;
+            IsValid = false;
+
+            Default.Delete();
+        }
+
+        /// <summary>
+        /// Caches the attribute locations the linked program reads, and verifies each landed where its
+        /// <see cref="VertexSlot"/> puts it. Attributes the linker dropped are not active.
+        /// </summary>
+        private void StoreRequiredAttributes()
+        {
+            GL.GetProgram(Program, GetProgramParameterName.ActiveAttributes, out var attributeCount);
+
+            RequiredAttributes = 0;
+            IntegerAttributes = 0;
+
+            for (var i = 0; i < attributeCount; i++)
+            {
+                GL.GetActiveAttrib(Program, i, 64, out _, out var elements, out var type, out var name);
+
+                var location = GL.GetAttribLocation(Program, name);
+
+                if (location < 0)
+                {
+                    continue; // A gl_ builtin
+                }
+
+                // A declaration ShaderParser did not stamp is placed by the driver, where no VAO expects it.
+                // A custom attribute has no canonical location, its slot comes from the declaring set.
+                if (VertexAttributeLocations.Get(name) is var canonical && canonical != -1 && canonical != location)
+                {
+                    ReportBadAttribute($"Shader '{Name}' has attribute '{name}' at location {location}, but {nameof(VertexSlot)} puts it at {canonical}. Its declaration was not stamped, check that it reads 'in <type> {name};'.");
+                }
+
+                // These span a location per element or column, silently taking the slots declared after them
+                else if (elements > 1 || IsMatrix(type))
+                {
+                    ReportBadAttribute($"Shader '{Name}' declares attribute '{name}' as {type}[{elements}], which spans several locations. Vertex attributes have to fit one {nameof(VertexSlot)}.");
+                }
+
+                RequiredAttributes |= 1 << location;
+
+                if (IsInteger(type))
+                {
+                    IntegerAttributes |= 1 << location;
+                }
+            }
+        }
+
+        /// <summary>
+        /// A shader whose attributes the renderer cannot place is an authoring fault, so development builds
+        /// stop on it. A release build only logs, because a mounted shader must not take the viewer down
+        /// from inside a draw call.
+        /// </summary>
+        private void ReportBadAttribute(string message)
+        {
+            Logger.LogError("{Message}", message);
+
+#if DEBUG
+            throw new ShaderLoader.ShaderCompilerException(message);
+#endif
+        }
+
+        /// <summary>Names the attributes this program declares at the given locations.</summary>
+        public string DescribeAttributes(int locationMask)
+        {
+            GL.GetProgram(Program, GetProgramParameterName.ActiveAttributes, out var attributeCount);
+
+            var names = new List<string>();
+
+            for (var i = 0; i < attributeCount; i++)
+            {
+                GL.GetActiveAttrib(Program, i, 64, out _, out _, out _, out var name);
+
+                var location = GL.GetAttribLocation(Program, name);
+
+                if (location >= 0 && (locationMask & (1 << location)) != 0)
+                {
+                    names.Add(name);
+                }
+            }
+
+            return string.Join(", ", names);
+        }
+
+        private static bool IsInteger(ActiveAttribType type) => type
+            is ActiveAttribType.Int or ActiveAttribType.IntVec2 or ActiveAttribType.IntVec3 or ActiveAttribType.IntVec4
+            or ActiveAttribType.UnsignedInt or ActiveAttribType.UnsignedIntVec2 or ActiveAttribType.UnsignedIntVec3 or ActiveAttribType.UnsignedIntVec4;
+
+        private static bool IsMatrix(ActiveAttribType type) => type
+            is ActiveAttribType.FloatMat2 or ActiveAttribType.FloatMat3 or ActiveAttribType.FloatMat4
+            or ActiveAttribType.FloatMat2x3 or ActiveAttribType.FloatMat2x4
+            or ActiveAttribType.FloatMat3x2 or ActiveAttribType.FloatMat3x4
+            or ActiveAttribType.FloatMat4x2 or ActiveAttribType.FloatMat4x3;
 
         private unsafe void StoreUniformLocations()
         {
@@ -390,22 +572,8 @@ namespace ValveResourceFormat.Renderer.Shaders
                     $"'{names[i]}' is at offset {offsets[i]} in '{Name}', but the layout put it at {expected[i]}.");
             }
         }
+
 #endif
-
-        /// <summary>Queries and caches the OpenGL locations of all active vertex attributes.</summary>
-        public void StoreAttributeLocations()
-        {
-            GL.GetProgram(Program, GetProgramParameterName.ActiveAttributes, out var attributeCount);
-
-            Attributes.EnsureCapacity(attributeCount);
-
-            for (var i = 0; i < attributeCount; i++)
-            {
-                GL.GetActiveAttrib(Program, i, 64, out var length, out var size, out var type, out var name);
-                var attribLocation = GL.GetAttribLocation(Program, name);
-                Attributes[name] = attribLocation;
-            }
-        }
 
         /// <summary>Returns the OpenGL location of the named uniform, querying the driver and caching the result on first access.</summary>
         /// <param name="name">The uniform variable name.</param>
@@ -526,17 +694,23 @@ namespace ValveResourceFormat.Renderer.Shaders
             }
         }
 
+
+        /// <summary>
+        /// Gets this shader built for what a mesh supplies. Only a pass that replaces material shaders needs
+        /// it, since a material shader already carries the combo of the mesh it was loaded for.
+        /// </summary>
+        public Shader WithSkinning(MeshSkinning skinning) => WithCombo("D_SKINNING", (byte)skinning);
+
         /// <summary>Sets the <c>uAnimationData</c> uniform used by skinned mesh shaders.</summary>
         /// <param name="animated">Whether skeletal animation is active.</param>
         /// <param name="boneOffset">Offset into the bone transform buffer.</param>
         /// <param name="boneCount">Number of bones influencing this draw call.</param>
-        /// <param name="weightCount">Number of bone weights per vertex.</param>
-        public void SetBoneAnimationData(bool animated, int boneOffset = 0, int boneCount = 0, int weightCount = 0)
+        public void SetBoneAnimationData(bool animated, int boneOffset = 0, int boneCount = 0)
         {
             var uniformLocation = GetUniformLocation("uAnimationData");
             if (uniformLocation > -1)
             {
-                GL.ProgramUniform4((uint)Program, uniformLocation, animated ? 1u : 0u, (uint)boneOffset, (uint)boneCount, (uint)weightCount);
+                GL.ProgramUniform3((uint)Program, uniformLocation, animated ? 1u : 0u, (uint)boneOffset, (uint)boneCount);
             }
         }
 
@@ -619,7 +793,7 @@ namespace ValveResourceFormat.Renderer.Shaders
         /// <param name="shader">The newly compiled shader to replace this instance with.</param>
         public void ReplaceWith(Shader shader)
         {
-            GL.DeleteProgram(Program);
+            Delete();
 
             IsLoaded = false;
             Program = shader.Program;
@@ -640,7 +814,6 @@ namespace ValveResourceFormat.Renderer.Shaders
             ReservedTexturesUsed.UnionWith(shader.ReservedTexturesUsed);
 
             Uniforms.Clear();
-            Attributes.Clear();
         }
 #endif
     }

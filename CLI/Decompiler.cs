@@ -53,6 +53,7 @@ namespace CLI
         private TextureCodec TextureDecodeFlags;
         private string[] FileFilter = [];
         private bool ListResources;
+        private string? GamePath;
         private string? GltfExportFormat;
         private bool GltfExportAnimations;
         private string[] GltfAnimationFilter = [];
@@ -60,6 +61,7 @@ namespace CLI
         private bool GltfExportMaterials;
         private bool GltfExportAdaptTextures;
         private bool GltfExportExtras;
+        private bool GltfComposeAdditive;
         private bool ToolsAssetInfoShort;
 
         // The options below are for collecting stats and testing exporting, this is mostly intended for VRF developers, not end users.
@@ -108,6 +110,7 @@ namespace CLI
         /// <param name="vpk_extensions">-e, File extension(s) filter, example: "vcss_c,vjs_c,vxml_c".</param>
         /// <param name="vpk_filepath">-f, File path filter, example: "panorama/,sounds/" or "scripts/items/items_game.txt".</param>
         /// <param name="vpk_list">-l, Lists all resources in given VPK. File extension and path filters apply.</param>
+        /// <param name="game">Path to a gameinfo.gi file to load search paths from.</param>
         /// <param name="gltf_export_format">Exports meshes/models in given glTF format. Must be either "gltf" or "glb".</param>
         /// <param name="gltf_export_animations">Whether to export model animations during glTF exports.</param>
         /// <param name="gltf_animation_list">Animations to include in the glTF, example "idle,dropped". By default will include all animations.</param>
@@ -115,6 +118,7 @@ namespace CLI
         /// <param name="gltf_export_materials">Whether to export materials during glTF exports.</param>
         /// <param name="gltf_textures_adapt">Whether to perform any glTF spec adaptations on textures (e.g. split metallic map).</param>
         /// <param name="gltf_export_extras">Export additional Mesh properties into glTF extras</param>
+        /// <param name="gltf_compose_additive">Compose additive animations over the bind pose instead of exporting their delta tracks.</param>
         /// <param name="tools_asset_info_short">Whether to print only file paths for tools_asset_info files.</param>
         /// <param name="stats">Collect stats on all input files and then print them. Use "-i steam" to scan all Steam libraries.</param>
         /// <param name="stats_with_loader">When using --stats, use GameFileLoader to load dependencies.</param>
@@ -140,6 +144,7 @@ namespace CLI
             string? vpk_extensions = default,
             string? vpk_filepath = default,
             bool vpk_list = false,
+            string? game = default,
 
             string? gltf_export_format = default,
             bool gltf_export_animations = false,
@@ -148,6 +153,7 @@ namespace CLI
             bool gltf_export_materials = false,
             bool gltf_textures_adapt = false,
             bool gltf_export_extras = false,
+            bool gltf_compose_additive = false,
             bool tools_asset_info_short = false,
 
             bool stats = false,
@@ -183,6 +189,7 @@ namespace CLI
             GltfMeshFilter = gltf_mesh_list?.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries) ?? [];
             GltfExportAdaptTextures = gltf_textures_adapt;
             GltfExportExtras = gltf_export_extras;
+            GltfComposeAdditive = gltf_compose_additive;
             ToolsAssetInfoShort = tools_asset_info_short;
 
             CollectStats = stats;
@@ -198,6 +205,17 @@ namespace CLI
             {
                 OutputFile = Path.GetFullPath(OutputFile);
                 OutputFile = FixPathSlashes(OutputFile);
+            }
+
+            if (game != null)
+            {
+                if (!File.Exists(game))
+                {
+                    Console.Error.WriteLine($"Gameinfo file \"{game}\" does not exist.");
+                    return 1;
+                }
+
+                GamePath = Path.GetFullPath(game);
             }
 
             for (var i = 0; i < FileFilter.Length; i++)
@@ -228,6 +246,12 @@ namespace CLI
                 return 1;
             }
 
+            if (ListResources && OutputFile != null)
+            {
+                Console.Error.WriteLine("Do not use --vpk_list with --output.");
+                return 1;
+            }
+
             if (StatsWithLoader)
             {
                 if (!CollectStats)
@@ -243,7 +267,7 @@ namespace CLI
                 }
             }
 
-            if (!Decompile && (GltfExportFormat != null || GltfExportAnimations || GltfExportMaterials || GltfExportAdaptTextures || GltfExportExtras))
+            if (!Decompile && (GltfExportFormat != null || GltfExportAnimations || GltfExportMaterials || GltfExportAdaptTextures || GltfExportExtras || GltfComposeAdditive))
             {
                 Console.Error.WriteLine("Exporting to glTF requires specifying -d argument.");
                 return 1;
@@ -650,7 +674,7 @@ namespace CLI
 
                 if (OutputFile != null)
                 {
-                    using var outputFileLoader = new GameFileLoader(null, resource.FileName);
+                    using var outputFileLoader = CreateGameFileLoader(null, resource.FileName);
 
                     path = Path.ChangeExtension(path, extension);
                     var outFilePath = GetOutputPath(path);
@@ -690,10 +714,6 @@ namespace CLI
             {
                 return;
             }
-
-            //Console.WriteLine("\tInput Path: \"{0}\"", args[fi]);
-            //Console.WriteLine("\tResource Name: \"{0}\"", "???");
-            //Console.WriteLine("\tID: {0:x16}", 0);
 
             lock (ConsoleWriterLock)
             {
@@ -828,7 +848,7 @@ namespace CLI
                     var outFilePath = Path.ChangeExtension(GetOutputPath(path), GltfExportFormat);
                     Directory.CreateDirectory(Path.GetDirectoryName(outFilePath)!);
 
-                    using var fileLoader = new GameFileLoader(null, path);
+                    using var fileLoader = CreateGameFileLoader(null, path);
                     CreateGltfExporter(fileLoader).Export(navMeshFile, path, outFilePath);
                     return;
                 }
@@ -1012,7 +1032,7 @@ namespace CLI
                             return RecursiveSearchArchives;
                         }
 
-                        return SupportedFileNamesRegex().IsMatch(x.Key);
+                        return SupportedFileNamesRegex().IsMatch($".{x.Key}");
                     }).ToList();
                 }
 
@@ -1070,7 +1090,7 @@ namespace CLI
                     }
                     else
                     {
-                        using var fileLoader = StatsWithLoader ? new GameFileLoader(package, package.FileName) : null;
+                        using var fileLoader = StatsWithLoader ? CreateGameFileLoader(package, package.FileName) : null;
 
                         while (queue.TryDequeue(out var file))
                         {
@@ -1104,7 +1124,6 @@ namespace CLI
                     var firstLine = true;
                     var goodCachedVersion = false;
 
-                    // add version
                     while ((line = file.ReadLine()) != null)
                     {
                         var lineSpan = line.AsSpan();
@@ -1142,7 +1161,7 @@ namespace CLI
                     }
                 }
 
-                using var fileLoader = new GameFileLoader(package, package.FileName);
+                using var fileLoader = CreateGameFileLoader(package, package.FileName);
 
                 Debug.Assert(package.Entries != null);
 
@@ -1274,6 +1293,9 @@ namespace CLI
                 var rawFileData = ArrayPool<byte>.Shared.Rent(totalLength);
                 ContentFile? contentFile = null;
 
+                // Must outlive DumpContentFile because content subfiles can be generated lazily from the resource.
+                Resource? resource = null;
+
                 try
                 {
                     package.ReadEntry(file, rawFileData);
@@ -1327,10 +1349,12 @@ namespace CLI
                         }
                         else
                         {
-                            using var resource = new Resource
+#pragma warning disable CA2000 // False positive, resource is disposed in the finally block
+                            resource = new Resource
                             {
                                 FileName = filePath,
                             };
+#pragma warning restore CA2000
                             resource.Read(memory);
 
                             if (GltfExportFormat != null && GltfModelExporter.CanExport(resource))
@@ -1381,9 +1405,22 @@ namespace CLI
                 finally
                 {
                     contentFile?.Dispose();
+                    resource?.Dispose();
                     ArrayPool<byte>.Shared.Return(rawFileData);
                 }
             }
+        }
+
+        private GameFileLoader CreateGameFileLoader(Package? package, string? path)
+        {
+            var fileLoader = new GameFileLoader(package, path);
+
+            if (GamePath != null)
+            {
+                fileLoader.FindAndLoadSearchPaths(GamePath);
+            }
+
+            return fileLoader;
         }
 
         private GltfModelExporter CreateGltfExporter(IFileLoader fileLoader)
@@ -1396,6 +1433,7 @@ namespace CLI
                 ExportMaterials = GltfExportMaterials,
                 AdaptTextures = GltfExportAdaptTextures,
                 ExportExtras = GltfExportExtras,
+                ComposeAdditiveAnimations = GltfComposeAdditive,
                 ProgressReporter = ProgressReporter,
             };
 
@@ -1587,6 +1625,7 @@ namespace CLI
                     break;
 
                 case ResourceType.EntityLump:
+                    // TODO: Also collect unknown attribute/material param hashes from compiled shader dynamic expressions
                     if (DumpUnknownEntityKeys)
                     {
                         var entityLump = (EntityLump?)resource.DataBlock;

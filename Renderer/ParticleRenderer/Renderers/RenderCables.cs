@@ -1,6 +1,6 @@
 using System.Buffers;
-using System.Runtime.InteropServices;
 using OpenTK.Graphics.OpenGL;
+using ValveResourceFormat.Renderer.Particles.Utils;
 using ValveResourceFormat.Renderer.SceneEnvironment;
 using ValveResourceFormat.Renderer.World;
 using ValveResourceFormat.Serialization.KeyValues;
@@ -111,33 +111,16 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
 
         private int SetupBuffers()
         {
-            GL.CreateVertexArrays(1, out int vao);
             GL.CreateBuffers(1, out vertexBufferHandle);
             GL.CreateBuffers(1, out indexBufferHandle);
 
-            var stride = Marshal.SizeOf<CableMeshBuilder.Vertex>();
-            GL.VertexArrayVertexBuffer(vao, 0, vertexBufferHandle, 0, stride);
-            GL.VertexArrayElementBuffer(vao, indexBufferHandle);
+#if DEBUG
+            var label = nameof(RenderCables);
+            GL.ObjectLabel(ObjectLabelIdentifier.Buffer, vertexBufferHandle, label.Length, label);
+            GL.ObjectLabel(ObjectLabelIdentifier.Buffer, indexBufferHandle, label.Length, label);
+#endif
 
-            SetupAttrib(vao, "aVertexPosition", 3, VertexAttribType.Float, false, nameof(CableMeshBuilder.Vertex.Position));
-            SetupAttrib(vao, "aVertexNormal", 3, VertexAttribType.Float, false, nameof(CableMeshBuilder.Vertex.Normal));
-            SetupAttrib(vao, "aTexCoords", 2, VertexAttribType.Float, false, nameof(CableMeshBuilder.Vertex.UV));
-            SetupAttrib(vao, "aVertexColor", 4, VertexAttribType.UnsignedByte, true, nameof(CableMeshBuilder.Vertex.Color));
-
-            return vao;
-        }
-
-        private void SetupAttrib(int vao, string attribName, int size, VertexAttribType type, bool normalized, string field)
-        {
-            var location = GL.GetAttribLocation(shader.Program, attribName);
-            if (location < 0)
-            {
-                return;
-            }
-
-            GL.EnableVertexArrayAttrib(vao, location);
-            GL.VertexArrayAttribFormat(vao, location, size, type, normalized, (int)Marshal.OffsetOf<CableMeshBuilder.Vertex>(field));
-            GL.VertexArrayAttribBinding(vao, location, 0);
+            return CableVertex.InputLayout.CreateVertexArray(nameof(RenderCables), vertexBufferHandle, indexBufferHandle);
         }
 
         public override void Render(ParticleCollection particles, ParticleSystemRenderState systemRenderState, Camera camera)
@@ -156,7 +139,7 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
             var index = 0;
             foreach (ref var particle in particles.Current)
             {
-                chain[index++] = (particle.ParticleID, particle.Position, particle.Radius, particle.Color);
+                chain[index++] = (particle.UniqueParticleId, particle.Position, particle.Radius, particle.Color);
             }
 
             chain.Sort(ChainComparer);
@@ -223,7 +206,7 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
 
             var ringPositions = ArrayPool<Vector3>.Shared.Rent(ringCount);
             var ringSamples = ArrayPool<RopeSample>.Shared.Rent(ringCount);
-            var vertexArray = ArrayPool<CableMeshBuilder.Vertex>.Shared.Rent(vertexCount);
+            var vertexArray = ArrayPool<CableVertex>.Shared.Rent(vertexCount);
             var indexArray = IndexArrayPool.Rent(tubeIndexCount);
 
             try
@@ -237,7 +220,7 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
                     return;
                 }
 
-                var stride = Marshal.SizeOf<CableMeshBuilder.Vertex>();
+                var stride = CableVertex.InputLayout.Stride;
                 GL.NamedBufferData(vertexBufferHandle, vertexCount * stride, vertexArray, BufferUsageHint.DynamicDraw);
                 GL.NamedBufferData(indexBufferHandle, tubeIndexCount * sizeof(uint), indexArray, BufferUsageHint.DynamicDraw);
                 indexCount = tubeIndexCount;
@@ -246,7 +229,7 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
             {
                 ArrayPool<Vector3>.Shared.Return(ringPositions);
                 ArrayPool<RopeSample>.Shared.Return(ringSamples);
-                ArrayPool<CableMeshBuilder.Vertex>.Shared.Return(vertexArray);
+                ArrayPool<CableVertex>.Shared.Return(vertexArray);
                 IndexArrayPool.Return(indexArray);
             }
 
@@ -273,7 +256,7 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
             for (var i = 0; i < segmentCount; i++)
             {
                 var direction = positions[i + 1] - positions[i];
-                directions[i] = direction.LengthSquared() > 1e-8f ? Vector3.Normalize(direction) : Vector3.UnitX;
+                directions[i] = direction.LengthSquared() > Epsilon.LengthSquared ? Vector3.Normalize(direction) : Vector3.UnitX;
             }
 
             for (var i = 0; i < segmentCount; i++)
@@ -421,7 +404,7 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
             }
 
             shader.Use();
-            GL.BindVertexArray(vaoHandle);
+            VertexArray.Bind(vaoHandle, shader);
             material.Render(shader);
 
             // todo: batch tube draws and call this less often
@@ -443,7 +426,7 @@ namespace ValveResourceFormat.Renderer.Particles.Renderers
 
         public override void Delete()
         {
-            GL.DeleteVertexArray(vaoHandle);
+            VertexArray.Delete(vaoHandle);
             GL.DeleteBuffer(vertexBufferHandle);
             GL.DeleteBuffer(indexBufferHandle);
 

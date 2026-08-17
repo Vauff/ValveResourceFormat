@@ -8,6 +8,8 @@ using GUI.Utils;
 using OpenTK.Graphics.OpenGL;
 using OpenTK.Windowing.Common;
 using OpenTK.Windowing.Desktop;
+using ValveResourceFormat;
+using ValveResourceFormat.CompiledShader;
 using ValveResourceFormat.Renderer;
 using ValveResourceFormat.Renderer.Input;
 using Windows.Win32;
@@ -162,19 +164,22 @@ internal abstract class GLBaseControl : IDisposable, IMessageFilter
         UiControl.SuspendLayout();
 
 #if DEBUG // We want reload shaders to be the top most button
-        var button = new ThemedButton
+        if (ShowReloadShadersButton)
         {
-            Text = "Reload shaders",
-            AutoSize = true,
-        };
-        button.Click += OnButtonClick;
+            var button = new ThemedButton
+            {
+                Text = "Reload shaders",
+                AutoSize = true,
+            };
+            button.Click += OnButtonClick;
 
-        void OnButtonClick(object? s, EventArgs e)
-        {
-            ShaderHotReload.ReloadShaders();
+            void OnButtonClick(object? s, EventArgs e)
+            {
+                ShaderHotReload.ReloadShaders();
+            }
+
+            UiControl.AddControl(button);
         }
-
-        UiControl.AddControl(button);
 #endif
 
         AddUiControls();
@@ -202,6 +207,10 @@ internal abstract class GLBaseControl : IDisposable, IMessageFilter
     {
         GLControl?.Invalidate();
     }
+
+    /// <summary>Whether the debug sidebar gets the shader hot-reload button; viewers that never
+    /// compile scene shaders turn it off.</summary>
+    protected virtual bool ShowReloadShadersButton => true;
 
     protected virtual void AddUiControls()
     {
@@ -567,7 +576,6 @@ internal abstract class GLBaseControl : IDisposable, IMessageFilter
 
     protected virtual void OnMouseWheel(int delta, Point location)
     {
-        // Track mouse wheel state
         using var _ = inputStateLock.EnterScope();
         if (delta > 0)
         {
@@ -623,6 +631,10 @@ internal abstract class GLBaseControl : IDisposable, IMessageFilter
                 RendererContext.ViewmodelFieldOfView = Settings.Config.ViewmodelFieldOfView;
                 viewer.Renderer.Camera.FieldOfView = Settings.Config.FieldOfView;
                 viewer.Renderer.Camera.CreateProjectionMatrix();
+
+                // The input camera frames objects using its own field of view, so it follows the setting too
+                viewer.Input.Camera.FieldOfView = Settings.Config.FieldOfView;
+                viewer.Input.Camera.CreateProjectionMatrix();
             }
         }
     }
@@ -636,9 +648,7 @@ internal abstract class GLBaseControl : IDisposable, IMessageFilter
 
     protected virtual void OnFirstPaint()
     {
-        var current = Stopwatch.GetTimestamp();
-        var elapsed = Stopwatch.GetElapsedTime(LastUpdate, current);
-        LastUpdate = current;
+        var elapsed = Stopwatch.GetElapsedTime(LastUpdate, Stopwatch.GetTimestamp());
 
         Log.Debug(nameof(GLBaseControl), $"First paint: {elapsed}");
     }
@@ -755,7 +765,7 @@ internal abstract class GLBaseControl : IDisposable, IMessageFilter
 #endif
 
         GLEnvironment.Initialize(VrfGuiContext.Logger);
-        GLEnvironment.SetDefaultRenderState();
+        GLEnvironment.SetDefaultRenderState(RendererContext);
 
         MaxSamples = GL.GetInteger(GetPName.MaxSamples);
         GLDefaultFramebuffer = Framebuffer.GLDefaultFramebuffer;
@@ -764,23 +774,11 @@ internal abstract class GLBaseControl : IDisposable, IMessageFilter
         MainFramebuffer = Framebuffer.Prepare(nameof(MainFramebuffer),
             4, 4,
             NumSamples,
-            new(PixelInternalFormat.Rgba16f, PixelFormat.Rgba, PixelType.HalfFloat),
-            Framebuffer.DepthAttachmentFormat.Depth32FStencil8
+            ImageFormat.RGBA16161616F,
+            ImageFormat.D32
         );
 
-        var status = MainFramebuffer.Initialize();
-
-        if (status != FramebufferErrorCode.FramebufferComplete)
-        {
-            Log.Error(nameof(GLBaseControl), $"Framebuffer failed to initialize with error: {status}");
-            Log.Info(nameof(GLBaseControl), "Falling back to default framebuffer.");
-
-            MainFramebuffer.Delete();
-            MainFramebuffer = GLDefaultFramebuffer;
-            GL.Enable(EnableCap.FramebufferSrgb);
-        }
-
-        MainFramebuffer.ClearMask |= ClearBufferMask.StencilBufferBit;
+        MainFramebuffer.Initialize();
 
         OnGLLoad();
     }
@@ -867,7 +865,9 @@ internal abstract class GLBaseControl : IDisposable, IMessageFilter
             ShouldResize = false;
         }
 
-        if (FirstPaint)
+        var firstDraw = FirstPaint;
+
+        if (firstDraw)
         {
             OnFirstPaint();
             FirstPaint = false;
@@ -892,6 +892,11 @@ internal abstract class GLBaseControl : IDisposable, IMessageFilter
         GLNativeWindow.Context.SwapBuffers();
 
         GLNativeWindow.Context.MakeNoneCurrent();
+
+        if (firstDraw)
+        {
+            LastUpdate = Stopwatch.GetTimestamp();
+        }
     }
 
     protected virtual void BlitFramebufferToScreen()

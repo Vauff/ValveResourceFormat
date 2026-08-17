@@ -199,7 +199,6 @@ namespace ValveResourceFormat.CompiledShader
             }
             var dynExpCount = 0;
             var indexPad = program.VariableDescriptions.Length > 100 ? 3 : 2;
-            // parameters
             output.WriteLine($"VARIABLE DESCRIPTIONS({program.VariableDescriptions.Length})    *dyn-expressions shown separately");
             output.DefineHeaders(["index",
                 nameof(VfxVariableDescription.Name),
@@ -347,8 +346,9 @@ namespace ValveResourceFormat.CompiledShader
             }
             foreach (var channelBlock in program.TextureChannelProcessors)
             {
-                var channelRemap = channelBlock.Channel.Indices.Select((ind, i) => ind != 0 && ind != i).Any(b => b)
-                    ? $" [{string.Join(", ", channelBlock.Channel.Indices)}]"
+                var destinations = channelBlock.Channel.Destinations;
+                var channelRemap = destinations.Where((destination, i) => destination != i).Any()
+                    ? $" [{string.Join(", ", destinations)}]"
                     : string.Empty;
                 output.AddTabulatedRow([$"[{channelBlock.BlockIndex,2}]",
                     $"{channelBlock.TexProcessorName}",

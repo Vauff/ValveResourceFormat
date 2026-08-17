@@ -432,7 +432,6 @@ public sealed class MapExtract
             }
         }
 
-        //convert phys to hammer meshes
         if (phys != null)
         {
             foreach (var hammermesh in PhysToHammerMeshes(phys))
@@ -1305,16 +1304,24 @@ public sealed class MapExtract
 
             var mapEntity = new CMapEntity();
             var entityLineage = AddProperties(className, compiledEntity, mapEntity);
-            var localTransform = EntityTransformHelper.CalculateTransformationMatrix(compiledEntity);
+            var localTransform = EntityTransformHelper.ToTransformationMatrix(compiledEntity);
             var worldTransform = parentTransform is { } parent ? localTransform * parent : localTransform;
             if (parentTransform is not null)
             {
                 // parent transform is rigid (rotation and translation only), so worldTransform is affine and
-                // decomposes cleanly unless the child itself shears (non-uniform scale + rotation)
-                _ = Matrix4x4.Decompose(worldTransform, out var scales, out var rotation, out var translation);
-                mapEntity.Origin = translation;
-                mapEntity.Angles = EntityTransformHelper.ToEulerAngles(rotation);
-                mapEntity.Scales = scales;
+                // decomposes cleanly unless the child itself shears (non-uniform scale + rotation). Where it
+                // does shear, keep the entity's own placement rather than silently writing out an identity
+                // rotation the decompose left behind.
+                if (Matrix4x4.Decompose(worldTransform, out var scales, out var rotation, out var translation))
+                {
+                    mapEntity.Origin = translation;
+                    mapEntity.Angles = EntityTransformHelper.ToEulerAngles(rotation);
+                    mapEntity.Scales = scales;
+                }
+                else
+                {
+                    ProgressReporter?.Report($"Failed to decompose transform for entity '{className}', its placement may be wrong.");
+                }
 
                 if (TryDeduplicateTemplateChild(compiledEntity))
                 {
@@ -1369,7 +1376,7 @@ public sealed class MapExtract
                 {
                     if (ChildEntityLumps.Remove(entityLumpName, out var childEntityLump))
                     {
-                        var childLumpTransform = EntityTransformHelper.CalculateRigidTransformationMatrix(compiledEntity) * (parentTransform ?? Matrix4x4.Identity);
+                        var childLumpTransform = EntityTransformHelper.ToRigidTransformationMatrix(compiledEntity) * (parentTransform ?? Matrix4x4.Identity);
                         GatherEntitiesFromLump(childEntityLump, childLumpTransform);
                     }
                     else
@@ -1535,13 +1542,13 @@ public sealed class MapExtract
             {
                 var dmeConnection = new DmeConnectionData
                 {
-                    OutputName = connection.GetStringProperty("m_outputName"),
-                    TargetType = connection.GetInt32Property("m_targetType"),
-                    TargetName = RemoveTargetnamePrefix(connection.GetStringProperty("m_targetName")),
-                    InputName = connection.GetStringProperty("m_inputName"),
-                    OverrideParam = connection.GetStringProperty("m_overrideParam"),
-                    Delay = connection.GetFloatProperty("m_flDelay"),
-                    TimesToFire = connection.GetInt32Property("m_nTimesToFire"),
+                    OutputName = connection.OutputName,
+                    TargetType = (int)connection.TargetType,
+                    TargetName = RemoveTargetnamePrefix(connection.TargetName),
+                    InputName = connection.InputName,
+                    OverrideParam = connection.OverrideParam,
+                    Delay = connection.Delay,
+                    TimesToFire = connection.TimesToFire,
                 };
 
                 mapEntity.ConnectionsData.Add(dmeConnection);
@@ -1653,23 +1660,6 @@ public sealed class MapExtract
             _ when data.GetType().IsPrimitive => Convert.ToString(data, CultureInfo.InvariantCulture),
             _ => throw new NotImplementedException()
         };
-    }
-
-    private static string RemoveTargetnamePrefix(string? value)
-    {
-        if (string.IsNullOrEmpty(value))
-        {
-            return string.Empty;
-        }
-
-        const string Prefix = "[PR#]";
-
-        if (!value.StartsWith(Prefix, StringComparison.Ordinal))
-        {
-            return value;
-        }
-
-        return value[Prefix.Length..];
     }
 
     #endregion Entities

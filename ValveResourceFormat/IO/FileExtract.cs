@@ -104,9 +104,6 @@ namespace ValveResourceFormat.IO
         /// <summary>
         /// Gets or sets the file name (relative to the content file).
         /// </summary>
-        /// <remarks>
-        /// This is relative to the content file.
-        /// </remarks>
         public string FileName { get; set; } = string.Empty;
 
         /// <summary>
@@ -291,8 +288,9 @@ namespace ValveResourceFormat.IO
                     contentFile = new NmClipExtract(resource, fileLoader).ToContentFile();
                     break;
 
+                // A graph variation holds no nodes, only the graph it binds and the skeleton and
+                // clips bound to it; the base graph's document already carries every variation.
                 case ResourceType.NmGraph:
-                case ResourceType.NmGraphVariation:
                     using (var nmGraphExtract = new NmGraphExtract(resource, fileLoader))
                     {
                         contentFile = nmGraphExtract.ToContentFile();

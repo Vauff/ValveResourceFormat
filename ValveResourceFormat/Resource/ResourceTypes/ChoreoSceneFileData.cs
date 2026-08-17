@@ -37,7 +37,7 @@ namespace ValveResourceFormat.ResourceTypes
             Version = reader.ReadInt32();
             var sceneCount = reader.ReadInt32();
             var strings = ReadStrings(reader);
-            reader.ReadInt32(); //Proportional to total length of strings or file size. Probably nothing useful.
+            reader.ReadInt32(); //Size of the string data in bytes, aligned to 4 bytes
 
             Scenes = ReadScenes(reader, sceneCount, strings);
         }
@@ -68,7 +68,7 @@ namespace ValveResourceFormat.ResourceTypes
 
         private static ChoreoScene ReadScene(BinaryReader reader, string[] strings)
         {
-            var namePosition = ReadPosition(reader);
+            var name = reader.ReadOffsetString(Encoding.ASCII);
             var blockPosition = ReadPosition(reader);
             var length = reader.ReadInt32();
             var sceneDuration = reader.ReadInt32();
@@ -76,9 +76,6 @@ namespace ValveResourceFormat.ResourceTypes
             var hasSounds = reader.ReadInt32(); //This is always 0 or 1
 
             var previousPosition = reader.BaseStream.Position;
-
-            reader.BaseStream.Position = namePosition;
-            var name = reader.ReadNullTermString(Encoding.ASCII);
 
             reader.BaseStream.Position = blockPosition;
             var sceneBlock = ReadSceneBlock(reader, length);

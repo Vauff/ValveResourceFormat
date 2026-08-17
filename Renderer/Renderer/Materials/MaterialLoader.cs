@@ -7,6 +7,7 @@ using System.Reflection;
 using System.Runtime.InteropServices;
 using OpenTK.Graphics.OpenGL;
 using SkiaSharp;
+using ValveResourceFormat.CompiledShader;
 using ValveResourceFormat.ResourceTypes;
 using VrfMaterial = ValveResourceFormat.ResourceTypes.Material;
 
@@ -28,19 +29,32 @@ namespace ValveResourceFormat.Renderer.Materials
         private RenderTexture? DefaultNormal;
         private RenderTexture? DefaultMask;
         private RenderTexture? DefaultColor;
+        private RenderTexture? DefaultVolume;
         /// <summary>Gets or sets the maximum anisotropy level applied to newly loaded textures when anisotropic filtering is enabled.</summary>
         public static float MaxTextureMaxAnisotropy { get; set; }
 
         /// <summary>Gets the number of materials currently held in the cache.</summary>
         public int MaterialCount => Materials.Count;
 
-        private readonly Dictionary<string, string[]> TextureAliases = new()
+        /// <summary>
+        /// Maps a material texture parameter name to the shader uniforms it can feed, in preference order.
+        /// The first candidate the shader declares and that is not already bound wins.
+        /// </summary>
+        private static readonly Dictionary<string, string[]> TextureAliases = new(StringComparer.Ordinal)
         {
-            ["g_tLayer2Color"] = ["g_tColorB", "g_tColor2"],
-            ["g_tColor"] = ["g_tColor2", "g_tColor1", "g_tColorA", "g_tColorB", "g_tColorC", "g_tGlassDust"],
-            ["g_tNormal"] = ["g_tNormalA", "g_tNormalRoughness", "g_tLayer1NormalRoughness", "g_tNormalRoughness1"],
-            ["g_tLayer2NormalRoughness"] = ["g_tNormalB", "g_tNormalRoughness2"],
-            ["g_tAmbientOcclusion"] = ["g_tLayer1AmbientOcclusion"],
+            ["g_tColor1"] = ["g_tColor"],
+            ["g_tColor2"] = ["g_tColor", "g_tLayer2Color"],
+            ["g_tColorA"] = ["g_tColor"],
+            ["g_tColorB"] = ["g_tLayer2Color", "g_tColor"],
+            ["g_tColorC"] = ["g_tColor"],
+            ["g_tGlassDust"] = ["g_tColor"],
+            ["g_tNormalA"] = ["g_tNormal"],
+            ["g_tNormalB"] = ["g_tLayer2NormalRoughness"],
+            ["g_tNormalRoughness"] = ["g_tNormal"],
+            ["g_tNormalRoughness1"] = ["g_tNormal"],
+            ["g_tNormalRoughness2"] = ["g_tLayer2NormalRoughness"],
+            ["g_tLayer1NormalRoughness"] = ["g_tNormal"],
+            ["g_tLayer1AmbientOcclusion"] = ["g_tAmbientOcclusion"],
         };
 
         /// <summary>Initializes a new instance of the <see cref="MaterialLoader"/> class.</summary>
@@ -152,24 +166,27 @@ namespace ValveResourceFormat.Renderer.Materials
 
             foreach (var (textureName, texturePath) in mat.Material.TextureParams)
             {
-                if (TryBindTexture(mat, textureName, texturePath))
+                TryBindTexture(mat, textureName, texturePath);
+            }
+
+            foreach (var (textureName, texturePath) in mat.Material.TextureParams)
+            {
+                if (mat.Textures.ContainsKey(textureName)
+                || !TextureAliases.TryGetValue(textureName, out var aliases))
                 {
                     continue;
                 }
 
-                foreach (var (possibleAlias, aliases) in TextureAliases)
+                foreach (var alias in aliases)
                 {
-                    if (mat.Textures.ContainsKey(possibleAlias))
+                    if (mat.Textures.ContainsKey(alias))
                     {
                         continue;
                     }
 
-                    if (aliases.Contains(textureName))
+                    if (TryBindTexture(mat, alias, texturePath))
                     {
-                        if (TryBindTexture(mat, possibleAlias, texturePath))
-                        {
-                            break;
-                        }
+                        break;
                     }
                 }
             }
@@ -233,6 +250,12 @@ namespace ValveResourceFormat.Renderer.Materials
             }
 
             GL.CreateSamplers(1, out sampler);
+
+#if DEBUG
+            var samplerLabel = $"Sampler{addressModeU}{addressModeV}";
+            GL.ObjectLabel(ObjectLabelIdentifier.Sampler, sampler, samplerLabel.Length, samplerLabel);
+#endif
+
             GL.SamplerParameter(sampler, SamplerParameterName.TextureWrapS, (int)MapAddressMode(addressModeU));
             GL.SamplerParameter(sampler, SamplerParameterName.TextureWrapT, (int)MapAddressMode(addressModeV));
             GL.SamplerParameter(sampler, SamplerParameterName.TextureMinFilter, (int)(mipmaps ? TextureMinFilter.LinearMipmapLinear : TextureMinFilter.Linear));
@@ -305,18 +328,20 @@ namespace ValveResourceFormat.Renderer.Materials
                 target = (data.Flags & VTexFlags.VOLUME_TEXTURE) != 0 ? TextureTarget.Texture3D : TextureTarget.Texture2DArray;
             }
 
-            var tex = new RenderTexture(target, data);
+            var tex = new RenderTexture(target, data, System.IO.Path.GetFileName(textureResource.FileName) ?? "UnnamedTexture");
             var format = GetTextureFormat(data.Format);
-            var sizedInternalFormat = srgbRead && format.InternalSrgbFormat is not null ? format.InternalSrgbFormat.Value : format.InternalFormat;
+            var srgb = srgbRead && format.HasSrgbVariant();
 
-#if DEBUG
-            var textureName = System.IO.Path.GetFileName(textureResource.FileName);
+            // todo: BC7 and BC6H are also problematic on pre-RDNA AMD GPUs, when using immutable storage
+            // see https://github.com/ValveResourceFormat/ValveResourceFormat/issues/721
+            var rgba8UncompressedFallback = target == TextureTarget.Texture3D && IsOpenGLUnsupportedTexture3DFormat(data.Format);
 
-            if (textureName != null)
+            if (rgba8UncompressedFallback)
             {
-                tex.SetLabel(textureName);
+                format = ImageFormat.RGBA8888;
             }
-#endif
+
+            var sizedInternalFormat = format.ToGLSizedInternalFormat(srgb);
 
             var texDepth = data.Depth;
 
@@ -352,35 +377,46 @@ namespace ValveResourceFormat.Renderer.Materials
             }
 
             var buffer = ArrayPool<byte>.Shared.Rent(data.GetBiggestBufferSize());
+            byte[]? decodedBuffer = null;
+
+            if (rgba8UncompressedFallback)
+            {
+                decodedBuffer = ArrayPool<byte>.Shared.Rent(data.Width * data.Height * data.Depth * 4);
+            }
 
             try
             {
                 foreach (var (level, width, height, depth, bufferSize) in data.GetEveryMipLevelTexture(buffer, minMipLevelAllowed))
                 {
                     var realLevel = (int)level - minMipLevelAllowed;
+                    var uploadBuffer = buffer;
 
-                    if (format.PixelType is not null)
+                    if (decodedBuffer != null)
                     {
-                        Debug.Assert(format.PixelFormat is not null);
+                        data.DecodeTexture(buffer.AsSpan(0, bufferSize), decodedBuffer, width, height, depth);
+                        uploadBuffer = decodedBuffer;
+                    }
 
+                    if (!format.IsBlockCompressed())
+                    {
                         if (is3d)
                         {
-                            GL.TextureSubImage3D(tex.Handle, realLevel, 0, 0, 0, width, height, depth, format.PixelFormat.Value, format.PixelType.Value, buffer);
+                            GL.TextureSubImage3D(tex.Handle, realLevel, 0, 0, 0, width, height, depth, format.ToGLPixelFormat(), format.ToGLPixelType(), uploadBuffer);
                         }
                         else
                         {
-                            GL.TextureSubImage2D(tex.Handle, realLevel, 0, 0, width, height, format.PixelFormat.Value, format.PixelType.Value, buffer);
+                            GL.TextureSubImage2D(tex.Handle, realLevel, 0, 0, width, height, format.ToGLPixelFormat(), format.ToGLPixelType(), uploadBuffer);
                         }
                     }
                     else
                     {
                         if (is3d)
                         {
-                            GL.CompressedTextureSubImage3D(tex.Handle, realLevel, 0, 0, 0, width, height, depth, (PixelFormat)sizedInternalFormat, bufferSize, buffer);
+                            GL.CompressedTextureSubImage3D(tex.Handle, realLevel, 0, 0, 0, width, height, depth, (PixelFormat)sizedInternalFormat, bufferSize, uploadBuffer);
                         }
                         else
                         {
-                            GL.CompressedTextureSubImage2D(tex.Handle, realLevel, 0, 0, width, height, (PixelFormat)sizedInternalFormat, bufferSize, buffer);
+                            GL.CompressedTextureSubImage2D(tex.Handle, realLevel, 0, 0, width, height, (PixelFormat)sizedInternalFormat, bufferSize, uploadBuffer);
                         }
                     }
                 }
@@ -388,6 +424,11 @@ namespace ValveResourceFormat.Renderer.Materials
             finally
             {
                 ArrayPool<byte>.Shared.Return(buffer);
+
+                if (decodedBuffer != null)
+                {
+                    ArrayPool<byte>.Shared.Return(decodedBuffer);
+                }
             }
 
             if (!isViewerRequest)
@@ -406,41 +447,46 @@ namespace ValveResourceFormat.Renderer.Materials
             return tex;
         }
 
-        /// <param name="InternalFormat">Specifies the sized internal format to be used to store texture image data.</param>
-        /// <param name="InternalSrgbFormat">Same as <see cref="InternalFormat"/>, but for sRGB textures. Null if no sRGB format.</param>
-        /// <param name="PixelFormat">Specifies the format of the pixel data. Must be null if the format is compressed.</param>
-        /// <param name="PixelType">Specifies the data type of the pixel data. Must be null if the format is compressed.</param>
-        /// <see href="https://registry.khronos.org/OpenGL-Refpages/gl4/html/glTexStorage2D.xhtml"/>
-        /// <see href="https://registry.khronos.org/OpenGL-Refpages/gl4/html/glTexSubImage2D.xhtml"/>
-        record struct TextureFormatMapping(SizedInternalFormat InternalFormat, PixelFormat? PixelFormat = null, PixelType? PixelType = null, SizedInternalFormat? InternalSrgbFormat = null);
+        /// <summary>
+        /// Whether a format has to be decompressed before it can be uploaded to a <see cref="TextureTarget.Texture3D"/>.
+        /// Of the block compressed formats only BPTC is specified to work with 3D textures, as a stack of
+        /// independently compressed 2D slices. S3TC and RGTC are two-dimensional only:
+        /// NVIDIA accepts them through NV_texture_compression_vtc, which reuses the very same format enums but expects
+        /// 4x4x4 VTC tiling, so the slices get read back scrambled, and other drivers reject the upload outright.
+        /// </summary>
+        private static bool IsOpenGLUnsupportedTexture3DFormat(VTexFormat vformat) => vformat
+            is VTexFormat.DXT1
+            or VTexFormat.DXT5
+            or VTexFormat.ATI1N
+            or VTexFormat.ATI2N;
 
-        private static TextureFormatMapping GetTextureFormat(VTexFormat vformat) => vformat switch
+        private static ImageFormat GetTextureFormat(VTexFormat vformat) => vformat switch
         {
 #pragma warning disable format
-            VTexFormat.ATI1N           => new((SizedInternalFormat)InternalFormat.CompressedRedRgtc1),
-            VTexFormat.ATI2N           => new((SizedInternalFormat)InternalFormat.CompressedRgRgtc2),
-            VTexFormat.BC6H            => new((SizedInternalFormat)InternalFormat.CompressedRgbBptcUnsignedFloat),
-            VTexFormat.BC7             => new((SizedInternalFormat)InternalFormat.CompressedRgbaBptcUnorm,        InternalSrgbFormat: (SizedInternalFormat)InternalFormat.CompressedSrgbAlphaBptcUnorm),
-            VTexFormat.DXT1            => new((SizedInternalFormat)InternalFormat.CompressedRgbaS3tcDxt1Ext,      InternalSrgbFormat: (SizedInternalFormat)InternalFormat.CompressedSrgbAlphaS3tcDxt1Ext),
-            VTexFormat.DXT5            => new((SizedInternalFormat)InternalFormat.CompressedRgbaS3tcDxt5Ext,      InternalSrgbFormat: (SizedInternalFormat)InternalFormat.CompressedSrgbAlphaS3tcDxt5Ext),
-            VTexFormat.ETC2            => new((SizedInternalFormat)InternalFormat.CompressedRgb8Etc2,             InternalSrgbFormat: (SizedInternalFormat)InternalFormat.CompressedSrgb8Etc2),
-            VTexFormat.ETC2_EAC        => new((SizedInternalFormat)InternalFormat.CompressedRgba8Etc2Eac,         InternalSrgbFormat: (SizedInternalFormat)InternalFormat.CompressedSrgb8Alpha8Etc2Eac),
+            VTexFormat.ATI1N           => ImageFormat.ATI1N,
+            VTexFormat.ATI2N           => ImageFormat.ATI2N,
+            VTexFormat.BC6H            => ImageFormat.BC6H,
+            VTexFormat.BC7             => ImageFormat.BC7,
+            VTexFormat.DXT1            => ImageFormat.DXT1,
+            VTexFormat.DXT5            => ImageFormat.DXT5,
+            VTexFormat.ETC2            => ImageFormat.R8G8B8_ETC2,
+            VTexFormat.ETC2_EAC        => ImageFormat.R8G8B8A8_ETC2_EAC,
 
-            VTexFormat.R16             => new(SizedInternalFormat.R16,        PixelFormat.Red,    PixelType.UnsignedShort),
-            VTexFormat.RG1616          => new(SizedInternalFormat.Rg16,       PixelFormat.Rg,     PixelType.UnsignedShort),
-            VTexFormat.RGBA16161616    => new(SizedInternalFormat.Rgba16,     PixelFormat.Rgba,   PixelType.UnsignedShort),
+            VTexFormat.R16             => ImageFormat.R16,
+            VTexFormat.RG1616          => ImageFormat.RG1616,
+            VTexFormat.RGBA16161616    => ImageFormat.RGBA16161616,
 
-            VTexFormat.R16F            => new(SizedInternalFormat.R16f,       PixelFormat.Red,    PixelType.HalfFloat),
-            VTexFormat.RG1616F         => new(SizedInternalFormat.Rg16f,      PixelFormat.Rg,     PixelType.HalfFloat),
-            VTexFormat.RGBA16161616F   => new(SizedInternalFormat.Rgba16f,    PixelFormat.Rgba,   PixelType.HalfFloat),
+            VTexFormat.R16F            => ImageFormat.R16F,
+            VTexFormat.RG1616F         => ImageFormat.RG1616F,
+            VTexFormat.RGBA16161616F   => ImageFormat.RGBA16161616F,
 
-            VTexFormat.R32F            => new(SizedInternalFormat.R32f,       PixelFormat.Red,    PixelType.Float),
-            VTexFormat.RG3232F         => new(SizedInternalFormat.Rg32f,      PixelFormat.Rg,     PixelType.Float),
-            VTexFormat.RGBA32323232F   => new(SizedInternalFormat.Rgba32f,    PixelFormat.Rgba,   PixelType.Float),
+            VTexFormat.R32F            => ImageFormat.R32F,
+            VTexFormat.RG3232F         => ImageFormat.RG3232F,
+            VTexFormat.RGBA32323232F   => ImageFormat.RGBA32323232F,
 
-            VTexFormat.RGBA8888        => new(SizedInternalFormat.Rgba8,      PixelFormat.Rgba,   PixelType.UnsignedByte,     SizedInternalFormat.Srgb8Alpha8),
-            VTexFormat.BGRA8888        => new(SizedInternalFormat.Rgba8,      PixelFormat.Bgra,   PixelType.UnsignedByte,     SizedInternalFormat.Srgb8Alpha8),
-            VTexFormat.I8              => new(SizedInternalFormat.R8,         PixelFormat.Red,    PixelType.UnsignedByte),
+            VTexFormat.RGBA8888        => ImageFormat.RGBA8888,
+            VTexFormat.BGRA8888        => ImageFormat.BGRA8888,
+            VTexFormat.I8              => ImageFormat.I8,
 
             //VTexFormat.IA88
             //VTexFormat.R11_EAC
@@ -531,36 +577,62 @@ namespace ValveResourceFormat.Renderer.Materials
         /// <summary>Returns a lazily created 1×1 solid white colour texture, a neutral fallback albedo.</summary>
         public RenderTexture GetDefaultColor() => DefaultColor ??= CreateSolidTexture(255, 255, 255);
 
-        /// <summary>Returns the OpenGL format triple appropriate for exporting a rendered image, choosing between 8-bit BGRA and 32-bit float RGBA.</summary>
-        /// <param name="hdr">Whether to use the HDR (32-bit float) format.</param>
-        public static (SizedInternalFormat SizedInternalFormat, PixelFormat PixelFormat, PixelType PixelType) GetImageExportFormat(bool hdr) => hdr switch
+        /// <summary>
+        /// Returns a lazily created 1×1×1 white volume texture.
+        /// </summary>
+        public RenderTexture GetDefaultVolume()
         {
-            false => (SizedInternalFormat.Rgba8, PixelFormat.Bgra, PixelType.UnsignedByte),
-            true => (SizedInternalFormat.Rgba32f, PixelFormat.Rgba, PixelType.Float),
-        };
+            if (DefaultVolume == null)
+            {
+                DefaultVolume = new RenderTexture(TextureTarget.Texture3D, 1, 1, 1, 1, "DefaultVolume");
+                DefaultVolume.SetFiltering(TextureMinFilter.Nearest, TextureMagFilter.Nearest);
+                DefaultVolume.SetWrapMode(TextureWrapMode.ClampToEdge);
+
+                GL.TextureStorage3D(DefaultVolume.Handle, 1, SizedInternalFormat.Rgba8, 1, 1, 1);
+                GL.TextureSubImage3D(DefaultVolume.Handle, 0, 0, 0, 0, 1, 1, 1, PixelFormat.Rgb, PixelType.UnsignedByte, WhiteTexel);
+            }
+
+            return DefaultVolume;
+        }
+
+        private static readonly byte[] WhiteTexel = [255, 255, 255];
+
+        /// <summary>Returns the readback format appropriate for exporting a rendered image: 8-bit BGRA, or 32-bit float RGBA for HDR.</summary>
+        /// <param name="hdr">Whether to use the HDR (32-bit float) format.</param>
+        public static ImageFormat GetImageExportFormat(bool hdr)
+            => hdr ? ImageFormat.RGBA32323232F : ImageFormat.BGRA8888;
 
         /// <summary>Uploads an <see cref="SKBitmap"/> as a 2D texture and returns the resulting <see cref="RenderTexture"/>.</summary>
         /// <param name="bitmap">The bitmap whose pixels are uploaded to the GPU.</param>
         public static RenderTexture LoadBitmapTexture(SKBitmap bitmap)
         {
-            var texture = new RenderTexture(TextureTarget.Texture2D, bitmap.Width, bitmap.Height, 1, 1);
+            var texture = new RenderTexture(TextureTarget.Texture2D, bitmap.Width, bitmap.Height, 1, 1, "BitmapTexture");
 
-            // var isHdr = bitmap.ColorType == Texture.HdrBitmapColorType;
-            // var store = GetImageExportFormat(isHdr);
-
-            var store = bitmap.ColorType switch
+            var format = bitmap.ColorType switch
             {
-                SKColorType.Rgba8888 => new TextureFormatMapping(SizedInternalFormat.Rgba8, PixelFormat.Rgba, PixelType.UnsignedByte),
-                SKColorType.Bgra8888 => new TextureFormatMapping(SizedInternalFormat.Rgba8, PixelFormat.Bgra, PixelType.UnsignedByte),
-                SKColorType.Rgb888x => new TextureFormatMapping(SizedInternalFormat.Rgb8, PixelFormat.Rgba, PixelType.UnsignedByte),
-                SKColorType.Gray8 => new TextureFormatMapping(SizedInternalFormat.R8, PixelFormat.Red, PixelType.UnsignedByte),
-                SKColorType.RgbaF16 => new TextureFormatMapping(SizedInternalFormat.Rgba16f, PixelFormat.Rgba, PixelType.HalfFloat),
-                SKColorType.RgbaF32 => new TextureFormatMapping(SizedInternalFormat.Rgba32f, PixelFormat.Rgba, PixelType.Float),
+                SKColorType.Rgba8888 => ImageFormat.RGBA8888,
+                SKColorType.Bgra8888 => ImageFormat.BGRA8888,
+                SKColorType.Rgb888x => ImageFormat.RGBA8888,
+                SKColorType.Gray8 => ImageFormat.I8,
+                SKColorType.RgbaF16 => ImageFormat.RGBA16161616F,
+                SKColorType.RgbaF32 => ImageFormat.RGBA32323232F,
                 _ => throw new NotSupportedException($"Unsupported bitmap color type for GPU upload {bitmap.ColorType}"),
             };
 
-            GL.TextureStorage2D(texture.Handle, 1, store.InternalFormat, texture.Width, texture.Height);
-            GL.TextureSubImage2D(texture.Handle, 0, 0, 0, texture.Width, texture.Height, store.PixelFormat!.Value, store.PixelType!.Value, bitmap.GetPixels());
+            GL.TextureStorage2D(texture.Handle, 1, format.ToGLSizedInternalFormat(), texture.Width, texture.Height);
+            GL.TextureSubImage2D(texture.Handle, 0, 0, 0, texture.Width, texture.Height, format.ToGLPixelFormat(), format.ToGLPixelType(), bitmap.GetPixels());
+
+            if (bitmap.ColorType == SKColorType.Rgb888x)
+            {
+                // DXGI has no RGBX storage; keep alpha reading as one like the old Rgb8 storage did.
+                texture.SetParameter(TextureParameterName.TextureSwizzleA, (int)All.One);
+            }
+
+            if (bitmap.ColorType == SKColorType.Rgb888x)
+            {
+                // The uploaded fourth byte is undefined, the format is opaque by definition
+                GL.TextureParameter(texture.Handle, TextureParameterName.TextureSwizzleA, (int)All.One);
+            }
 
             return texture;
         }
@@ -586,7 +658,8 @@ namespace ValveResourceFormat.Renderer.Materials
                 texels[(x * 4) + 3] = color.A;
             }
 
-            var texture = new RenderTexture(TextureTarget.Texture2D, Width, 1, 1, 1);
+            var texture = new RenderTexture(TextureTarget.Texture2D, Width, 1, 1, 1, "GeneratedGradient");
+
             // Clamped and filtered: the ramp is addressed by a luminance, so the ends have to hold rather
             // than wrap, and the steps between stops should not be visible.
             texture.SetFiltering(TextureMinFilter.Linear, TextureMagFilter.Linear);
@@ -595,10 +668,6 @@ namespace ValveResourceFormat.Renderer.Materials
             // sRGB storage, so a sample lands in linear space like every other layer's texture.
             GL.TextureStorage2D(texture.Handle, 1, SizedInternalFormat.Srgb8Alpha8, Width, 1);
             GL.TextureSubImage2D(texture.Handle, 0, 0, 0, Width, 1, PixelFormat.Rgba, PixelType.UnsignedByte, texels);
-
-#if DEBUG
-            texture.SetLabel("GeneratedGradient");
-#endif
 
             return texture;
         }
@@ -654,19 +723,24 @@ namespace ValveResourceFormat.Renderer.Materials
 
         private static RenderTexture GenerateColorTexture(int width, int height, byte[] color)
         {
-            var texture = new RenderTexture(TextureTarget.Texture2D, width, height, 1, 1);
+            // Full mip chain, because materials may bind a mipmap filtering sampler over this
+            // texture, and an incomplete mip chain would then sample as if nothing was bound
+            var levels = 1 + BitOperations.Log2((uint)Math.Max(width, height));
+
+            var texture = new RenderTexture(TextureTarget.Texture2D, width, height, 1, levels, width > 1 ? "ErrorTexture" : "ColorTexture");
             texture.SetFiltering(TextureMinFilter.Nearest, TextureMagFilter.Nearest);
             texture.SetWrapMode(TextureWrapMode.Repeat);
 
             var color32 = new Color32(color[0], color[1], color[2]);
             texture.Reflectivity = color32.ToLinearColor();
 
-            GL.TextureStorage2D(texture.Handle, 1, SizedInternalFormat.Rgb8, width, height);
+            GL.TextureStorage2D(texture.Handle, levels, SizedInternalFormat.Rgba8, width, height);
             GL.TextureSubImage2D(texture.Handle, 0, 0, 0, width, height, PixelFormat.Rgb, PixelType.UnsignedByte, color);
 
-#if DEBUG
-            texture.SetLabel(width > 1 ? "ErrorTexture" : "ColorTexture");
-#endif
+            if (levels > 1)
+            {
+                GL.GenerateTextureMipmap(texture.Handle);
+            }
 
             return texture;
         }

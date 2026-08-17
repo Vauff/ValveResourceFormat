@@ -10,6 +10,14 @@ namespace ValveResourceFormat.ResourceTypes
     /// <seealso href="https://s2v.app/SchemaExplorer/cs2/particles/CParticleSystemDefinition">CParticleSystemDefinition</seealso>
     public class ParticleSystem : KeyValuesOrNTRO
     {
+        /// <summary>Builds a particle system from the provided keyvalues.</summary>
+        public static ParticleSystem Create(KVObject data)
+            => new()
+            {
+                Resource = null!,
+                Data = data,
+            };
+
         /// <summary>
         /// Gets the renderers in the particle system.
         /// </summary>
@@ -72,5 +80,11 @@ namespace ValveResourceFormat.ResourceTypes
 
             return children.Select(c => c.GetStringProperty("m_ChildRef")).ToList();
         }
+
+        /// <summary>
+        /// Gets the child particle entries, which carry the child's delay, endcap and detail level
+        /// alongside its reference.
+        /// </summary>
+        public IEnumerable<KVObject> GetChildren() => Data.GetArray("m_Children") ?? [];
     }
 }

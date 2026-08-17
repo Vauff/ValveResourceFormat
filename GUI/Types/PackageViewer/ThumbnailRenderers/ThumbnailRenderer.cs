@@ -8,6 +8,7 @@ using OpenTK.Windowing.Common;
 using OpenTK.Windowing.Desktop;
 using SteamDatabase.ValvePak;
 using ValveResourceFormat;
+using ValveResourceFormat.CompiledShader;
 using ValveResourceFormat.IO;
 using ValveResourceFormat.Renderer;
 using ValveResourceFormat.Renderer.SceneEnvironment;
@@ -62,12 +63,11 @@ internal abstract class ThumbnailRenderer : IDisposable
         NativeWindow.MakeCurrent();
 
         GLEnvironment.Initialize(RendererContext.Logger);
-        GLEnvironment.SetDefaultRenderState();
+        GLEnvironment.SetDefaultRenderState(RendererContext);
 
         SceneRenderer = new Renderer(RendererContext);
 
-        SceneRenderer.Camera.Pitch = float.DegreesToRadians(-20);
-        SceneRenderer.Camera.Yaw = float.DegreesToRadians(225);
+        SceneRenderer.Camera.SetFromQAngle(new Vector3(20f, 225f, 0f));
 
         RendererContext.Logger.LogInformation("Loading scene...");
 
@@ -77,10 +77,9 @@ internal abstract class ThumbnailRenderer : IDisposable
 
         SceneRenderer.Postprocess.Load(4);
 
-        // Create framebuffer for rendering
         framebuffer = Framebuffer.Prepare("MainFramebuffer", 4, 4, 4,
-            new(PixelInternalFormat.Rgba16f, PixelFormat.Rgba, PixelType.HalfFloat),
-            Framebuffer.DepthAttachmentFormat.Depth16);
+            ImageFormat.RGBA16161616F,
+            ImageFormat.D16);
         framebuffer.Initialize();
 
         SceneRenderer.Initialize();
@@ -171,18 +170,21 @@ internal abstract class ThumbnailRenderer : IDisposable
 
         SceneRenderer.Scene.Clear();
 
+        var size = (int)thumbnailSize;
+
+        // Before the resource is set, because setting it frames the camera on what it loaded, and framing
+        // it against the previous thumbnail's aspect ratio picks the wrong distance
+        SceneRenderer.Camera.SetViewportSize(size, size);
+
         SetResource(resource);
 
         // Initialize scene (creates lighting buffers, octrees, etc.)
         SceneRenderer.Scene.Initialize();
 
-        var size = (int)thumbnailSize;
-
         RendererContext.MaxTextureSize = size;
         NativeWindow.ClientSize = new(size);
         NativeWindow.Size = new OpenTK.Mathematics.Vector2i(size, size);
         GL.Viewport(0, 0, size, size);
-        SceneRenderer.Camera.SetViewportSize(size, size);
         framebuffer.Resize(size, size);
 
         NativeWindow.MakeCurrent();

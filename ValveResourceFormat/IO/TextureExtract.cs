@@ -141,9 +141,6 @@ public sealed class TextureExtract
 
         Func<SKBitmap, byte[]> ImageEncode = ExportExr ? ToExrImage : ToPngImage;
 
-        //
-        // Multiple images path
-        //
         if (isArray || isCubeMap)
         {
             var contentFile = new ContentFile()
@@ -665,11 +662,11 @@ public sealed class TextureExtract
                     ? $"{textureName}_seq{s}.png"
                     : $"{textureName}_seq{s}_{f}.png";
 
-                // These images seem to be duplicates. So only extract the first one.
+                // A frame holds up to four image slots, and the unused ones repeat the first rectangle.
                 var image = frame.Images[0];
                 var imageRect = image.GetCroppedRect(texture.ActualWidth, texture.ActualHeight);
 
-                if (imageRect.Size.Width == 0 || imageRect.Size.Height == 0)
+                if (imageRect.IsEmpty)
                 {
                     continue;
                 }
@@ -758,7 +755,6 @@ public sealed class TextureExtract
                 var (sinU, cosU) = MathF.SinCos(u);
                 var (sinV, cosV) = MathF.SinCos(v);
 
-                // direction vector
                 var dir = new Vector3(sinV * cosU, cosV, sinV * sinU);
 
                 var color = SampleCubemapDirection(faces, dir);

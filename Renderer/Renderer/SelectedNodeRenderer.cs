@@ -23,6 +23,9 @@ namespace ValveResourceFormat.Renderer
         /// <summary>Gets or sets optional debug text rendered in the top-left corner of the viewport.</summary>
         public string ScreenDebugText { get; set; } = string.Empty;
 
+        /// <summary>Gets a value indicating whether any node is currently selected.</summary>
+        public bool HasSelectedNodes => selectedNodes.Count > 0;
+
         /// <summary>Initializes the selected node renderer and creates GPU resources.</summary>
         /// <param name="rendererContext">Renderer context for loading shaders.</param>
         public SelectedNodeRenderer(RendererContext rendererContext)
@@ -294,12 +297,12 @@ namespace ValveResourceFormat.Renderer
                         if (boundsMins != null && boundsMaxs != null && obbExtent != null && obbOrigin != null)
                         {
                             var bounds = new AABB(
-                                EntityTransformHelper.ParseVector(boundsMins),
-                                EntityTransformHelper.ParseVector(boundsMaxs)
+                                EntityTransformHelper.ParseVector3(boundsMins),
+                                EntityTransformHelper.ParseVector3(boundsMaxs)
                             );
 
-                            var origin = EntityTransformHelper.ParseVector(obbExtent);
-                            var extent = EntityTransformHelper.ParseVector(obbOrigin);
+                            var origin = EntityTransformHelper.ParseVector3(obbExtent);
+                            var extent = EntityTransformHelper.ParseVector3(obbOrigin);
 
                             AddBox(renderContext.Camera, updateContext.TextRenderer, vertices, Matrix4x4.Identity, bounds, new(0.0f, 1.0f, 0.0f, 1.0f));
 

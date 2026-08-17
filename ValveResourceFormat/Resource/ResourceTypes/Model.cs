@@ -423,7 +423,6 @@ namespace ValveResourceFormat.ResourceTypes
         /// <summary>
         /// Get the embedded animations with a different skeleton as animation target.
         /// </summary>
-        /// <returns></returns>
         public static IEnumerable<Animation> GetEmbeddedAnimationsWithSkeleton(IFileLoader fileLoader, Skeleton skeleton, Model model)
         {
             var old = model.cachedSkeleton;
@@ -494,10 +493,58 @@ namespace ValveResourceFormat.ResourceTypes
                 }
             }
 
-            var referencedAnims = GetReferencedAnimations(fileLoader);
-            animations.AddRange(referencedAnims);
+            // Animation graph (AG2) clips are part of the model's animation set.
+            foreach (var clipName in IO.AnimationGraphLoader.GetClipNames(this, fileLoader))
+            {
+                try
+                {
+                    if (fileLoader.LoadFileCompiled(clipName)?.DataBlock is ModelAnimation2.AnimationClip clip)
+                    {
+                        animations.Add(new ClipAnimation(clip));
+                    }
+                }
+                catch (Exception e)
+                {
+                    Console.Error.WriteLine(e.ToString());
+                }
+            }
 
-            CachedAnimations = [.. animations];
+            animations.AddRange(GetReferencedAnimations(fileLoader));
+
+            HashSet<string> additiveSequences;
+            try
+            {
+                additiveSequences = IO.AnimationGraph1Additive.GetAdditiveSequences(this, fileLoader);
+            }
+            catch (Exception e)
+            {
+                Console.Error.WriteLine(e.ToString());
+                additiveSequences = [];
+            }
+
+            // Legacy sequences sharing an additive clip's name (retarget sources) inherit its flag.
+            foreach (var animation in animations)
+            {
+                if (animation is ClipAnimation { IsAdditive: true })
+                {
+                    additiveSequences.Add(System.IO.Path.GetFileNameWithoutExtension(animation.Name));
+                }
+            }
+
+            // '@' autoplay aliases inherit the wrapped sequence's flag.
+            foreach (var animation in animations)
+            {
+                if (animation is not SequenceAnimation sequenceAnimation)
+                {
+                    continue;
+                }
+
+                var sequenceName = animation.Name.StartsWith('@') ? animation.Name[1..] : animation.Name;
+
+                sequenceAnimation.IsAdditive |= additiveSequences.Contains(sequenceName);
+            }
+
+            CachedAnimations = animations;
 
             return CachedAnimations;
         }
@@ -525,7 +572,7 @@ namespace ValveResourceFormat.ResourceTypes
         {
             var defaultGroupMask = Data.GetUnsignedIntegerProperty("m_nDefaultMeshGroupMask");
 
-            return GetMeshGroups().Where((group, index) => ((ulong)(1 << index) & defaultGroupMask) != 0);
+            return GetMeshGroups().Where((group, index) => index < 64 && ((1UL << index) & defaultGroupMask) != 0);
         }
 
         KVObject? ParseKeyValuesText()

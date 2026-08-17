@@ -1,5 +1,3 @@
-global using DepthOnlyDrawBuckets = System.Collections.Generic.Dictionary<ValveResourceFormat.Renderer.DepthOnlyProgram, System.Collections.Generic.List<ValveResourceFormat.Renderer.MeshBatchRenderer.Request>>;
-
 using System.Diagnostics;
 using System.Linq;
 using System.Runtime.CompilerServices;
@@ -7,7 +5,9 @@ using System.Runtime.InteropServices;
 using Microsoft.Extensions.Logging;
 using OpenTK.Graphics.OpenGL;
 using ValveResourceFormat.Blocks;
+using ValveResourceFormat.CompiledShader;
 using ValveResourceFormat.Renderer.Buffers;
+using ValveResourceFormat.Renderer.Entities;
 using ValveResourceFormat.Renderer.SceneEnvironment;
 using ValveResourceFormat.Renderer.SceneNodes;
 using ValveResourceFormat.Renderer.World;
@@ -76,6 +76,12 @@ namespace ValveResourceFormat.Renderer
 
         /// <summary>Gets or sets the physics simulation world associated with this scene.</summary>
         public Rubikon? PhysicsWorld { get; set; }
+
+        /// <summary>
+        /// Gets the entity context for this scene. Simulated entities live here and are ticked by
+        /// <see cref="Update"/> before the scene nodes are updated.
+        /// </summary>
+        public EntitySystem EntitySystem { get; }
 
         /// <summary>Gets or sets the voxel visibility data.</summary>
         public VoxelVisibility? VoxelVisibility { get; set; }
@@ -166,6 +172,9 @@ namespace ValveResourceFormat.Renderer
         /// <summary>Gets or sets whether GPU indirect drawing is used for eligible aggregate scene nodes.</summary>
         public bool EnableIndirectDraws { get; set; } = true;
 
+        /// <summary>Whether this is the 3d sky scene, which draws behind everything the main scene draws.</summary>
+        internal bool IsSkybox => LightingInfo.LightingData.IsSkybox != 0u;
+
         /// <summary>Gets or sets whether GPU draw compaction is applied after frustum culling to remove empty indirect draw commands.</summary>
         public bool EnableCompaction { get; set; } = true;
 
@@ -200,6 +209,7 @@ namespace ValveResourceFormat.Renderer
 
             LightingInfo = new(this);
             LightBinner = new(this);
+            EntitySystem = new(this);
         }
 
         /// <summary>
@@ -222,8 +232,6 @@ namespace ValveResourceFormat.Renderer
             DepthPyramidShader = RendererContext.ShaderLoader.LoadShader("depth_pyramid");
             DepthPyramidNpotShader = RendererContext.ShaderLoader.LoadShader("depth_pyramid", ("D_NPOT_DOWNSAMPLE", 1));
             LightBinner.LoadShaders();
-
-            EnableIndirectDraws = LightingInfo.LightingData.IsSkybox == 0u;
 
             // set render lists to their max capacity
             CollectSceneDrawCalls(new Camera(), Frustum.CreateEmpty());
@@ -315,6 +323,8 @@ namespace ValveResourceFormat.Renderer
             }
             staticNodes.Clear();
 
+            EntitySystem.Clear();
+
             StaticOctree.Clear();
             DynamicOctree.Clear();
 
@@ -378,12 +388,38 @@ namespace ValveResourceFormat.Renderer
             return staticNodes.Find(IsMatchingEntity) ?? dynamicNodes.Find(IsMatchingEntity);
         }
 
+
+        /// <summary>
+        /// Finds the first scene node whose entity name matches with the given pattern.
+        /// </summary>
+        /// <param name="pattern">Targetname to match against, may contain wildcards: `*` and `?` (e.g. <c>door_*</c>).</param>
+        /// <returns>The matching <see cref="SceneNode"/>, or <see langword="null"/> if not found.</returns>
+        public SceneNode? FindNodeByTargetName(string pattern)
+        {
+            bool IsMatchingEntity(SceneNode node)
+            {
+                if (node.EntityData == null)
+                {
+                    return false;
+                }
+
+                return node.EntityData.TryGetValue("targetname", out var value)
+                    && value.ValueType == ValveKeyValue.KVValueType.String
+                    && EntityLump.EntityNameMatches(pattern, (string)value);
+            }
+
+            return staticNodes.Find(IsMatchingEntity) ?? dynamicNodes.Find(IsMatchingEntity);
+        }
+
         /// <summary>
         /// Updates all scene nodes for the current frame, advancing animations and rebuilding octrees and GPU buffers if the scene changed.
         /// </summary>
         /// <param name="updateContext">Per-frame context data including camera and timestep.</param>
         public void Update(Scene.UpdateContext updateContext)
         {
+            // Entities simulate on their own fixed tick, then their scene nodes pick the result up below
+            EntitySystem.Update(updateContext.Timestep);
+
             foreach (var node in staticNodes)
             {
                 node.Update(updateContext);
@@ -501,8 +537,8 @@ namespace ValveResourceFormat.Renderer
                 };
             }
 
-            InstanceBufferGpu = new StorageBuffer(ReservedBufferSlots.Objects);
-            TransformBufferGpu = new StorageBuffer(ReservedBufferSlots.Transforms);
+            InstanceBufferGpu = new StorageBuffer(ReservedBufferSlots.Objects, nameof(ReservedBufferSlots.Objects));
+            TransformBufferGpu = new StorageBuffer(ReservedBufferSlots.Transforms, nameof(ReservedBufferSlots.Transforms));
 
             InstanceBufferGpu.Create(instanceData, BufferUsageHint.StaticDraw);
             TransformBufferGpu.Create(CollectionsMarshal.AsSpan(transformData), BufferUsageHint.StaticDraw);
@@ -540,13 +576,17 @@ namespace ValveResourceFormat.Renderer
                     {
                         var drawCall = fragment.DrawCall;
                         Debug.Assert(drawCall.DrawBounds != null);
-                        drawBounds[index].Min = drawCall.DrawBounds.Value.Min;
-                        drawBounds[index].Max = drawCall.DrawBounds.Value.Max;
+
+                        // need to transform bounds for the 3d skybox
+                        var bounds = drawCall.DrawBounds.Value.Transform(fragment.Transform);
+
+                        drawBounds[index].Min = bounds.Min;
+                        drawBounds[index].Max = bounds.Max;
                         index++;
                     }
                 }
 
-                DrawBoundsGpu = new StorageBuffer(ReservedBufferSlots.AggregateDrawBounds);
+                DrawBoundsGpu = new StorageBuffer(ReservedBufferSlots.AggregateDrawBounds, nameof(ReservedBufferSlots.AggregateDrawBounds));
                 DrawBoundsGpu.Create(drawBounds, BufferUsageHint.StaticDraw);
             }
 
@@ -631,20 +671,28 @@ namespace ValveResourceFormat.Renderer
 
                 SceneMeshletCount = sceneMeshletCount;
 
-                MeshletDataGpu = new StorageBuffer(ReservedBufferSlots.AggregateMeshlets);
-                IndirectDrawsGpu = new StorageBuffer(ReservedBufferSlots.AggregateDraws);
+                MeshletDataGpu = new StorageBuffer(ReservedBufferSlots.AggregateMeshlets, nameof(ReservedBufferSlots.AggregateMeshlets));
+                IndirectDrawsGpu = new StorageBuffer(ReservedBufferSlots.AggregateDraws, nameof(ReservedBufferSlots.AggregateDraws));
 
                 MeshletDataGpu.Create(meshletDataGpu, BufferUsageHint.StaticDraw);
-                IndirectDrawsGpu.Create(indirectDrawsGpu, BufferUsageHint.DynamicDraw);
+                IndirectDrawsGpu.Create(indirectDrawsGpu, BufferUsageHint.DynamicCopy);
 
                 // Create compaction buffers
-                CompactedDrawsGpu = new StorageBuffer(ReservedBufferSlots.CompactedDraws);
-                CompactedDrawsGpu.Create(indirectDrawsGpu, BufferUsageHint.DynamicDraw);
+                CompactedDrawsGpu = new StorageBuffer(ReservedBufferSlots.CompactedDraws, nameof(ReservedBufferSlots.CompactedDraws));
+                CompactedDrawsGpu.Create(indirectDrawsGpu, BufferUsageHint.DynamicCopy);
 
-                CompactedCountsGpu = StorageBuffer.Allocate<uint>(ReservedBufferSlots.CompactedCounts, compactionRequestList.Count / 2, BufferUsageHint.DynamicDraw);
+                var compactedCounts = new uint[compactionRequestList.Count / 2];
 
-                CompactionRequestsGpu = new StorageBuffer(ReservedBufferSlots.CompactionRequests);
-                CompactionRequestsGpu.Create(compactionRequestList);
+                for (var request = 0; request < compactedCounts.Length; request++)
+                {
+                    compactedCounts[request] = compactionRequestList[request * 2];
+                }
+
+                CompactedCountsGpu = new StorageBuffer(ReservedBufferSlots.CompactedCounts, nameof(ReservedBufferSlots.CompactedCounts));
+                CompactedCountsGpu.Create(compactedCounts, BufferUsageHint.DynamicCopy);
+
+                CompactionRequestsGpu = new StorageBuffer(ReservedBufferSlots.BufferSlot2, "CompactionRequests");
+                CompactionRequestsGpu.Create(compactionRequestList, BufferUsageHint.StaticDraw);
             }
 
             OcclusionDebug = new OcclusionDebugRenderer(this, RendererContext);
@@ -737,13 +785,7 @@ namespace ValveResourceFormat.Renderer
             [RenderPass.Translucent] = [],
         };
 
-        private DepthOnlyDrawBuckets depthOnlyDraws { get; } = new()
-        {
-            [DepthOnlyProgram.Static] = [],
-            [DepthOnlyProgram.Animated] = [],
-            [DepthOnlyProgram.AnimatedEightBones] = [],
-            [DepthOnlyProgram.Unspecified] = [],
-        };
+        private Dictionary<DepthOnlyBucket, List<MeshBatchRenderer.Request>> depthOnlyDraws { get; } = CreateDepthOnlyDrawCallCollection();
 
         private void Add(MeshBatchRenderer.Request request, RenderPass renderPass)
         {
@@ -770,7 +812,7 @@ namespace ValveResourceFormat.Renderer
                 {
                     if (EnableDepthPrepass)
                     {
-                        var bucket = GetSpecializedDepthOnlyShader(false, request.Mesh, request.Call);
+                        var bucket = GetDepthOnlyBucket(request.Call);
                         depthOnlyDraws[bucket].Add(request);
                     }
                 }
@@ -957,20 +999,25 @@ namespace ValveResourceFormat.Renderer
 
         private List<SceneNode> CulledShadowNodes { get; } = [];
         private readonly List<RenderableMesh> listWithSingleMesh = [null!];
-        internal DepthOnlyDrawBuckets CulledShadowDrawCalls { get; } = CreateDepthOnlyDrawCallCollection();
-        internal static DepthOnlyDrawBuckets CreateDepthOnlyDrawCallCollection() => new()
-        {
-            [DepthOnlyProgram.Static] = [],
-            [DepthOnlyProgram.Animated] = [],
-            [DepthOnlyProgram.AnimatedEightBones] = [],
-            [DepthOnlyProgram.Unspecified] = [],
-        };
+        internal Dictionary<DepthOnlyBucket, List<MeshBatchRenderer.Request>>[] CulledShadowDrawCallsCascades { get; } = CreateSunCascadeDrawCallCollections();
+        internal static Dictionary<DepthOnlyBucket, List<MeshBatchRenderer.Request>> CreateDepthOnlyDrawCallCollection()
+            => Enum.GetValues<DepthOnlyBucket>().ToDictionary(static bucket => bucket, static _ => new List<MeshBatchRenderer.Request>());
 
-        /// <summary>
-        /// Updates the sun light shadow frustum and collects shadow draw calls for the directional light, if dynamic shadows are enabled.
-        /// </summary>
-        /// <param name="camera">The main camera used to fit the shadow frustum.</param>
-        /// <param name="shadowMapSize">The shadow map resolution; pass -1 to produce an empty frustum (pre-warm pass).</param>
+        private static Dictionary<DepthOnlyBucket, List<MeshBatchRenderer.Request>>[] CreateSunCascadeDrawCallCollections()
+        {
+            var buckets = new Dictionary<DepthOnlyBucket, List<MeshBatchRenderer.Request>>[WorldLightingInfo.SunCascadeCount];
+
+            for (var i = 0; i < buckets.Length; i++)
+            {
+                buckets[i] = CreateDepthOnlyDrawCallCollection();
+            }
+
+            return buckets;
+        }
+
+        /// <summary>Updates the sun light shadow cascades and collects shadow draw calls for each of them, if dynamic shadows are enabled.</summary>
+        /// <param name="camera">The main camera used to fit the shadow cascades.</param>
+        /// <param name="shadowMapSize">The shadow map resolution; pass -1 to produce empty frustums (pre-warm pass).</param>
         public void SetupSceneShadows(Camera camera, int shadowMapSize)
         {
             if (!LightingInfo.EnableDynamicShadows)
@@ -980,14 +1027,30 @@ namespace ValveResourceFormat.Renderer
 
             LightingInfo.UpdateSunLightFrustum(camera, shadowMapSize);
 
-            if (shadowMapSize == -1)
+            for (var cascade = 0; cascade < WorldLightingInfo.SunCascadeCount; cascade++)
             {
-                LightingInfo.SunLightFrustum.SetEmpty();
-            }
+                if (cascade >= LightingInfo.ActiveSunCascadeCount)
+                {
+                    foreach (var bucket in CulledShadowDrawCallsCascades[cascade].Values)
+                    {
+                        bucket.Clear();
+                    }
 
-            CollectShadowDrawCalls(LightingInfo.SunLightFrustum,
-                includeStatic: !LightingInfo.HasBakedShadowsFromLightmap,
-                includeDynamic: true, CulledShadowDrawCalls);
+                    continue;
+                }
+
+                if (shadowMapSize == -1)
+                {
+                    LightingInfo.SunLightFrustums[cascade].SetEmpty();
+                }
+
+                CollectShadowDrawCalls(LightingInfo.SunLightFrustums[cascade],
+                    includeStatic: !LightingInfo.HasBakedShadowsFromLightmap,
+                    includeDynamic: true, CulledShadowDrawCallsCascades[cascade],
+                    LightingInfo.SunCastDirection, out var casterDepthMin, out var casterDepthMax);
+
+                LightingInfo.FitSunLightDepthRange(cascade, casterDepthMin, casterDepthMax);
+            }
         }
 
         /// <summary>Invalidates the cached shadow draw calls for all faces of the given barn light, forcing a rebuild next frame.</summary>
@@ -1026,8 +1089,31 @@ namespace ValveResourceFormat.Renderer
             entry.FrustumHash = barnLightFrustumHash;
         }
 
-        private void CollectShadowDrawCalls(Frustum frustum, bool includeStatic, bool includeDynamic, DepthOnlyDrawBuckets drawBuckets)
+        private void CollectShadowDrawCalls(Frustum frustum, bool includeStatic, bool includeDynamic, Dictionary<DepthOnlyBucket, List<MeshBatchRenderer.Request>> drawBuckets)
+            => CollectShadowDrawCalls(frustum, includeStatic, includeDynamic, drawBuckets, Vector3.Zero, out _, out _);
+
+        private void CollectShadowDrawCalls(Frustum frustum, bool includeStatic, bool includeDynamic, Dictionary<DepthOnlyBucket, List<MeshBatchRenderer.Request>> drawBuckets,
+            Vector3 depthFitAxis, out float casterDepthMin, out float casterDepthMax)
         {
+            // Extent of the accepted casters along the fit axis, for tightening the light's depth range
+            var depthMin = float.MaxValue;
+            var depthMax = float.MinValue;
+
+            void AccumulateDepthFit(SceneNode casterNode)
+            {
+                if (depthFitAxis == Vector3.Zero)
+                {
+                    return;
+                }
+
+                var bounds = casterNode.BoundingBox;
+                var center = Vector3.Dot(bounds.Center, depthFitAxis);
+                var extent = Vector3.Dot(bounds.Size, Vector3.Abs(depthFitAxis)) * 0.5f;
+
+                depthMin = Math.Min(depthMin, center - extent);
+                depthMax = Math.Max(depthMax, center + extent);
+            }
+
             foreach (var bucket in drawBuckets.Values)
             {
                 bucket.Clear();
@@ -1088,11 +1174,12 @@ namespace ValveResourceFormat.Renderer
                 else
                 {
                     // Nodes that draw their own solid geometry cast shadows by drawing into the depth pass
-                    // with their own shaders. The unspecified bucket is the one with no depth-only
-                    // replacement shader, which is exactly what that needs.
+                    // with their own shaders, which is what this bucket is for.
                     if ((node.Flags & skipFlags) == 0 && (node.RenderPasses & CustomRenderPasses.Opaque) != 0)
                     {
-                        drawBuckets[DepthOnlyProgram.Unspecified].Add(new MeshBatchRenderer.Request
+                        AccumulateDepthFit(node);
+
+                        drawBuckets[DepthOnlyBucket.MaterialShader].Add(new MeshBatchRenderer.Request
                         {
                             Node = node,
                         });
@@ -1101,7 +1188,7 @@ namespace ValveResourceFormat.Renderer
                     continue;
                 }
 
-                var animated = node is ModelSceneNode model && model.IsAnimated;
+                AccumulateDepthFit(node);
 
                 foreach (var mesh in meshes)
                 {
@@ -1117,7 +1204,7 @@ namespace ValveResourceFormat.Renderer
                             continue;
                         }
 
-                        var bucket = GetSpecializedDepthOnlyShader(animated, mesh, opaqueCall);
+                        var bucket = GetDepthOnlyBucket(opaqueCall);
 
                         drawBuckets[bucket].Add(new MeshBatchRenderer.Request
                         {
@@ -1130,26 +1217,26 @@ namespace ValveResourceFormat.Renderer
             }
 
             CulledShadowNodes.Clear();
+
+            casterDepthMin = depthMin;
+            casterDepthMax = depthMax;
         }
 
-        private static DepthOnlyProgram GetSpecializedDepthOnlyShader(bool animated, RenderableMesh mesh, DrawCall opaqueCall)
+        // The skinning variant is picked per draw, so the bucket only says which shader draws it
+        private static DepthOnlyBucket GetDepthOnlyBucket(DrawCall opaqueCall)
         {
-            var renderWithUnoptimizedShader = opaqueCall.Material.VertexAnimation || opaqueCall.Material.IsAlphaTest;
-
-            var bucket = (renderWithUnoptimizedShader, animated) switch
-            {
-                (true, _) => DepthOnlyProgram.Unspecified, // shader will be null
-                (false, false) => DepthOnlyProgram.Static,
-                (false, true) => DepthOnlyProgram.Animated,
-            };
-
-            if (mesh.BoneWeightCount > 4)
-            {
-                bucket = DepthOnlyProgram.AnimatedEightBones;
-            }
-
-            return bucket;
+            return opaqueCall.Material.VertexAnimation ? DepthOnlyBucket.MaterialShader
+                : opaqueCall.Material.IsAlphaTest ? DepthOnlyBucket.AlphaTest
+                : DepthOnlyBucket.Specialized;
         }
+
+        /// <summary>Picks the shader that replaces material shaders for a depth-only bucket, or <see langword="null"/> for the bucket that keeps the material's own shader.</summary>
+        private static Shader? GetDepthOnlyReplacementShader(DepthOnlyBucket bucket, Shader depthOnlyShader) => bucket switch
+        {
+            DepthOnlyBucket.AlphaTest => depthOnlyShader.WithCombo("F_ALPHA_TEST", 1),
+            DepthOnlyBucket.MaterialShader => null,
+            _ => depthOnlyShader,
+        };
 
         internal void UpdateIndirectRenderingState()
         {
@@ -1158,19 +1245,29 @@ namespace ValveResourceFormat.Renderer
 
             if (DrawMeshletsIndirect)
             {
-                Debug.Assert(IndirectDrawsGpu is not null);
-                Debug.Assert(CompactedDrawsGpu is not null);
-
                 CompactMeshletDraws = GLEnvironment.IndirectCountSupported && EnableCompaction;
-                GL.BindBuffer(BufferTarget.DrawIndirectBuffer, CompactMeshletDraws
-                    ? CompactedDrawsGpu.Handle
-                    : IndirectDrawsGpu.Handle);
+            }
+        }
 
-                if (CompactMeshletDraws)
-                {
-                    Debug.Assert(CompactedCountsGpu is not null);
-                    GL.BindBuffer(BufferTarget.ParameterBuffer, CompactedCountsGpu.Handle);
-                }
+        /// <summary>Binds the indirect draw buffers chosen by <see cref="UpdateIndirectRenderingState"/>.</summary>
+        internal void BindIndirectDrawBuffers()
+        {
+            if (!DrawMeshletsIndirect)
+            {
+                return;
+            }
+
+            Debug.Assert(IndirectDrawsGpu is not null);
+            Debug.Assert(CompactedDrawsGpu is not null);
+
+            GL.BindBuffer(BufferTarget.DrawIndirectBuffer, CompactMeshletDraws
+                ? CompactedDrawsGpu.Handle
+                : IndirectDrawsGpu.Handle);
+
+            if (CompactMeshletDraws)
+            {
+                Debug.Assert(CompactedCountsGpu is not null);
+                GL.BindBuffer(BufferTarget.ParameterBuffer, CompactedCountsGpu.Handle);
             }
         }
 
@@ -1186,9 +1283,11 @@ namespace ValveResourceFormat.Renderer
             var enabled = DepthPyramidValid && pyramid != null;
 
             shader.SetUniform("g_bOcclusionCullEnabled", enabled ? 1 : 0);
+            shader.SetUniform("g_bSkyOcclusion", IsSkybox ? 1 : 0);
 
             if (!enabled)
             {
+                shader.SetTexture(RenderMaterial.TextureUnitStart, "g_tDepthPyramid", RendererContext.MaterialLoader.GetDefaultMask());
                 return false;
             }
 
@@ -1216,8 +1315,6 @@ namespace ValveResourceFormat.Renderer
             Debug.Assert(DrawBoundsGpu is not null);
             Debug.Assert(MeshletDataGpu is not null);
             Debug.Assert(IndirectDrawsGpu is not null);
-
-            using var _ = new GLDebugGroup("Cull Meshlet Draws");
 
             frustumBuffer.BindBufferBase();
             frustumBuffer.Data = new(frustum);
@@ -1264,8 +1361,6 @@ namespace ValveResourceFormat.Renderer
             {
                 return;
             }
-
-            using var _ = new GLDebugGroup("Compact Meshlet Draws");
 
             CompactionShader.Use();
 
@@ -1349,17 +1444,22 @@ namespace ValveResourceFormat.Renderer
         /// Renders shadow depth passes for all draw call buckets using their corresponding specialized depth-only shaders.
         /// </summary>
         /// <param name="renderContext">The render context for this shadow pass.</param>
-        /// <param name="depthOnlyShaders">A span of shaders indexed by <see cref="DepthOnlyProgram"/>.</param>
+        /// <param name="depthOnlyShader">The depth-only shader, which the pass takes skinning variants of.</param>
         /// <param name="drawCalls">The bucketed draw calls to render.</param>
-        public static void RenderOpaqueShadows(RenderContext renderContext, Span<Shader> depthOnlyShaders, DepthOnlyDrawBuckets drawCalls)
+        public static void RenderOpaqueShadows(RenderContext renderContext, Shader depthOnlyShader, Dictionary<DepthOnlyBucket, List<MeshBatchRenderer.Request>> drawCalls)
         {
             renderContext.RenderPass = RenderPass.DepthOnly;
 
             PerfStats.Active.SuspendTriangleCounter();
 
-            foreach (var (program, calls) in drawCalls)
+            foreach (var (bucket, calls) in drawCalls)
             {
-                renderContext.ReplacementShader = depthOnlyShaders[(int)program];
+                if (calls.Count == 0)
+                {
+                    continue;
+                }
+
+                renderContext.ReplacementShader = GetDepthOnlyReplacementShader(bucket, depthOnlyShader);
                 MeshBatchRenderer.Render(calls, renderContext);
             }
 
@@ -1370,49 +1470,46 @@ namespace ValveResourceFormat.Renderer
         /// Renders the opaque pass, optionally with a depth prepass, followed by aggregate indirect draws and static overlay geometry.
         /// </summary>
         /// <param name="renderContext">The render context for this pass.</param>
-        /// <param name="depthOnlyShaders">An optional span of depth-only shaders; when provided and <see cref="EnableDepthPrepass"/> is set, a depth prepass is performed.</param>
-        public void RenderOpaqueLayer(RenderContext renderContext, Span<Shader> depthOnlyShaders = default)
+        /// <param name="depthOnlyShader">Optional depth-only shader; when provided and <see cref="EnableDepthPrepass"/> is set, a depth prepass is performed.</param>
+        public void RenderOpaqueLayer(RenderContext renderContext, Shader? depthOnlyShader = null)
         {
+            using var passScope = RendererContext.RenderState.Scope();
+
             var camera = renderContext.Camera;
 
-            var depthPrepass = !depthOnlyShaders.IsEmpty && EnableDepthPrepass;
+            var depthPrepass = depthOnlyShader != null && EnableDepthPrepass;
 
             if (DrawMeshletsIndirect)
             {
-                // Memory barrier to ensure compute shader writes are visible to indirect draw commands
-                GL.MemoryBarrier(MemoryBarrierFlags.CommandBarrierBit | MemoryBarrierFlags.ShaderStorageBarrierBit);
+                BindIndirectDrawBuffers();
+
+                // CommandBarrierBit is defined over the indirect buffer only, not the compacted count buffer
+                GL.MemoryBarrier(MemoryBarrierFlags.CommandBarrierBit | MemoryBarrierFlags.ShaderStorageBarrierBit
+                    | MemoryBarrierFlags.BufferUpdateBarrierBit);
             }
 
             if (depthPrepass)
             {
                 using (new GLDebugGroup("Depth Prepass"))
+                using (RendererContext.RenderState.Scope(colorWriteMask: RsColorWriteEnableBits.None))
                 {
-                    GL.ColorMask(false, false, false, false);
-
                     PerfStats.Active.SuspendTriangleCounter();
 
                     renderContext.RenderPass = RenderPass.DepthOnly;
-                    foreach (var (program, calls) in depthOnlyDraws)
+                    foreach (var (bucket, calls) in depthOnlyDraws)
                     {
-                        renderContext.ReplacementShader = depthOnlyShaders[(int)program];
+                        renderContext.ReplacementShader = bucket == DepthOnlyBucket.Specialized ? depthOnlyShader : null;
                         MeshBatchRenderer.Render(calls, renderContext);
                     }
 
                     PerfStats.Active.ResumeTriangleCounter();
-
-                    GL.ColorMask(true, true, true, true);
                 }
 
                 using (new GLDebugGroup("Opaque Prepassed"))
+                using (RendererContext.RenderState.Scope(depthWrite: false, depthFunc: RsComparison.Equal))
                 {
-                    GL.DepthMask(false);
-                    GL.DepthFunc(DepthFunction.Equal);
-
                     renderContext.RenderPass = RenderPass.OpaqueAggregate;
                     MeshBatchRenderer.Render(renderLists[renderContext.RenderPass], renderContext);
-
-                    GL.DepthMask(true);
-                    GL.DepthFunc(DepthFunction.Greater);
                 }
             }
 
@@ -1454,6 +1551,8 @@ namespace ValveResourceFormat.Renderer
         /// <param name="renderContext">The render context for this pass, expected to use the dedicated viewmodel camera and depth range.</param>
         public void RenderViewmodelOpaqueLayer(RenderContext renderContext)
         {
+            using var _ = RendererContext.RenderState.Scope();
+
             renderContext.RenderPass = RenderPass.Opaque;
             MeshBatchRenderer.Render(viewmodelRenderLists[RenderPass.Opaque], renderContext);
         }
@@ -1465,14 +1564,10 @@ namespace ValveResourceFormat.Renderer
         /// <param name="renderContext">The render context for this pass, expected to use the dedicated viewmodel camera and depth range.</param>
         public void RenderViewmodelTranslucentLayer(RenderContext renderContext)
         {
-            GL.DepthMask(false);
-            GL.Enable(EnableCap.Blend);
+            using var _ = RendererContext.RenderState.Scope(depthWrite: false, blend: true);
 
             renderContext.RenderPass = RenderPass.Translucent;
             MeshBatchRenderer.Render(viewmodelRenderLists[RenderPass.Translucent], renderContext);
-
-            GL.Disable(EnableCap.Blend);
-            GL.DepthMask(true);
         }
 
         /// <summary>
@@ -1490,6 +1585,7 @@ namespace ValveResourceFormat.Renderer
             }
 
             using (new GLDebugGroup("Opaque Refract Render"))
+            using (RendererContext.RenderState.Scope())
             {
                 renderContext.RenderPass = RenderPass.OpaqueRefract;
                 MeshBatchRenderer.Render(requests, renderContext);
@@ -1508,6 +1604,7 @@ namespace ValveResourceFormat.Renderer
             }
 
             using (new GLDebugGroup("Fancy Water Render"))
+            using (RendererContext.RenderState.Scope())
             {
                 renderContext.RenderPass = RenderPass.Water;
                 MeshBatchRenderer.Render(requests, renderContext);

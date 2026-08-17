@@ -115,19 +115,23 @@ public static class GLEnvironment
     /// <summary>
     /// Sets the default OpenGL render state for Source 2 rendering.
     /// </summary>
-    public static void SetDefaultRenderState()
+    /// <param name="rendererContext">The renderer context owning the state tracker for this GL context.</param>
+    public static void SetDefaultRenderState(RendererContext rendererContext)
     {
-        // Application semantics / default state
         GL.Enable(EnableCap.TextureCubeMapSeamless);
-        GL.Enable(EnableCap.CullFace);
-        GL.CullFace(TriangleFace.Back);
-        GL.Enable(EnableCap.DepthTest);
+        GL.ClipControl(ClipOrigin.LowerLeft, ClipDepthMode.ZeroToOne); // reverse-Z clip range
 
-        // reverse z
-        GL.ClipControl(ClipOrigin.LowerLeft, ClipDepthMode.ZeroToOne);
-        GL.DepthFunc(DepthFunction.Greater);
-        GL.ClearDepth(0.0f);
+        rendererContext.RenderState.SetPassBaseline(RenderState.Default);
+        rendererContext.RenderState.ApplyDynamic(DynamicState.Default);
 
+        EnableParallelShaderCompile();
+    }
+
+    /// <summary>
+    /// Allows the driver to compile and link shaders on its own worker threads.
+    /// </summary>
+    public static void EnableParallelShaderCompile()
+    {
         // Process-global driver setting; configure exactly once (re-issuing it mid-compile crashes some drivers).
         if (Interlocked.CompareExchange(ref parallelShaderCompileConfigured, 1, 0) == 0)
         {

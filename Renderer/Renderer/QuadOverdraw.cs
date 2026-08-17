@@ -1,37 +1,30 @@
 using System.Diagnostics;
 using OpenTK.Graphics.OpenGL;
+using ValveResourceFormat.CompiledShader;
+using ValveResourceFormat.Renderer.Buffers;
 
 namespace ValveResourceFormat.Renderer;
 
 /// <summary>
 /// Quad overdraw debug visualization.
 /// </summary>
-/// 
+///
 /// <remarks>
 /// The scene is rendered with a replacement shader that counts, per 2x2 pixel quad, how
-/// many primitives were shaded into it, using an atomic lock image so a primitive spanning
+/// many primitives were shaded into it, using an atomic lock so a primitive spanning
 /// several pixels of the same quad counts once.
 ///
 /// The first render only fills out the depth buffer, the second one renders overdraw
 /// </remarks>
 public class QuadOverdraw(RendererContext rendererContext)
 {
-    /// <summary>
-    /// Image unit for the lock image. Units 1 and 2 are used by the MSAA resolve and depth pyramid compute passes.
-    /// </summary>
-    public const int LockImageUnit = 3;
-
-    /// <summary>
-    /// Image unit for the count image. Units 1 and 2 are used by the MSAA resolve and depth pyramid compute passes.
-    /// </summary>
-    public const int CountImageUnit = 4;
-
     private Shader? sceneShader;
     private Shader? visualizeShader;
 
-    private RenderTexture? quadLock;
-    private RenderTexture? quadCount;
+    // Two uints per quad: a scoreboard lock and the count, zeroed each frame
+    private StorageBuffer? quadBuffer;
     private ClearBufferMask savedClearMask;
+    private RenderState savedPassState;
 
     /// <summary>Gets the replacement shader that counts quad overdraw while the scene renders.</summary>
     public Shader SceneShader => sceneShader ??= rendererContext.ShaderLoader.LoadShader("quad_overdraw");
@@ -53,40 +46,30 @@ public class QuadOverdraw(RendererContext rendererContext)
     }
 
     /// <summary>
-    /// Sizes the count images to the framebuffer, resets them, binds them to their image
-    /// units, and puts <see cref="SceneShader"/> in depth prime mode. Call before the first
-    /// scene render of the frame.
+    /// Sizes the count buffer to the framebuffer, zeroes it, binds it to its slot, and puts
+    /// <see cref="SceneShader"/> in depth prime mode. Call before the first scene render of the frame.
     /// </summary>
     /// <param name="width">Framebuffer width in pixels.</param>
     /// <param name="height">Framebuffer height in pixels.</param>
     public void Prepare(int width, int height)
     {
-        SceneShader.SetUniform1("bCountQuads", false);
+        // All variants: skinned meshes draw with a skinning variant of this shader (see MeshBatchRenderer)
+        SceneShader.SetUniform1AllVariants("bCountQuads", 0u);
 
-        // one texel per 2x2 pixel quad
+        // one entry per 2x2 pixel quad
         var quadWidth = (width + 1) / 2;
         var quadHeight = (height + 1) / 2;
+        var elementCount = quadWidth * quadHeight * 2;
 
-        if (quadLock == null || quadLock.Width != quadWidth || quadLock.Height != quadHeight)
+        if (quadBuffer == null || quadBuffer.Size != elementCount * sizeof(uint))
         {
-            quadLock?.Delete();
-            quadCount?.Delete();
-
-            quadLock = RenderTexture.Create(quadWidth, quadHeight, SizedInternalFormat.R32ui);
-            quadLock.SetLabel("QuadOverdrawLock");
-
-            quadCount = RenderTexture.Create(quadWidth, quadHeight, SizedInternalFormat.R32ui);
-            quadCount.SetLabel("QuadOverdrawCount");
-            quadCount.SetFiltering(TextureMinFilter.Nearest, TextureMagFilter.Nearest);
+            quadBuffer?.Delete();
+            quadBuffer = StorageBuffer.Allocate<uint>(ReservedBufferSlots.QuadOverdraw, nameof(ReservedBufferSlots.QuadOverdraw), elementCount, BufferUsageHint.DynamicCopy);
         }
 
-        var unlocked = uint.MaxValue;
-        var zero = 0u;
-        GL.ClearTexImage(quadLock.Handle, 0, PixelFormat.RedInteger, PixelType.UnsignedInt, ref unlocked);
-        GL.ClearTexImage(quadCount!.Handle, 0, PixelFormat.RedInteger, PixelType.UnsignedInt, ref zero);
-
-        GL.BindImageTexture(LockImageUnit, quadLock.Handle, 0, false, 0, TextureAccess.ReadWrite, SizedInternalFormat.R32ui);
-        GL.BindImageTexture(CountImageUnit, quadCount.Handle, 0, false, 0, TextureAccess.ReadWrite, SizedInternalFormat.R32ui);
+        // zero is both the unlocked lock value and the starting count
+        quadBuffer.Clear();
+        quadBuffer.BindBufferBase();
     }
 
     /// <summary>
@@ -98,8 +81,12 @@ public class QuadOverdraw(RendererContext rendererContext)
         savedClearMask = framebuffer.ClearMask;
         framebuffer.ClearMask &= ~ClearBufferMask.DepthBufferBit;
 
-        GL.DepthFunc(DepthFunction.Gequal);
-        SceneShader.SetUniform1("bCountQuads", true);
+        savedPassState = rendererContext.RenderState.CurrentPass;
+        var countingState = savedPassState;
+        countingState.DepthStencil.DepthFunc = RsComparison.CloserEqual;
+        rendererContext.RenderState.SetPassBaseline(in countingState);
+
+        SceneShader.SetUniform1AllVariants("bCountQuads", 1u);
     }
 
     /// <summary>Restores the depth state changed by <see cref="BeginCountingPass"/>.</summary>
@@ -107,7 +94,7 @@ public class QuadOverdraw(RendererContext rendererContext)
     public void EndCountingPass(Framebuffer framebuffer)
     {
         framebuffer.ClearMask = savedClearMask;
-        GL.DepthFunc(DepthFunction.Greater);
+        rendererContext.RenderState.SetPassBaseline(in savedPassState);
     }
 
     /// <summary>
@@ -116,34 +103,27 @@ public class QuadOverdraw(RendererContext rendererContext)
     /// </summary>
     public void Render()
     {
-        Debug.Assert(quadCount != null, $"{nameof(Prepare)} must be called before {nameof(Render)}");
+        Debug.Assert(quadBuffer != null, $"{nameof(Prepare)} must be called before {nameof(Render)}");
 
         visualizeShader ??= rendererContext.ShaderLoader.LoadShader("visualize_quad_overdraw");
 
         using var _ = new GLDebugGroup("Quad Overdraw Visualization");
 
-        // The counts were written as image stores, the fullscreen pass samples them.
-        GL.MemoryBarrier(MemoryBarrierFlags.ShaderImageAccessBarrierBit | MemoryBarrierFlags.TextureFetchBarrierBit);
+        // The counts were written as buffer stores, the fullscreen pass reads them.
+        GL.MemoryBarrier(MemoryBarrierFlags.ShaderStorageBarrierBit);
 
         visualizeShader.Use();
-        visualizeShader.SetTexture(0, "g_tQuadOverdraw", quadCount);
 
-        GL.Disable(EnableCap.DepthTest);
-        GL.DepthMask(false);
+        using var overdrawState = rendererContext.RenderState.Scope(depthTest: false, depthWrite: false);
 
         GL.BindVertexArray(rendererContext.MeshBufferCache.EmptyVAO);
         GL.DrawArrays(PrimitiveType.Triangles, 0, 3);
-
-        GL.DepthMask(true);
-        GL.Enable(EnableCap.DepthTest);
     }
 
-    /// <summary>Releases the GPU textures owned by this visualization.</summary>
+    /// <summary>Releases the GPU buffer owned by this visualization.</summary>
     public void Dispose()
     {
-        quadLock?.Delete();
-        quadCount?.Delete();
-        quadLock = null;
-        quadCount = null;
+        quadBuffer?.Delete();
+        quadBuffer = null;
     }
 }

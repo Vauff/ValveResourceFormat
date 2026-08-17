@@ -91,17 +91,19 @@ namespace GUI.Types.GLViewers
 
             if (clip != null)
             {
-                AddAnimationControls();
+                // A clip has no animation list to pick from; the base list combo would stay empty.
+                AddAnimationControls(includeAnimationList: false);
 
                 void BindAnimationUi()
                 {
                     Debug.Assert(animationController != null);
 
-                    // Register update handler
                     SetAnimationControllerUpdateHandler();
 
                     // Set trackbar length to the animation length
                     animationController.SetAnimation(animationController.ActiveAnimation);
+
+                    SyncAnimationToggles();
                 }
 
                 if (animationPlayPause != null)

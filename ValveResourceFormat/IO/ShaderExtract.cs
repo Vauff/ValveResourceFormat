@@ -103,7 +103,6 @@ public sealed class ShaderExtract
     public VfxProgramData? Raytracing => Shaders.Raytracing;
 
     private readonly string[] FeatureNames;
-    private readonly string[] Globals;
     private HashSet<string> VariantParameterNames = [];
     private HashSet<int> VariantParameterIndices = [];
 
@@ -133,7 +132,6 @@ public sealed class ShaderExtract
         }
 
         FeatureNames = [.. Features.StaticComboArray.Select(f => f.Name)];
-        Globals = [.. Features.VariableDescriptions.Select(p => p.Name)];
     }
 
     /// <summary>
@@ -665,7 +663,10 @@ public sealed class ShaderExtract
         ConfigMappingParams staticConfig = new(program);
 
         // Attributes
-        var attributesDisect = new Dictionary<int[], HashSet<string>>(2 ^ Math.Max(0, program.StaticComboArray.Length - 1), new ConfigKeyComparer());
+        var attributeCapacity = Options.StaticComboReadingCap < 0
+            ? program.StaticComboEntries.Count
+            : Math.Min(program.StaticComboEntries.Count, Options.StaticComboReadingCap);
+        var attributesDisect = new Dictionary<int[], HashSet<string>>(attributeCapacity, new ConfigKeyComparer());
         var perConditionAttributes = new Dictionary<(int Index, int State), HashSet<string>>(staticConfig.SumStates);
 
         // Parameters
@@ -967,7 +968,7 @@ public sealed class ShaderExtract
             }
             else if (attribute.DynExpression!.Length > 0)
             {
-                value = new VfxEval(attribute.DynExpression, Globals, omitReturnStatement: true, FeatureNames).DynamicExpressionResult!;
+                value = new VfxEval(attribute.DynExpression, omitReturnStatement: true, features: FeatureNames).DynamicExpressionResult!;
             }
             else
             {
@@ -1215,49 +1216,62 @@ public sealed class ShaderExtract
         }
     }
 
-    enum Boolean
+    // The member names are output text in extracted shader source
+    enum VfxBool
     {
-        False,
-        True
+        @false,
+        @true
     }
 
+    // Keyed on the state names as they appear in shader source, which do not always
+    // match the C# property names (e.g. the front-face stencil states have no "Front" prefix)
     static readonly Dictionary<string, Type> RenderStateEnumSource = new()
     {
         // RsRasterizerStateDesc
-        [nameof(VfxRenderStateInfoPixelShader.RsRasterizerStateDesc.FillMode)] = typeof(VfxRenderStateInfoPixelShader.RsRasterizerStateDesc.RsFillMode),
-        [nameof(VfxRenderStateInfoPixelShader.RsRasterizerStateDesc.CullMode)] = typeof(VfxRenderStateInfoPixelShader.RsRasterizerStateDesc.RsCullMode),
-        [nameof(VfxRenderStateInfoPixelShader.RsRasterizerStateDesc.DepthClipEnable)] = typeof(Boolean),
-        [nameof(VfxRenderStateInfoPixelShader.RsRasterizerStateDesc.MultisampleEnable)] = typeof(Boolean),
+        ["FillMode"] = typeof(RsFillMode),
+        ["CullMode"] = typeof(RsCullMode),
+        ["DepthClipEnable"] = typeof(VfxBool),
+        ["MultisampleEnable"] = typeof(VfxBool),
 
         // RsDepthStencilStateDesc
-        [nameof(VfxRenderStateInfoPixelShader.RsDepthStencilStateDesc.DepthFunc)] = typeof(RsComparison),
-        ["DepthEnable"] = typeof(Boolean),
-        [nameof(VfxRenderStateInfoPixelShader.RsDepthStencilStateDesc.DepthWriteEnable)] = typeof(Boolean),
+        ["DepthFunc"] = typeof(RsComparison),
+        ["DepthEnable"] = typeof(VfxBool),
+        ["DepthWriteEnable"] = typeof(VfxBool),
+        ["StencilEnable"] = typeof(VfxBool),
+        ["StencilFunc"] = typeof(RsComparison),
+        ["StencilFailOp"] = typeof(RsStencilOp),
+        ["StencilDepthFailOp"] = typeof(RsStencilOp),
+        ["StencilPassOp"] = typeof(RsStencilOp),
+        ["BackStencilFunc"] = typeof(RsComparison),
+        ["BackStencilFailOp"] = typeof(RsStencilOp),
+        ["BackStencilDepthFailOp"] = typeof(RsStencilOp),
+        ["BackStencilPassOp"] = typeof(RsStencilOp),
 
         // RsBlendStateDesc
-        [nameof(VfxRenderStateInfoPixelShader.RsBlendStateDesc.AlphaToCoverageEnable)] = typeof(Boolean),
-        [nameof(VfxRenderStateInfoPixelShader.RsBlendStateDesc.IndependentBlendEnable)] = typeof(Boolean),
-        [nameof(VfxRenderStateInfoPixelShader.RsBlendStateDesc.SrgbWriteEnable)] = typeof(Boolean),
-        [nameof(VfxRenderStateInfoPixelShader.RsBlendStateDesc.BlendEnable)] = typeof(Boolean),
-        [nameof(VfxRenderStateInfoPixelShader.RsBlendStateDesc.SrcBlend)] = typeof(VfxRenderStateInfoPixelShader.RsBlendStateDesc.RsBlendMode),
-        [nameof(VfxRenderStateInfoPixelShader.RsBlendStateDesc.BlendOp)] = typeof(VfxRenderStateInfoPixelShader.RsBlendStateDesc.RsBlendOp),
-        [nameof(VfxRenderStateInfoPixelShader.RsBlendStateDesc.SrcBlendAlpha)] = typeof(VfxRenderStateInfoPixelShader.RsBlendStateDesc.RsBlendMode),
-        [nameof(VfxRenderStateInfoPixelShader.RsBlendStateDesc.BlendOpAlpha)] = typeof(VfxRenderStateInfoPixelShader.RsBlendStateDesc.RsBlendOp),
-        ["DstBlendAlpha"] = typeof(VfxRenderStateInfoPixelShader.RsBlendStateDesc.RsBlendMode),
-        ["DstBlend"] = typeof(VfxRenderStateInfoPixelShader.RsBlendStateDesc.RsBlendMode),
-        ["ColorWriteEnable"] = typeof(VfxRenderStateInfoPixelShader.RsBlendStateDesc.RsColorWriteEnableBits),
+        ["AlphaToCoverageEnable"] = typeof(VfxBool),
+        ["IndependentBlendEnable"] = typeof(VfxBool),
+        ["SrgbWriteEnable"] = typeof(VfxBool),
+        ["BlendEnable"] = typeof(VfxBool),
+        ["SrcBlend"] = typeof(RsBlendMode),
+        ["BlendOp"] = typeof(RsBlendOp),
+        ["SrcBlendAlpha"] = typeof(RsBlendMode),
+        ["BlendOpAlpha"] = typeof(RsBlendOp),
+        ["DstBlendAlpha"] = typeof(RsBlendMode),
+        ["DstBlend"] = typeof(RsBlendMode),
+        ["ColorWriteEnable"] = typeof(RsColorWriteEnableBits),
+
+        // Alpha test states are not part of the render state descriptors
+        ["AlphaTestEnable"] = typeof(VfxBool),
+        ["AlphaTestFunc"] = typeof(RsComparison),
     };
 
     private void WriteState(IndentedTextWriter writer, VfxVariableDescription param)
     {
-        string enumMapper(int v)
-        {
-            var enumSource = RenderStateEnumSource.GetValueOrDefault(param.Name.TrimEnd('0', '1', '2', '3', '4', '5', '6', '7'));
-            return enumSource?.GetEnumName(v) ?? v.ToString(CultureInfo.InvariantCulture);
-        }
+        var enumSource = RenderStateEnumSource.GetValueOrDefault(param.Name.TrimEnd('0', '1', '2', '3', '4', '5', '6', '7'));
+        string enumMapper(int v) => enumSource is null ? v.ToString(CultureInfo.InvariantCulture) : ShaderUtilHelpers.GetEnumName(enumSource, v);
 
         var stateValue = param.DynExp.Length > 0
-            ? new VfxEval(param.DynExp, Globals, omitReturnStatement: true, FeatureNames, enumMapper).DynamicExpressionResult
+            ? new VfxEval(param.DynExp, omitReturnStatement: true, features: FeatureNames, enumMapper: enumMapper).DynamicExpressionResult
             : enumMapper(param.IntDefs[0]);
 
         if (param.RegisterType == VfxRegisterType.RenderState)
@@ -1357,17 +1371,15 @@ public sealed class ShaderExtract
             annotations.Add($"MaxRes(\"{param.MaxRes}\");");
         }
 
-        var stageSpecificGlobals = new Lazy<string[]>(() => [.. paramBlocks.Select(p => p.Name)]);
-
         if (param.DynExp.Length > 0)
         {
-            var dynEx = GetDynamicExpressionStringShared(param.DynExp, param, writer, FeatureNames, stageSpecificGlobals.Value);
+            var dynEx = GetDynamicExpressionStringShared(param.DynExp, param, writer, FeatureNames);
             annotations.Add($"Expression({dynEx});");
         }
 
         if (param.UiVisibilityExp.Length > 0)
         {
-            var dynEx = GetDynamicExpressionStringShared(param.UiVisibilityExp, param, writer, FeatureNames, stageSpecificGlobals.Value);
+            var dynEx = GetDynamicExpressionStringShared(param.UiVisibilityExp, param, writer, FeatureNames);
             annotations.Add($"UiVisibility({dynEx});");
         }
 
@@ -1485,12 +1497,44 @@ public sealed class ShaderExtract
             : string.Empty;
     }
 
-    private static string GetDynamicExpressionStringShared(byte[] bytecode, VfxVariableDescription param, IndentedTextWriter writer, string[] features, string[] globals)
+    private static string GetDynamicExpressionStringShared(byte[] bytecode, VfxVariableDescription param, IndentedTextWriter writer, string[] features)
     {
-        var dynEx = new VfxEval(bytecode, globals, omitReturnStatement: true, features).DynamicExpressionResult;
-        dynEx = dynEx.Replace(param.Name, "this", StringComparison.Ordinal);
+        var dynEx = new VfxEval(bytecode, omitReturnStatement: true, features: features).DynamicExpressionResult;
+        dynEx = ReplaceIdentifier(dynEx, param.Name, "this");
         dynEx = dynEx.Replace("\n", "\n" + new string('\t', writer.Indent + 1), StringComparison.Ordinal);
         return dynEx;
+    }
+
+    // The name of a variable can be the start of the name of another one
+    internal static string ReplaceIdentifier(string expression, string identifier, string replacement)
+    {
+        var index = expression.IndexOf(identifier, StringComparison.Ordinal);
+
+        if (index < 0)
+        {
+            return expression;
+        }
+
+        static bool IsIdentifierChar(char c) => char.IsAsciiLetterOrDigit(c) || c is '_' or '$';
+
+        var result = new StringBuilder(expression.Length);
+        var copied = 0;
+
+        while (index >= 0)
+        {
+            var end = index + identifier.Length;
+
+            if ((index == 0 || !IsIdentifierChar(expression[index - 1]))
+                && (end == expression.Length || !IsIdentifierChar(expression[end])))
+            {
+                result.Append(expression, copied, index - copied).Append(replacement);
+                copied = end;
+            }
+
+            index = expression.IndexOf(identifier, end, StringComparison.Ordinal);
+        }
+
+        return result.Append(expression, copied, expression.Length - copied).ToString();
     }
 
     private static string GetChannelFromChannelBlock(VfxTextureChannelProcessor channelBlock, VfxVariableDescription[] paramBlocks)

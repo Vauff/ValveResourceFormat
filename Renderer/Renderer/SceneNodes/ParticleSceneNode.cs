@@ -2,6 +2,7 @@ using Microsoft.Extensions.Logging;
 using ValveKeyValue;
 using ValveResourceFormat.Blocks;
 using ValveResourceFormat.Renderer.Particles;
+using ValveResourceFormat.Renderer.Particles.Utils;
 using ValveResourceFormat.ResourceTypes;
 using ValveResourceFormat.Serialization.KeyValues;
 
@@ -227,12 +228,30 @@ namespace ValveResourceFormat.Renderer.SceneNodes
         private bool pendingRestart;
 
         /// <summary>
+        /// Stops emission and plays the system's endcap, which is what the engine does when something
+        /// tells a running effect to end.
+        /// </summary>
+        public void PlayEndCap()
+        {
+            particleRenderer.Stop();
+            particleRenderer.PlayEndCap();
+        }
+
+        /// <summary>
         /// Forces this system's renderers to draw once with temporary particles.
         /// </summary>
         public void Prewarm(Camera camera) => particleRenderer.Prewarm(camera);
 
-        /// <summary>Sets the particle detail tier (0 = Low .. 3 = Ultra) used by detail-tiered inputs.</summary>
-        public void SetDetailLevel(int level) => particleRenderer.SetDetailLevel(level);
+        /// <summary>Sets the particle detail tier used by detail-tiered inputs and by child systems.</summary>
+        public void SetDetailLevel(ParticleDetailLevel level) => particleRenderer.SetDetailLevel(level);
+
+        /// <summary>
+        /// Replaces the texture drawn by every renderer in this system and its children.
+        /// </summary>
+        public void SetTextureOverride(string textureName) => particleRenderer.SetTextureOverride(textureName);
+
+        /// <inheritdoc cref="SetTextureOverride(string)"/>
+        public void SetTextureOverride(RenderTexture texture) => particleRenderer.SetTextureOverride(texture);
 
         /// <summary>Gets the control point at the given index from the particle renderer.</summary>
         /// <param name="index">The index of the control point to retrieve.</param>
@@ -375,9 +394,8 @@ namespace ValveResourceFormat.Renderer.SceneNodes
                 }
                 else
                 {
-                    point.Orientation = EntityTransformHelper.QAngleToForwardDirection(angleOffset);
-                    point.Rotation = Quaternion.CreateFromRotationMatrix(
-                        EntityTransformHelper.CreateRotationMatrixFromEulerAngles(angleOffset));
+                    point.Orientation = EntityTransformHelper.EulerAnglesToForwardDirection(angleOffset);
+                    point.Rotation = EntityTransformHelper.EulerAnglesToQuaternion(angleOffset);
                 }
                 point.AttachType = attachType;
             }
@@ -416,7 +434,7 @@ namespace ValveResourceFormat.Renderer.SceneNodes
                 if (!Preview)
                 {
                     var controlPointForward = Vector3.TransformNormal(Vector3.UnitX, Transform);
-                    if (controlPointForward.LengthSquared() > 1e-12f)
+                    if (controlPointForward.LengthSquared() > Epsilon.LengthSquared)
                     {
                         controlPoint.Orientation = Vector3.Normalize(controlPointForward);
                         controlPoint.Rotation = Quaternion.Normalize(Quaternion.CreateFromRotationMatrix(Transform));

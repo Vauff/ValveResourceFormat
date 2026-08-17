@@ -93,7 +93,7 @@ namespace ValveResourceFormat.ResourceTypes
                 return flexData;
             }
 
-            var bundleTypes = GetMorphKeyValueCollection(Data, "m_bundleTypes").Select(kv => ParseBundleType(kv)).ToArray();
+            var bundleTypes = GetBundleTypes();
             flexData.EnsureCapacity(morphDatas.Count);
 
             foreach (var morphData in morphDatas)
@@ -241,9 +241,9 @@ namespace ValveResourceFormat.ResourceTypes
                 var bundleTypeString = (string)bundleType;
                 return bundleTypeString switch
                 {
-                    "MORPH_BUNDLE_TYPE_POSITION_SPEED" => MorphBundleType.PositionSpeed,
-                    "BUNDLE_TYPE_POSITION_SPEED" => MorphBundleType.PositionSpeed,
-                    "MORPH_BUNDLE_TYPE_NORMAL_WRINKLE" => MorphBundleType.NormalWrinkle,
+                    "MORPH_BUNDLE_TYPE_NONE" or "BUNDLE_TYPE_NONE" => MorphBundleType.None,
+                    "MORPH_BUNDLE_TYPE_POSITION_SPEED" or "BUNDLE_TYPE_POSITION_SPEED" => MorphBundleType.PositionSpeed,
+                    "MORPH_BUNDLE_TYPE_NORMAL_WRINKLE" or "BUNDLE_TYPE_NORMAL_WRINKLE" => MorphBundleType.NormalWrinkle,
                     _ => throw new NotImplementedException($"Unhandled bundle type: {bundleTypeString}"),
                 };
             }
@@ -254,6 +254,15 @@ namespace ValveResourceFormat.ResourceTypes
         private static IReadOnlyList<KVObject> GetMorphKeyValueCollection(KVObject data, string name)
         {
             return data.GetArray(name) ?? [];
+        }
+
+        /// <summary>
+        /// Gets what each bundle of a morph rect holds. The bundle types are shared by every rect, so this
+        /// indexes into a rect's <c>m_bundleDatas</c>.
+        /// </summary>
+        public MorphBundleType[] GetBundleTypes()
+        {
+            return [.. GetMorphKeyValueCollection(Data, "m_bundleTypes").Select(ParseBundleType)];
         }
 
         /// <summary>

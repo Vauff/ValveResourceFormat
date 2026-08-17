@@ -5,17 +5,16 @@ namespace ValveResourceFormat.Renderer.Particles.Operators
     /// particle attribute, with an option to normalize the output.
     /// </summary>
     /// <seealso href="https://s2v.app/SchemaExplorer/cs2/particles/C_OP_RemapCrossProductOfTwoVectorsToVector">C_OP_RemapCrossProductOfTwoVectorsToVector</seealso>
-    // seriously?
     class RemapCrossProductOfTwoVectorsToVector : ParticleFunctionOperator
     {
-        private readonly ParticleField FieldOutput = ParticleField.Position;
+        private readonly ParticleField fieldOutput = ParticleField.Position;
         private readonly IVectorProvider inputVec1 = new LiteralVectorProvider(Vector3.Zero);
         private readonly IVectorProvider inputVec2 = new LiteralVectorProvider(Vector3.Zero);
         private readonly bool normalize;
 
         public RemapCrossProductOfTwoVectorsToVector(ParticleDefinitionParser parse) : base(parse)
         {
-            FieldOutput = parse.ParticleField("m_nFieldOutput", FieldOutput);
+            fieldOutput = parse.ParticleField("m_nFieldOutput", fieldOutput);
             inputVec1 = parse.VectorProvider("m_InputVec1", inputVec1);
             inputVec2 = parse.VectorProvider("m_InputVec2", inputVec2);
             normalize = parse.Boolean("m_bNormalize", normalize);
@@ -34,7 +33,7 @@ namespace ValveResourceFormat.Renderer.Particles.Operators
                     cross = Vector3.Normalize(cross);
                 }
 
-                particle.SetVector(FieldOutput, cross);
+                particle.SetVector(fieldOutput, cross);
             }
         }
     }

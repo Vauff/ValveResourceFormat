@@ -163,7 +163,6 @@ namespace GUI.Types.GLViewers
                 }
             }
 
-            // Process all parameters
             foreach (var paramName in allParameterNames)
             {
                 var inMaterial = materialParams.FloatParams.ContainsKey(paramName) ||
@@ -453,15 +452,6 @@ namespace GUI.Types.GLViewers
             ParamsTable.Controls.Add(inputRow, 1, row);
         }
 
-        static readonly string[] GlobalShaderPrefixes =
-        [
-            "g_fl",
-            "g_f",
-            "g_v",
-            "g_b",
-            "g_n",
-        ];
-
         private static string NormalizeParameterName(string paramNameString)
         {
             // Handle feature flags (F_ prefix) - all uppercase, split by underscores
@@ -472,7 +462,7 @@ namespace GUI.Types.GLViewers
 
             var paramName = paramNameString.AsSpan();
 
-            foreach (var prefix in GlobalShaderPrefixes)
+            foreach (var prefix in VfxVariableDescription.TypePrefixes)
             {
                 if (paramName.StartsWith(prefix))
                 {
@@ -481,7 +471,6 @@ namespace GUI.Types.GLViewers
                 }
             }
 
-            // Start with empty result
             var result = new System.Text.StringBuilder();
 
             for (var i = 0; i < paramName.Length; i++)
@@ -710,7 +699,7 @@ namespace GUI.Types.GLViewers
             Input.Camera.FrameObjectFromAngle(Vector3.Zero, 0, 32, 32, float.DegreesToRadians(180f), 0);
             if (renderMat != null && renderMat.IsCs2Water)
             {
-                Input.Camera.FrameObjectFromAngle(Vector3.Zero, 32, 32, 0, 0, float.DegreesToRadians(-90f));
+                Input.Camera.FrameObjectFromAngle(Vector3.Zero, 32, 32, 0, 0, float.DegreesToRadians(90f));
             }
 
             if (previewNode != null)

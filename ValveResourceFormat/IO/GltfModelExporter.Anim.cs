@@ -1,12 +1,13 @@
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Text.Json.Nodes;
 using SharpGLTF.Schema2;
 using ValveResourceFormat.ResourceTypes;
 using ValveResourceFormat.ResourceTypes.ModelAnimation;
 using ValveResourceFormat.ResourceTypes.ModelFlex;
 using VAnim = ValveResourceFormat.ResourceTypes.ModelAnimation.Animation;
-using VAnimationClip = ValveResourceFormat.ResourceTypes.ModelAnimation2.AnimationClip;
+using VMesh = ValveResourceFormat.ResourceTypes.Mesh;
 using VModel = ValveResourceFormat.ResourceTypes.Model;
 
 namespace ValveResourceFormat.IO;
@@ -20,11 +21,21 @@ public partial class GltfModelExporter
     {
         Skeleton Skeleton { get; init; }
         Frame Frame { get; init; }
+        FlexController[] FlexControllers { get; init; }
         int BoneCount => Frame.Bones.Length;
 
         AnimationChannelWriter<Quaternion> RotationWriter;
         AnimationChannelWriter<Vector3> PositionWriter;
         AnimationChannelWriter<Vector3> ScaleWriter;
+
+        readonly Vector3[] localPositions;
+        readonly Quaternion[] localRotations;
+        readonly Vector3[] localScales;
+
+        /// <summary>
+        /// Gets whether additive animations are composed over the bind pose rather than written as delta tracks.
+        /// </summary>
+        public bool ComposeAdditive { get; init; }
 
         /// <summary>
         /// Initializes a new instance of the <see cref="AnimationWriter"/> class.
@@ -33,10 +44,15 @@ public partial class GltfModelExporter
         {
             Skeleton = skeleton;
             Frame = new(skeleton, flexControllers);
+            FlexControllers = flexControllers;
 
             RotationWriter = AnimationChannelWriter<Quaternion>.Create(BoneCount);
             PositionWriter = AnimationChannelWriter<Vector3>.Create(BoneCount);
             ScaleWriter = AnimationChannelWriter<Vector3>.Create(BoneCount);
+
+            localPositions = new Vector3[BoneCount];
+            localRotations = new Quaternion[BoneCount];
+            localScales = new Vector3[BoneCount];
         }
 
         /// <summary>
@@ -46,21 +62,67 @@ public partial class GltfModelExporter
         /// </summary>
         public void WriteAnimation(ModelRoot model, Node?[] joints, VAnim animation, string? animationName = null)
         {
+            WriteCore(model, joints, animation, animationName, retargeter: null);
+        }
+
+        /// <summary>
+        /// Writes an animation authored on another skeleton, retargeted onto the model by world pose.
+        /// Retargeting matches world poses, so an additive animation is composed over the source
+        /// skeleton's bind pose either way, and taken back to a delta over the model's bind pose when
+        /// deltas are wanted.
+        /// </summary>
+        public void WriteRetargetedAnimation(ModelRoot model, Node?[] joints, VAnim animation, string animationName, SkeletonRetargeter retargeter)
+        {
+            if (!retargeter.HasMappedBones)
+            {
+                return;
+            }
+
+            WriteCore(model, joints, animation, animationName, retargeter);
+        }
+
+        /// <summary>
+        /// Writes the animation's channels: per frame, the per-bone local transforms are produced
+        /// (decoded directly, or through <paramref name="retargeter"/> when given), then scale
+        /// sanitizing, cloth pinning, root motion, delta conversion and coordinate baking are applied
+        /// and the glTF channels emitted.
+        /// </summary>
+        private void WriteCore(ModelRoot model, Node?[] joints, VAnim animation, string? animationName, SkeletonRetargeter? retargeter)
+        {
             Debug.Assert(joints.Length == BoneCount);
 
-            // Cleanup state
-            Frame.Clear(Skeleton);
+            var writeDeltas = animation.IsAdditive && !ComposeAdditive;
+
+            Frame? clipFrame = null;
+            Matrix4x4[]? modelWorld = null;
+            Matrix4x4[]? inverseWorld = null;
+
+            if (retargeter != null)
+            {
+                clipFrame = new Frame(retargeter.SourceSkeleton, FlexControllers);
+                modelWorld = new Matrix4x4[BoneCount];
+                inverseWorld = new Matrix4x4[BoneCount];
+            }
+            else if (writeDeltas)
+            {
+                Frame.ClearToIdentity();
+            }
+            else
+            {
+                Frame.Clear(Skeleton);
+            }
 
             RotationWriter.Clear();
             PositionWriter.Clear();
             ScaleWriter.Clear();
 
             var outputAnimation = model.UseAnimation(animationName ?? animation.Name);
+            WriteAdditiveExtras(outputAnimation, animation, ComposeAdditive);
 
             var fps = animation.Fps;
 
             // Some models have fps of 0.000, which will make time a NaN
-            if (fps == 0)
+            if (fps <= 0)
             {
                 fps = 1f;
             }
@@ -68,11 +130,11 @@ public partial class GltfModelExporter
             // root motion is stored separately from bone frames, so bake it into the root bone(s) to keep
             // the skeleton from animating in place. horizontal travel and yaw only. the engine doesn't
             // apply a vertical movement track to the body.
-            var applyRootMotion = animation.HasMovementData();
+            var applyRootMotion = animation.HasMovementData() && !writeDeltas;
 
             // No cloth solver here, so mirror the renderer (AnimationController.GetSkinningMatrices):
             // pin each cloth root to the cloth anchor bone instead of writing its raw, solver-less clip data.
-            var clothAnchor = Skeleton.ClothSimulationRoot;
+            var clothAnchor = writeDeltas ? null : Skeleton.ClothSimulationRoot;
             var anchorInverseBindPose = Matrix4x4.Identity;
             if (clothAnchor != null)
             {
@@ -88,21 +150,21 @@ public partial class GltfModelExporter
                 }
             }
 
-            // bake additive clips over the bind pose, same as the renderer
-            var additive = animation.IsAdditive;
-
             for (var f = 0; f < animation.FrameCount; f++)
             {
-                Frame.FrameIndex = f;
-                animation.DecodeFrame(Frame);
-
-                if (additive)
+                if (retargeter != null)
                 {
-                    for (var boneID = 0; boneID < BoneCount; boneID++)
-                    {
-                        var bind = new FrameBone(Skeleton.Bones[boneID].Position, 1f, Skeleton.Bones[boneID].Angle);
-                        Frame.Bones[boneID] = Frame.Bones[boneID].BlendAdd(bind, 1f);
-                    }
+                    DecodeRetargetedFrameLocals(animation, retargeter, f, clipFrame!, modelWorld!, inverseWorld!);
+                }
+                else
+                {
+                    DecodeFrameLocals(animation, f, writeDeltas);
+                }
+
+                for (var boneID = 0; boneID < BoneCount; boneID++)
+                {
+                    var s = localScales[boneID];
+                    localScales[boneID] = new Vector3(SanitizeScale(s.X), SanitizeScale(s.Y), SanitizeScale(s.Z));
                 }
 
                 var time = f / fps;
@@ -112,7 +174,10 @@ public partial class GltfModelExporter
                 if (applyRootMotion)
                 {
                     var movement = animation.GetMovementOffsetData(f);
-                    var movementPosition = new Vector3(movement.Position.X, movement.Position.Y, 0f);
+                    // Legacy movement data is planar; NM clip root motion natively carries vertical travel.
+                    var movementPosition = animation is ClipAnimation
+                        ? movement.Position
+                        : new Vector3(movement.Position.X, movement.Position.Y, 0f);
                     rootMotion = Matrix4x4.CreateRotationZ(float.DegreesToRadians(movement.Angle))
                         * Matrix4x4.CreateTranslation(movementPosition);
                 }
@@ -124,16 +189,9 @@ public partial class GltfModelExporter
                     var anchorPose = Matrix4x4.Identity;
                     for (var b = clothAnchor; b != null; b = b.Parent)
                     {
-                        var anchorFrame = Frame.Bones[b.Index];
-                        var anchorScale = anchorFrame.Scale;
-                        if (float.IsNaN(anchorScale) || float.IsInfinity(anchorScale))
-                        {
-                            anchorScale = 0.0f;
-                        }
-
-                        anchorPose *= Matrix4x4.CreateScale(anchorScale)
-                            * Matrix4x4.CreateFromQuaternion(anchorFrame.Angle)
-                            * Matrix4x4.CreateTranslation(anchorFrame.Position);
+                        anchorPose *= Matrix4x4.CreateScale(localScales[b.Index])
+                            * Matrix4x4.CreateFromQuaternion(localRotations[b.Index])
+                            * Matrix4x4.CreateTranslation(localPositions[b.Index]);
                     }
 
                     clothSkinning = anchorInverseBindPose * anchorPose;
@@ -141,20 +199,9 @@ public partial class GltfModelExporter
 
                 for (var boneID = 0; boneID < BoneCount; boneID++)
                 {
-                    var boneFrame = Frame.Bones[boneID];
-
-                    var position = boneFrame.Position;
-                    var rotation = boneFrame.Angle;
-                    var scalarBoneScale = boneFrame.Scale;
-
-                    if (float.IsNaN(scalarBoneScale) || float.IsInfinity(scalarBoneScale))
-                    {
-                        // See https://github.com/ValveResourceFormat/ValveResourceFormat/issues/527 (NaN)
-                        // and https://github.com/ValveResourceFormat/ValveResourceFormat/issues/570 (inf)
-                        scalarBoneScale = 0.0f;
-                    }
-
-                    var scale = new Vector3(scalarBoneScale);
+                    var position = localPositions[boneID];
+                    var rotation = localRotations[boneID];
+                    var scale = localScales[boneID];
 
                     var bone = Skeleton.Bones[boneID];
 
@@ -192,7 +239,16 @@ public partial class GltfModelExporter
                         }
                     }
 
-                    (position, rotation) = BakeConversion(position, rotation, bone.Parent == null);
+                    if (writeDeltas && retargeter != null)
+                    {
+                        position -= bone.Position;
+                        rotation = Quaternion.Conjugate(bone.Angle) * rotation;
+                        scale = Vector3.One;
+                    }
+
+                    (position, rotation) = writeDeltas
+                        ? BakeAdditiveDeltaConversion(position, rotation, bone.Parent == null)
+                        : BakeConversion(position, rotation, bone.Parent == null);
 
                     RotationWriter.SubmitKeyframe(boneID, time, prevFrameTime, rotation);
                     PositionWriter.SubmitKeyframe(boneID, time, prevFrameTime, position);
@@ -205,9 +261,11 @@ public partial class GltfModelExporter
                 if (animation.FrameCount == 0)
                 {
                     var bone = Skeleton.Bones[boneID];
-                    var (bindPosition, bindRotation) = BakeConversion(bone.Position, bone.Angle, bone.Parent == null);
-                    RotationWriter.Channels[boneID].Add(0f, bindRotation);
-                    PositionWriter.Channels[boneID].Add(0f, bindPosition);
+                    var (restPosition, restRotation) = writeDeltas
+                        ? (Vector3.Zero, Quaternion.Identity)
+                        : BakeConversion(bone.Position, bone.Angle, bone.Parent == null);
+                    RotationWriter.Channels[boneID].Add(0f, restRotation);
+                    PositionWriter.Channels[boneID].Add(0f, restPosition);
                     ScaleWriter.Channels[boneID].Add(0f, Vector3.One);
                 }
 
@@ -222,27 +280,133 @@ public partial class GltfModelExporter
                 outputAnimation.CreateScaleChannel(jointNode, ScaleWriter.Channels[boneID], true);
             }
         }
+
+        /// <summary>
+        /// Fills the local transform buffers with the frame decoded straight onto the model skeleton.
+        /// When deltas are written, the decoded frame already contains them, and scale stays at one.
+        /// </summary>
+        private void DecodeFrameLocals(VAnim animation, int frameIndex, bool writeDeltas)
+        {
+            Frame.FrameIndex = frameIndex;
+            animation.DecodeFrame(Frame);
+
+            if (animation.IsAdditive && !writeDeltas)
+            {
+                animation.ComposeAdditiveOverBindPose(Frame.Bones, Skeleton);
+            }
+
+            for (var boneID = 0; boneID < BoneCount; boneID++)
+            {
+                var boneFrame = Frame.Bones[boneID];
+                localPositions[boneID] = boneFrame.Position;
+                localRotations[boneID] = boneFrame.Angle;
+                localScales[boneID] = writeDeltas ? Vector3.One : new Vector3(boneFrame.Scale);
+            }
+        }
+
+        /// <summary>
+        /// Fills the local transform buffers by decoding the frame on the source skeleton, retargeting
+        /// the world pose onto the model skeleton and converting back to per-bone locals. Additive
+        /// frames are always composed first, since retargeting matches absolute world poses.
+        /// </summary>
+        private void DecodeRetargetedFrameLocals(VAnim animation, SkeletonRetargeter retargeter, int frameIndex, Frame clipFrame, Matrix4x4[] modelWorld, Matrix4x4[] inverseWorld)
+        {
+            clipFrame.FrameIndex = frameIndex;
+            animation.DecodeFrame(clipFrame);
+
+            if (animation.IsAdditive)
+            {
+                animation.ComposeAdditiveOverBindPose(clipFrame.Bones, retargeter.SourceSkeleton);
+            }
+
+            retargeter.Retarget(clipFrame, modelWorld);
+
+            for (var boneID = 0; boneID < BoneCount; boneID++)
+            {
+                if (!Matrix4x4.Invert(modelWorld[boneID], out inverseWorld[boneID]))
+                {
+                    inverseWorld[boneID] = Matrix4x4.Identity;
+                }
+            }
+
+            for (var boneID = 0; boneID < BoneCount; boneID++)
+            {
+                var bone = Skeleton.Bones[boneID];
+                var inverseParent = bone.Parent != null ? inverseWorld[bone.Parent.Index] : Matrix4x4.Identity;
+                var local = modelWorld[boneID] * inverseParent;
+
+                if (!Matrix4x4.Decompose(local, out var scale, out var rotation, out var translation))
+                {
+                    scale = Vector3.One;
+                    rotation = Quaternion.Identity;
+                    translation = local.Translation;
+                }
+
+                localPositions[boneID] = translation;
+                localRotations[boneID] = rotation;
+                localScales[boneID] = scale;
+            }
+        }
+
+        // See https://github.com/ValveResourceFormat/ValveResourceFormat/issues/527 (NaN)
+        // and https://github.com/ValveResourceFormat/ValveResourceFormat/issues/570 (inf)
+        private static float SanitizeScale(float value)
+            => float.IsNaN(value) || float.IsInfinity(value) ? 0f : value;
     }
 
-    // Animation-graph clips aren't part of GetAllAnimations; write them here, retargeted by bone name.
-    private void WriteAnimationGraphClips(ModelRoot exportedModel, VModel model, Node[] joints, HashSet<string> animationFilter)
+    /// <summary>
+    /// Writes animations authored on another skeleton, retargeted onto the model by world pose.
+    /// One retargeter serves every clip targeting the same skeleton.
+    /// </summary>
+    private void WriteAnimationGraphClips(ModelRoot exportedModel, Scene scene, VModel model, Node?[] joints, HashSet<string> animationFilter)
     {
-        var retargets = new Dictionary<string, (AnimationWriter Writer, Node?[] Joints)?>();
+        var clipRetargeters = new Dictionary<string, SkeletonRetargeter?>();
+
+        // Secondary animations (the clip's tracks for further skeletons, e.g. the weapon of a
+        // viewmodel clip) get their own skeleton nodes and writer, created once per skeleton and shared.
+        var secondarySkeletons = new Dictionary<string, (AnimationWriter Writer, Node[] Joints)?>();
+
+        (AnimationWriter Writer, Node[] Joints)? GetOrCreateSecondarySkeleton(string skeletonName)
+        {
+            if (secondarySkeletons.TryGetValue(skeletonName, out var cached))
+            {
+                return cached;
+            }
+
+            (AnimationWriter Writer, Node[] Joints)? created = null;
+            if (Skeleton.FromSkeletonResource(FileLoader, skeletonName) is { } skeleton)
+            {
+                var (skeletonNode, secondaryJoints) = CreateGltfSkeleton(scene, skeleton, skeletonName);
+                if (skeletonNode != null && secondaryJoints != null)
+                {
+                    var meshNode = CreateSkeletonVisualizationMesh(exportedModel, scene, skeleton, secondaryJoints);
+                    meshNode.Name = $"{skeletonName}.empty_mesh_reference";
+                    var writer = new AnimationWriter(skeleton, []) { ComposeAdditive = ComposeAdditiveAnimations };
+                    created = (writer, secondaryJoints);
+                }
+            }
+
+            secondarySkeletons[skeletonName] = created;
+            return created;
+        }
 
         // UseAnimation is find-or-create by name, so a clip sharing a name with an already-written
         // animation (embedded, or an earlier clip) would merge its channels onto it. Keep the first, skip the rest.
         var writtenNames = exportedModel.LogicalAnimations.Select(a => a.Name).ToHashSet();
 
-        foreach (var clipName in AnimationGraphLoader.GetClipNames(model, FileLoader))
+        var retargetWriter = new AnimationWriter(model.Skeleton, model.FlexControllers) { ComposeAdditive = ComposeAdditiveAnimations };
+
+        foreach (var animation in model.GetAllAnimations(FileLoader))
         {
             CancellationToken.ThrowIfCancellationRequested();
 
-            if (FileLoader.LoadFileCompiled(clipName)?.DataBlock is not VAnimationClip clip)
+            if (animation is not ClipAnimation clipAnimation)
             {
                 continue;
             }
 
-            var animationName = ClipAnimationName(clip.Name);
+            var targetSkeletonName = clipAnimation.TargetSkeletonName;
+            var animationName = ClipAnimationName(clipAnimation.Name);
 
             if (!IncludeAnimation(animationFilter, animationName))
             {
@@ -255,14 +419,25 @@ public partial class GltfModelExporter
                 continue;
             }
 
-            if (!retargets.TryGetValue(clip.SkeletonName, out var retarget))
+            if (!clipRetargeters.TryGetValue(targetSkeletonName, out var retargeter))
             {
-                retargets[clip.SkeletonName] = retarget = BuildClipRetarget(model, joints, clip.SkeletonName);
+                var clipSkeleton = Skeleton.FromSkeletonResource(FileLoader, targetSkeletonName);
+                retargeter = clipSkeleton != null ? new SkeletonRetargeter(model.Skeleton, clipSkeleton) : null;
+                clipRetargeters[targetSkeletonName] = retargeter;
             }
 
-            if (retarget != null)
+            if (retargeter != null)
             {
-                retarget.Value.Writer.WriteAnimation(exportedModel, retarget.Value.Joints, new ClipAnimation(clip), animationName);
+                retargetWriter.WriteRetargetedAnimation(exportedModel, joints, clipAnimation, animationName, retargeter);
+
+                foreach (var secondaryClip in clipAnimation.Clip.SecondaryAnimations)
+                {
+                    if (GetOrCreateSecondarySkeleton(secondaryClip.SkeletonName) is { } secondary)
+                    {
+                        secondary.Writer.WriteAnimation(exportedModel, secondary.Joints, new ClipAnimation(secondaryClip), animationName);
+                    }
+                }
+
                 writtenNames.Add(animationName);
             }
         }
@@ -272,28 +447,120 @@ public partial class GltfModelExporter
     // path with the .vnmclip extension stripped (the path keeps them unique across clip folders).
     private static string ClipAnimationName(string clipName) => Path.ChangeExtension(clipName, null)!;
 
-    private (AnimationWriter Writer, Node?[] Joints)? BuildClipRetarget(VModel model, Node[] joints, string clipSkeletonName)
+    /// <summary>
+    /// Flags an additive animation in its glTF extras. glTF has no notion of additive animation, so an
+    /// uncomposed one carries per-bone deltas the consumer composes onto the bind pose itself: add the
+    /// translation, post-multiply the rotation. Scale is not part of the delta and stays at one.
+    /// </summary>
+    private static void WriteAdditiveExtras(SharpGLTF.Schema2.Animation outputAnimation, VAnim animation, bool composed)
     {
-        if (FileLoader.LoadFileCompiled(clipSkeletonName)?.DataBlock is not BinaryKV3 skeletonData)
+        if (!animation.IsAdditive)
         {
-            return null;
+            return;
         }
 
-        var clipSkeleton = Skeleton.FromSkeletonData(skeletonData.Data);
-        var remappedJoints = new Node?[clipSkeleton.Bones.Length];
-        var matched = false;
-
-        for (var i = 0; i < clipSkeleton.Bones.Length; i++)
+        outputAnimation.Extras = new JsonObject
         {
-            var modelBone = model.Skeleton[clipSkeleton.Bones[i].Name];
-            if (modelBone != null)
+            ["additive"] = true,
+            ["additive_base"] = "bindpose",
+            ["additive_composed"] = composed,
+        };
+    }
+
+    /// <summary>
+    /// Writes morph-target weight animation. glTF has no flex controllers, so each mesh's flex rules
+    /// are evaluated per frame from the animation's controller values (Frame.Datas) and the resulting
+    /// morph weights are baked.
+    /// </summary>
+    private void WriteMorphAnimations(ModelRoot exportedModel, VModel model, List<(Node Node, VMesh Mesh)> morphedMeshes, HashSet<string> animationFilter)
+    {
+        var meshTargets = new List<(Node Node, List<int> MorphFlexIds, Dictionary<int, FlexRule> RuleByFlexId)>();
+
+        foreach (var (node, mesh) in morphedMeshes)
+        {
+            var morph = mesh.MorphData!;
+            var descriptors = morph.GetFlexDescriptors();
+            var flexData = morph.GetFlexVertexData();
+
+            // The mesh's glTF morph targets are the flex descriptors that have flex data, in descriptor order.
+            var morphFlexIds = new List<int>();
+            for (var d = 0; d < descriptors.Count; d++)
             {
-                remappedJoints[i] = joints[modelBone.Index];
-                matched = true;
+                if (flexData.ContainsKey(descriptors[d]))
+                {
+                    morphFlexIds.Add(d);
+                }
+            }
+
+            if (morphFlexIds.Count == 0)
+            {
+                continue;
+            }
+
+            var ruleByFlexId = new Dictionary<int, FlexRule>();
+            foreach (var rule in morph.FlexRules)
+            {
+                ruleByFlexId[rule.FlexID] = rule;
+            }
+
+            meshTargets.Add((node, morphFlexIds, ruleByFlexId));
+        }
+
+        if (meshTargets.Count == 0)
+        {
+            return;
+        }
+
+        var frame = new Frame(model.Skeleton, model.FlexControllers);
+
+        foreach (var animation in model.GetAllAnimations(FileLoader))
+        {
+            if (animation is ClipAnimation || animation.FrameCount == 0 || !animation.HasFlexData || !IncludeAnimation(animationFilter, animation.Name))
+            {
+                continue;
+            }
+
+            // The frame is shared across animations; each animation only writes the flex channels it animates.
+            frame.Clear(model.Skeleton);
+
+            var fps = animation.Fps <= 0f ? 1f : animation.Fps;
+            var keyframes = new Dictionary<float, float[]>[meshTargets.Count];
+            var anyWeight = new bool[meshTargets.Count];
+            for (var t = 0; t < meshTargets.Count; t++)
+            {
+                keyframes[t] = [];
+            }
+
+            for (var f = 0; f < animation.FrameCount; f++)
+            {
+                frame.FrameIndex = f;
+                animation.DecodeFrame(frame);
+
+                for (var t = 0; t < meshTargets.Count; t++)
+                {
+                    var (_, morphFlexIds, ruleByFlexId) = meshTargets[t];
+                    var weights = new float[morphFlexIds.Count];
+                    for (var i = 0; i < morphFlexIds.Count; i++)
+                    {
+                        if (ruleByFlexId.TryGetValue(morphFlexIds[i], out var rule))
+                        {
+                            weights[i] = rule.Evaluate(frame.Datas);
+                            anyWeight[t] |= weights[i] != 0f;
+                        }
+                    }
+
+                    keyframes[t][f / fps] = weights;
+                }
+            }
+
+            for (var t = 0; t < meshTargets.Count; t++)
+            {
+                if (anyWeight[t])
+                {
+                    exportedModel.UseAnimation(animation.Name).CreateMorphChannel(meshTargets[t].Node, keyframes[t], meshTargets[t].MorphFlexIds.Count);
+                }
             }
         }
-
-        return matched ? (new AnimationWriter(clipSkeleton, model.FlexControllers), remappedJoints) : null;
     }
 
     record struct AnimationChannelWriter<T>(Dictionary<float, T>[] Channels, T?[] LastValue, bool[] ValueOmmited) where T : struct
