@@ -279,10 +279,10 @@ namespace GUI.Types.Viewers
         private bool MatchesEntityIo(Entity entity)
         {
             return entity.Connections?.Any(connection =>
-                MatchesFilter(connection.GetStringProperty("m_outputName"), SearchData.Output)
-                && MatchesFilter(connection.GetStringProperty("m_targetName"), SearchData.Target)
-                && MatchesFilter(connection.GetStringProperty("m_inputName"), SearchData.Input)
-                && MatchesFilter(connection.GetStringProperty("m_overrideParam"), SearchData.Parameter)) == true;
+                MatchesFilter(connection.OutputName, SearchData.Output)
+                && MatchesFilter(connection.TargetName, SearchData.Target)
+                && MatchesFilter(connection.InputName, SearchData.Input)
+                && MatchesFilter(connection.OverrideParam, SearchData.Parameter)) == true;
         }
 
         private static bool MatchesFilter(string value, string filter)
