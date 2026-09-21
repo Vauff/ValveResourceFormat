@@ -278,6 +278,14 @@ namespace GUI.Types.Viewers
 
         private bool MatchesEntityIo(Entity entity)
         {
+            if (string.IsNullOrEmpty(SearchData.Output)
+                && string.IsNullOrEmpty(SearchData.Target)
+                && string.IsNullOrEmpty(SearchData.Input)
+                && string.IsNullOrEmpty(SearchData.Parameter))
+            {
+                return true;
+            }
+
             return entity.Connections?.Any(connection =>
                 MatchesFilter(connection.OutputName, SearchData.Output)
                 && MatchesFilter(connection.TargetName, SearchData.Target)
