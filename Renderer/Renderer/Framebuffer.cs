@@ -1,7 +1,6 @@
 using System.Diagnostics;
 using OpenTK.Graphics.OpenGL;
 using OpenTK.Mathematics;
-using ValveResourceFormat.CompiledShader;
 
 namespace ValveResourceFormat.Renderer;
 
@@ -70,6 +69,12 @@ public class Framebuffer
     public ImageFormat? DepthFormat { get; protected set; }
 
     /// <summary>
+    /// Gets or sets whether the color attachment stores sRGB encoded values, which blending decodes while
+    /// <c>GL_FRAMEBUFFER_SRGB</c> is enabled. Set before <see cref="Initialize"/>.
+    /// </summary>
+    public bool IsColorSrgb { get; set; }
+
+    /// <summary>
     /// Framebuffer completeness status set after <see cref="Initialize"/> is called.
     /// </summary>
     public FramebufferErrorCode InitialStatus { get; private set; } = FramebufferErrorCode.FramebufferUndefined;
@@ -77,7 +82,7 @@ public class Framebuffer
     // Sampler state requested by callers, remembered so that it survives attachment recreation.
     private bool? shadowDepthSamplerLEqualCompare;
     private (TextureMinFilter Min, TextureMagFilter Mag)? colorFiltering;
-    private TextureWrapMode? colorWrapMode;
+    private RsTextureAddressMode? colorWrapMode;
 
     /// <summary>
     /// The framebuffer target this object was last bound to.
@@ -120,15 +125,15 @@ public class Framebuffer
     /// </summary>
     public string Name { get; }
 
+    private readonly bool isDefaultFramebuffer;
+
     /// <summary>
     /// Creates a new named OpenGL framebuffer object.
     /// </summary>
     /// <param name="name">Debug label applied to the framebuffer object.</param>
     public Framebuffer(string name)
     {
-        GL.CreateFramebuffers(1, out int handle);
-        GL.ObjectLabel(ObjectLabelIdentifier.Framebuffer, handle, name.Length, name);
-        FboHandle = handle;
+        FboHandle = GraphicsDevice.CreateFramebuffer(name);
         Name = name;
     }
 
@@ -138,6 +143,7 @@ public class Framebuffer
         FboHandle = fboHandle;
         InitialStatus = FramebufferErrorCode.FramebufferComplete;
         Name = "GLDefaultFramebuffer";
+        isDefaultFramebuffer = true;
     }
     /// <summary>
     /// Creates a <see cref="Framebuffer"/> instance wrapping the default OpenGL framebuffer (handle 0).
@@ -199,11 +205,6 @@ public class Framebuffer
     /// </summary>
     public void Initialize()
     {
-        if (Target == 0)
-        {
-            throw new InvalidOperationException("Framebuffer target is not set");
-        }
-
         if (ColorFormat == null && DepthFormat == null)
         {
             throw new InvalidOperationException("Framebuffer has no attachments");
@@ -275,16 +276,22 @@ public class Framebuffer
 
     private void CreateAttachments()
     {
+        Target = TargetForSampleCount(NumSamples);
+
+        if (isDefaultFramebuffer)
+        {
+            // implicitly created by window
+            return;
+        }
+
         Color?.Delete();
         Depth?.Delete();
-
-        Target = TargetForSampleCount(NumSamples);
 
         var (width, height) = (Width, Height);
 
         if (ColorFormat is { } colorFormat)
         {
-            Color = CreateAttachment(colorFormat, width, height, $"{Name}Color", NumMips);
+            Color = CreateAttachment(colorFormat, width, height, $"{Name}Color", NumMips, IsColorSrgb);
             Color.AttachToFramebuffer(this, FramebufferAttachment.ColorAttachment0, 0);
 
             ApplyColorSamplerState();
@@ -299,8 +306,7 @@ public class Framebuffer
                     throw new InvalidOperationException("Layered depth attachments do not support multisampling");
                 }
 
-                Depth = new RenderTexture(TextureTarget.Texture2DArray, width, height, DepthLayers, 1, $"{Name}Depth");
-                GL.TextureStorage3D(Depth.Handle, 1, depthFormat.ToGLSizedInternalFormat(), width, height, DepthLayers);
+                Depth = RenderTexture.Create3D(TextureTarget.Texture2DArray, width, height, DepthLayers, depthFormat, 1, $"{Name}Depth");
                 AttachDepthLayer(0);
             }
             else
@@ -320,7 +326,7 @@ public class Framebuffer
         }
     }
 
-    private RenderTexture CreateAttachment(ImageFormat format, int width, int height, string label, int numMips = 1)
+    private RenderTexture CreateAttachment(ImageFormat format, int width, int height, string label, int numMips = 1, bool srgb = false)
     {
         var attachment = new RenderTexture(Target, width, height, 1, numMips, label);
         var mipCount = Math.Min(RenderTexture.MaxMipCount(width, height), attachment.NumMipLevels);
@@ -332,11 +338,11 @@ public class Framebuffer
                 throw new InvalidOperationException("Multisample textures do not support mipmaps");
             }
 
-            GL.TextureStorage2DMultisample(attachment.Handle, NumSamples, format.ToGLSizedInternalFormat(), width, height, fixedsamplelocations: true);
+            GL.TextureStorage2DMultisample(attachment.Handle, NumSamples, format.ToGLSizedInternalFormat(srgb), width, height, fixedsamplelocations: true);
         }
         else
         {
-            GL.TextureStorage2D(attachment.Handle, mipCount, format.ToGLSizedInternalFormat(), width, height);
+            GL.TextureStorage2D(attachment.Handle, mipCount, format.ToGLSizedInternalFormat(srgb), width, height);
         }
 
         attachment.SetBaseMaxLevel(0, mipCount - 1);
@@ -399,8 +405,8 @@ public class Framebuffer
     /// <param name="level">Zero-based mip level.</param>
     public Vector2i GetMipSize(int level)
     {
-        var mipWidth = Math.Max(1, Width >> level);
-        var mipHeight = Math.Max(1, Height >> level);
+        var mipWidth = MathUtils.MipLevelSize(Width, level);
+        var mipHeight = MathUtils.MipLevelSize(Height, level);
 
         return new(mipWidth, mipHeight);
     }
@@ -445,14 +451,14 @@ public class Framebuffer
         Depth.SetParameter(TextureParameterName.TextureCompareMode, (int)TextureCompareMode.CompareRToTexture);
         Depth.SetParameter(TextureParameterName.TextureCompareFunc, (int)(lEqualCompare ? DepthFunction.Lequal : DepthFunction.Gequal));
         Depth.SetFiltering(TextureMinFilter.Linear, TextureMagFilter.Linear);
-        Depth.SetWrapMode(TextureWrapMode.ClampToEdge);
+        Depth.SetWrapMode(RsTextureAddressMode.Clamp);
     }
 
     /// <summary>
     /// Sets the filtering and wrap mode of the color attachment. The state is remembered and re-applied
     /// whenever the attachment is recreated by a resize or a format change.
     /// </summary>
-    public void SetColorSamplerState(TextureMinFilter minFilter, TextureMagFilter magFilter, TextureWrapMode wrapMode)
+    public void SetColorSamplerState(TextureMinFilter minFilter, TextureMagFilter magFilter, RsTextureAddressMode wrapMode)
     {
         colorFiltering = (minFilter, magFilter);
         colorWrapMode = wrapMode;
@@ -471,7 +477,7 @@ public class Framebuffer
             Color.SetFiltering(colorFiltering.Value.Min, colorFiltering.Value.Mag);
         }
 
-        if (colorWrapMode is TextureWrapMode wrapMode)
+        if (colorWrapMode is RsTextureAddressMode wrapMode)
         {
             Color.SetWrapMode(wrapMode);
         }

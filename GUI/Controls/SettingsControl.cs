@@ -5,6 +5,7 @@ using System.Threading.Tasks;
 using System.Windows.Forms;
 using GUI.Utils;
 using Microsoft.Win32;
+using ValveResourceFormat.IO;
 
 namespace GUI.Controls
 {
@@ -30,7 +31,7 @@ namespace GUI.Controls
             fovInput.Value = Settings.Config.FieldOfView;
             viewmodelFovInput.Value = Settings.Config.ViewmodelFieldOfView;
             mouseSensitivitySlider.Value = (int)(Settings.Config.MouseSensitivity * 10f);
-            mouseSensitivityValueLabel.Text = Settings.Config.MouseSensitivity.ToString("0.0");
+            mouseSensitivityValueLabel.Text = Settings.Config.MouseSensitivity.ToString("0.0", CultureInfo.InvariantCulture);
 
             var volumePercent = Math.Clamp((int)MathF.Round(Settings.Config.Volume * 100f), 0, 100);
             volumeSlider.Value = volumePercent;
@@ -104,9 +105,9 @@ namespace GUI.Controls
                 return;
             }
 
-            if (Regexes.VpkNumberArchive().IsMatch(fileName))
+            if (PackageFileNames.TryGetArchiveChunkDirectoryFile(fileName, out var directoryFile))
             {
-                fileName = $"{fileName[..^8]}_dir.vpk";
+                fileName = directoryFile;
             }
 
             if (Settings.Config.GameSearchPaths.Contains(fileName))

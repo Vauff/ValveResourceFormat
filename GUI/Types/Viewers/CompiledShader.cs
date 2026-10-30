@@ -6,8 +6,6 @@ using System.Threading.Tasks;
 using System.Windows.Forms;
 using GUI.Controls;
 using GUI.Utils;
-using ValveResourceFormat;
-using ValveResourceFormat.CompiledShader;
 using ValveResourceFormat.IO;
 using static ValveResourceFormat.CompiledShader.ShaderUtilHelpers;
 
@@ -15,10 +13,10 @@ namespace GUI.Types.Viewers
 {
     class CompiledShader : IDisposable, IViewer
     {
-        private TextControl control;
-        private TreeView fileListView;
+        private readonly TextControl control;
+        private readonly TreeView fileListView;
         private readonly Container components;
-        private ThemedContextMenuStrip shaderFileContextMenu;
+        private readonly ThemedContextMenuStrip shaderFileContextMenu;
         private readonly VrfGuiContext vrfGuiContext;
         private VfxProgramData? featuresProgram;
 
@@ -95,8 +93,8 @@ namespace GUI.Types.Viewers
             };
             fileListView.Nodes.Add(collectionNode);
 
-            List<string> sfNamesAbbrev = [];
-            List<string> sfNames = [];
+            List<string> comboNamesAbbrev = [];
+            List<string> comboNames = [];
 
             Debug.Assert(shaderCollection.Features != null);
             featuresProgram = shaderCollection.Features;
@@ -120,20 +118,20 @@ namespace GUI.Types.Viewers
 
                 if (program.StaticComboEntries.Count > 0)
                 {
-                    var configGen = new ConfigMappingParams(program);
+                    var configMapping = new ComboConfigMapping(program);
                     var leadStaticComboId = -1L; // Shader file to be displayed for a particular material
 
                     if (leadFeatureParams != null)
                     {
-                        leadStaticComboId = ShaderDataProvider.GetStaticConfiguration_ForFeatureState(shaderCollection.Features, program, leadFeatureParams).StaticComboId;
+                        leadStaticComboId = ShaderDataProvider.ResolveStaticConfiguration(shaderCollection.Features, program, leadFeatureParams).StaticComboId;
                     }
 
                     foreach (var staticComboEntry in program.StaticComboEntries)
                     {
-                        var config = configGen.GetConfigState(staticComboEntry.Key);
+                        var config = configMapping.GetConfigState(staticComboEntry.Key);
 
-                        sfNames.Clear();
-                        sfNamesAbbrev.Clear();
+                        comboNames.Clear();
+                        comboNamesAbbrev.Clear();
 
                         for (var i = 0; i < program.StaticComboArray.Length; i++)
                         {
@@ -142,23 +140,23 @@ namespace GUI.Types.Viewers
                                 continue;
                             }
 
-                            var sfBlock = program.StaticComboArray[i];
-                            var sfShortName = ShortenShaderParam(sfBlock.Name).ToLowerInvariant();
+                            var staticCombo = program.StaticComboArray[i];
+                            var shortName = ShortenShaderParam(staticCombo.Name).ToLowerInvariant();
 
                             if (config[i] > 1)
                             {
-                                sfNames.Add($"{sfBlock.Name}={config[i]}");
-                                sfNamesAbbrev.Add($"{sfShortName}={config[i]}");
+                                comboNames.Add($"{staticCombo.Name}={config[i]}");
+                                comboNamesAbbrev.Add($"{shortName}={config[i]}");
                             }
                             else
                             {
-                                sfNames.Add(sfBlock.Name);
-                                sfNamesAbbrev.Add(sfShortName);
+                                comboNames.Add(staticCombo.Name);
+                                comboNamesAbbrev.Add(shortName);
                             }
                         }
 
-                        var variantsAbbrev = sfNamesAbbrev.Count > 0 ? $" ({string.Join(", ", sfNamesAbbrev)})" : string.Empty;
-                        var variantsTooltip = string.Join(Environment.NewLine, sfNames);
+                        var variantsAbbrev = comboNamesAbbrev.Count > 0 ? $" ({string.Join(", ", comboNamesAbbrev)})" : string.Empty;
+                        var variantsTooltip = string.Join(Environment.NewLine, comboNames);
 
                         var comboNode = new TreeNode($"{staticComboEntry.Key:x08}{variantsAbbrev}")
                         {
@@ -214,7 +212,7 @@ namespace GUI.Types.Viewers
                 var shaderExtract = new ShaderExtract(shaderCollection);
 
                 collectionNode.Tag = shaderExtract;
-                DisplayExtractedVfx(shaderExtract);
+                TryDisplayNode(collectionNode);
             }
         }
 
@@ -253,32 +251,60 @@ namespace GUI.Types.Viewers
                 return;
             }
 
-            if (e.Node.Tag is ShaderExtract shaderExtract)
+            TryDisplayNode(e.Node);
+        }
+
+        private void TryDisplayNode(TreeNode node)
+        {
+            try
             {
-                DisplayExtractedVfx(shaderExtract);
+                control.TextBox.ClearException();
+                DisplayNode(node);
             }
-            else if (e.Node.Tag is VfxProgramData program)
+            catch (Exception ex)
+            {
+                var context = $"{node.Text} in {vrfGuiContext.DisplayPath}";
+                Log.Error(nameof(CompiledShader), $"Failed to display \"{context}\": {ex}");
+
+                control.TextBox.ShowException(ex, context);
+            }
+        }
+
+        private void DisplayNode(TreeNode node)
+        {
+            if (node.Tag is ShaderExtract shaderExtract)
+            {
+                control.TextBox.Text = shaderExtract.ToVFX();
+            }
+            else if (node.Tag is VfxProgramData program)
             {
                 using var output = new IndentedTextWriter();
                 program.PrintSummary(output, featuresProgram);
                 control.TextBox.Text = output.ToString();
             }
-            else if (e.Node.Tag is VfxStaticComboVcsEntry comboEntry)
+            else if (node.Tag is VfxStaticComboVcsEntry comboEntry)
             {
                 var combo = comboEntry.Unserialize();
-                e.Node.Tag = combo; // Replace the entry with unserialized combo data
+                node.Tag = combo; // Replace the entry with unserialized combo data
 
                 DisplayStaticCombo(combo);
 
                 fileListView.BeginUpdate();
-                CreateStaticComboNodes(combo, e.Node);
-                fileListView.EndUpdate();
+
+                try
+                {
+                    CreateStaticComboNodes(combo, node);
+                }
+                finally
+                {
+                    fileListView.EndUpdate();
+                }
             }
-            else if (e.Node.Tag is VfxStaticComboData combo)
+            else if (node.Tag is VfxStaticComboData combo)
             {
                 DisplayStaticCombo(combo);
             }
-            else if (e.Node.Tag is VfxShaderFile shaderFile)
+            else if (node.Tag is VfxShaderFile shaderFile)
             {
                 // TODO: Perhaps these tabs can also be removed, but currently required for the byte viewer
                 control.TextBox.Text = shaderFile.GetDecompiledFile();
@@ -324,29 +350,30 @@ namespace GUI.Types.Viewers
         {
             var sourceFileImage = AppIcons.GetImageIndexForExtension("ini");
 
-            List<string> dfNamesAbbrev = [];
-            List<string> dfNames = [];
-            var sourceIdToRenderStateInfo = new Dictionary<int, VfxRenderStateInfo>(combo.ShaderFiles.Length);
+            List<string> comboNamesAbbrev = [];
+            List<string> comboNames = [];
+            var shaderFileIdToRenderStateInfo = new Dictionary<int, VfxRenderStateInfo>(combo.ShaderFiles.Length);
 
             // We are only taking the first render state info currently
-            foreach (var renderStateInfo in combo.DynamicCombos)
+            foreach (var renderStateInfo in combo.DynamicComboRenderStates)
             {
-                sourceIdToRenderStateInfo.TryAdd(renderStateInfo.ShaderFileId, renderStateInfo);
+                shaderFileIdToRenderStateInfo.TryAdd(renderStateInfo.ShaderFileId, renderStateInfo);
             }
 
             Debug.Assert(combo.ParentProgramData != null);
 
-            foreach (var source in combo.ShaderFiles)
+            foreach (var shaderFile in combo.ShaderFiles)
             {
-                if (source.Size == 0)
+                // KV3 resources may leave unreferenced shader file slots null
+                if (shaderFile is null || shaderFile.Size == 0)
                 {
                     continue;
                 }
 
-                var config = combo.ParentProgramData.GetDBlockConfig(sourceIdToRenderStateInfo[source.ShaderFileId].DynamicComboId);
+                var config = combo.ParentProgramData.GetDynamicComboConfig(shaderFileIdToRenderStateInfo[shaderFile.ShaderFileId].DynamicComboId);
 
-                dfNames.Clear();
-                dfNamesAbbrev.Clear();
+                comboNames.Clear();
+                comboNamesAbbrev.Clear();
 
                 for (var i = 0; i < combo.ParentProgramData.DynamicComboArray.Length; i++)
                 {
@@ -355,25 +382,25 @@ namespace GUI.Types.Viewers
                         continue;
                     }
 
-                    var dfBlock = combo.ParentProgramData.DynamicComboArray[i];
-                    var dfShortName = ShortenShaderParam(dfBlock.Name).ToLowerInvariant();
+                    var dynamicCombo = combo.ParentProgramData.DynamicComboArray[i];
+                    var shortName = ShortenShaderParam(dynamicCombo.Name).ToLowerInvariant();
 
                     if (config[i] > 1)
                     {
-                        dfNames.Add($"{dfBlock.Name}={config[i]}");
-                        dfNamesAbbrev.Add($"{dfShortName}={config[i]}");
+                        comboNames.Add($"{dynamicCombo.Name}={config[i]}");
+                        comboNamesAbbrev.Add($"{shortName}={config[i]}");
                     }
                     else
                     {
-                        dfNames.Add(dfBlock.Name);
-                        dfNamesAbbrev.Add(dfShortName);
+                        comboNames.Add(dynamicCombo.Name);
+                        comboNamesAbbrev.Add(shortName);
                     }
                 }
 
-                var node = new TreeNode($"{source.ShaderFileId:X2}{(dfNamesAbbrev.Count > 0 ? $" ({string.Join(", ", dfNamesAbbrev)})" : string.Empty)}")
+                var node = new TreeNode($"{shaderFile.ShaderFileId:X2}{(comboNamesAbbrev.Count > 0 ? $" ({string.Join(", ", comboNamesAbbrev)})" : string.Empty)}")
                 {
-                    ToolTipText = string.Join(Environment.NewLine, dfNames),
-                    Tag = source,
+                    ToolTipText = string.Join(Environment.NewLine, comboNames),
+                    Tag = shaderFile,
                     ImageIndex = sourceFileImage,
                     SelectedImageIndex = sourceFileImage,
                 };
@@ -383,22 +410,10 @@ namespace GUI.Types.Viewers
             treeNode.Expand();
         }
 
-        private void DisplayExtractedVfx(ShaderExtract shaderExtract)
-        {
-            try
-            {
-                control.TextBox.Text = shaderExtract.ToVFX();
-            }
-            catch (Exception ex)
-            {
-                control.TextBox.Text = ex.ToString();
-            }
-        }
-
         private void DisplayStaticCombo(VfxStaticComboData combo)
         {
             using var output = new IndentedTextWriter();
-            var zframeSummary = new PrintZFrameSummary(combo, output);
+            _ = new PrintStaticComboSummary(combo, output);
             control.TextBox.Text = output.ToString();
         }
 
@@ -412,13 +427,13 @@ namespace GUI.Types.Viewers
             var combo = shaderFile.ParentCombo;
             Debug.Assert(combo.ParentProgramData != null);
 
-            var extension = shaderFile.BlockName == "VULKAN" ? "spv" : shaderFile.BlockName.ToLowerInvariant();
+            var extension = shaderFile.SourceType == "VULKAN" ? "spv" : shaderFile.SourceType.ToLowerInvariant();
 
             var fileName = AppFileDialogs.SaveFile(
                 "Export bytecode",
                 $"{combo.ParentProgramData.ShaderName}_{combo.StaticComboId:x08}_{shaderFile.ShaderFileId:x02}",
                 extension,
-                $"{shaderFile.BlockName} bytecode (*.{extension})|*.{extension}|All files (*.*)|*.*");
+                $"{shaderFile.SourceType} bytecode (*.{extension})|*.{extension}|All files (*.*)|*.*");
 
             if (fileName == null)
             {

@@ -1,5 +1,4 @@
 using System.Diagnostics;
-using OpenTK.Graphics.OpenGL;
 namespace ValveResourceFormat.Renderer;
 
 public partial class GPUMeshBufferCache
@@ -28,12 +27,7 @@ public partial class GPUMeshBufferCache
         {
             if (emptyVAO == -1)
             {
-                GL.CreateVertexArrays(1, out emptyVAO);
-
-#if DEBUG
-                var vaoLabel = nameof(EmptyVAO);
-                GL.ObjectLabel(ObjectLabelIdentifier.VertexArray, emptyVAO, vaoLabel.Length, vaoLabel);
-#endif
+                emptyVAO = GraphicsDevice.CreateVertexArray(nameof(EmptyVAO));
             }
 
             return emptyVAO;
@@ -50,14 +44,7 @@ public partial class GPUMeshBufferCache
         {
             if (vectorOneVertexBuffer == -1)
             {
-                GL.CreateBuffers(1, out vectorOneVertexBuffer);
-
-#if DEBUG
-                var bufferLabel = nameof(VectorOneVertexBuffer);
-                GL.ObjectLabel(ObjectLabelIdentifier.Buffer, vectorOneVertexBuffer, bufferLabel.Length, bufferLabel);
-#endif
-
-                GL.NamedBufferData(vectorOneVertexBuffer, 4 * sizeof(float), [1f, 1f, 1f, 1f], BufferUsageHint.StaticDraw);
+                vectorOneVertexBuffer = GraphicsDevice.CreateBuffer<float>(nameof(VectorOneVertexBuffer), [1f, 1f, 1f, 1f], BufferUsage.Static);
             }
 
             return vectorOneVertexBuffer;

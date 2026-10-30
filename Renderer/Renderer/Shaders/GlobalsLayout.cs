@@ -1,7 +1,6 @@
 using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Text;
-using ValveResourceFormat.Renderer.Buffers;
 
 namespace ValveResourceFormat.Renderer.Shaders;
 
@@ -165,6 +164,27 @@ public sealed class GlobalsLayout
         return merged.Count == 0 ? Empty : new GlobalsLayout([.. merged.Values]);
     }
 
+    /// <summary>Initializes a layout from members with predefined offsets.</summary>
+    public GlobalsLayout(IEnumerable<GlobalsMember> members, int size)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(size);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(size, MaxBlockSize);
+
+        Size = size;
+        defaultBytes = new byte[size];
+
+        foreach (var member in members)
+        {
+            if (member.Offset < 0 || member.Offset + member.Size > size)
+            {
+                throw new ArgumentException(
+                    $"Member '{member.Name}' spans {member.Offset}..{member.Offset + member.Size} of a {size} byte block", nameof(members));
+            }
+
+            this.members.Add(member.Name, member);
+        }
+    }
+
     private GlobalsLayout(List<GlobalsDeclaration> declarations)
     {
         if (declarations.Count == 0)
@@ -198,7 +218,7 @@ public sealed class GlobalsLayout
 
         void Place(GlobalsDeclaration declaration)
         {
-            offset = Align(offset, GetBaseAlignment(declaration.Type));
+            offset = MathUtils.AlignUp(offset, GetBaseAlignment(declaration.Type));
 
             members.Add(declaration.Name, new GlobalsMember(declaration.Name, declaration.Type, offset));
 
@@ -246,7 +266,7 @@ public sealed class GlobalsLayout
         builder.Append("};\n");
 
         BlockSource = builder.ToString();
-        Size = Align(offset, 16);
+        Size = MathUtils.AlignUp(offset, 16);
 
         if (Size > MaxBlockSize)
         {
@@ -377,7 +397,7 @@ public sealed class GlobalsLayout
             return;
         }
 
-        values.Slice(1, constant.ComponentCount - 1).Fill(values[0]);
+        values[1..constant.ComponentCount].Fill(values[0]);
     }
 
     private static double ParseScalar(GlobalsDeclaration declaration, ReadOnlySpan<char> text)
@@ -392,11 +412,6 @@ public sealed class GlobalsLayout
         if (text.SequenceEqual("false"))
         {
             return 0d;
-        }
-
-        if (text.EndsWith("f", StringComparison.OrdinalIgnoreCase))
-        {
-            text = text[..^1];
         }
 
         var negative = text.StartsWith("-", StringComparison.Ordinal);
@@ -416,6 +431,11 @@ public sealed class GlobalsLayout
             return negative ? -(double)hex : hex;
         }
 
+        if (text.EndsWith("f", StringComparison.OrdinalIgnoreCase))
+        {
+            text = text[..^1];
+        }
+
         if (!double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out var value))
         {
             throw new ShaderLoader.ShaderCompilerException($"Could not parse the default value '{declaration.Initializer}' of uniform '{declaration.Name}'");
@@ -423,8 +443,6 @@ public sealed class GlobalsLayout
 
         return negative ? -value : value;
     }
-
-    private static int Align(int offset, int alignment) => (offset + alignment - 1) & ~(alignment - 1);
 
     /// <summary>Returns the number of scalar components in the given type, 16 for <see cref="GlobalsType.Mat4"/>.</summary>
     internal static int GetComponentCount(GlobalsType type) => type switch

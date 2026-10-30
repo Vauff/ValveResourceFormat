@@ -1,5 +1,4 @@
 using OpenTK.Graphics.OpenGL;
-using ValveResourceFormat.CompiledShader;
 using ValveResourceFormat.NavMesh;
 
 namespace ValveResourceFormat.Renderer.SceneNodes
@@ -11,6 +10,7 @@ namespace ValveResourceFormat.Renderer.SceneNodes
     {
         private static readonly Color32 NavMeshColor = new(64, 32, 255, 100);
         private static readonly Color32 NavMeshLadderColor = new(16, 255, 32, 100);
+        private static readonly Color32 FlowMapConnectionColor = new(255, 255, 255);
 
         private readonly int triangleIndexCount;
 
@@ -109,18 +109,17 @@ namespace ValveResourceFormat.Renderer.SceneNodes
             var renderShader = context.ReplacementShader ?? shader;
 
             renderShader.Use();
-            renderShader.SetUniform3x4("transform", Transform);
-            renderShader.SetBoneAnimationData(false);
 
-            renderShader.SetUniform("g_bNormalShaded", true);
-            renderShader.SetUniform("g_bTriplanarMapping", false);
+            renderShader.SetUniform("g_bHasToolTexture", false);
 
             VertexArray.Bind(vao, renderShader);
 
-            using var _ = Scene.RendererContext.RenderState.Scope(depthBias: 96, depthBiasClamp: 0.0005f);
+            using var _ = GraphicsContext.RenderState.Scope(depthBias: 96, depthBiasClamp: 0.0005f);
 
+            renderShader.SetUniform("g_bNormalShaded", false);
             GL.DrawElements(PrimitiveType.Lines, indexCount - triangleIndexCount, DrawElementsType.UnsignedInt, triangleIndexCount * sizeof(int));
 
+            renderShader.SetUniform("g_bNormalShaded", true);
             GL.DrawElementsInstancedBaseInstance(PrimitiveType.Triangles, triangleIndexCount, DrawElementsType.UnsignedInt, 0, 1, Id);
 
         }
@@ -129,9 +128,86 @@ namespace ValveResourceFormat.Renderer.SceneNodes
         public override IEnumerable<string> GetSupportedRenderModes() => shader.RenderModes;
 
         /// <summary>
+        /// Adds a layer per hull of a <see cref="NavFlowMapFile"/> to the scene, drawing the areas of the
+        /// <see cref="NavMeshFile"/> colored by the cluster they belong to, and lines between the centres of connected
+        /// clusters.
+        /// </summary>
+        /// <param name="navFlowMapFile">The flow map to draw.</param>
+        /// <param name="navMeshFile">The navigation mesh the flow map was built for.</param>
+        /// <param name="scene">The scene to add the nodes to.</param>
+        /// <param name="hullNames">Hull names from <see cref="NavHullNames.Read"/>, used in the layer names.</param>
+        public static void AddFlowMapNodesToScene(NavFlowMapFile? navFlowMapFile, NavMeshFile? navMeshFile, Scene scene, IReadOnlyList<string> hullNames)
+        {
+            if (navFlowMapFile == null || navMeshFile == null || scene == null)
+            {
+                return;
+            }
+
+            var verts = new List<SimpleVertexNormal>();
+            var triangleInds = new List<int>();
+            var lineInds = new List<int>();
+
+            foreach (var hull in navFlowMapFile.Hulls)
+            {
+                var layerName = $"Navigation flow map ({NavHullNames.GetName(hullNames, hull.HullIndex)})";
+                var minBounds = new Vector3(float.MaxValue);
+                var maxBounds = new Vector3(float.MinValue);
+                var connectionLines = new List<SimpleVertex>();
+                var connected = new HashSet<(int, int)>();
+
+                foreach (var node in hull.Nodes)
+                {
+                    var color = WireframeSceneNode.GetIdColor((uint)node.Index) with { A = NavMeshColor.A };
+
+                    foreach (var areaId in node.AreaIds)
+                    {
+                        if (navMeshFile.GetArea(areaId) is { } area)
+                        {
+                            AddArea(area, verts, triangleInds, lineInds, color, ref minBounds, ref maxBounds);
+                        }
+                    }
+
+                    foreach (var connection in node.Connections)
+                    {
+                        var pair = (Math.Min(node.Index, connection.NodeIndex), Math.Max(node.Index, connection.NodeIndex));
+
+                        if ((uint)connection.NodeIndex < (uint)hull.Nodes.Length && connected.Add(pair))
+                        {
+                            ShapeSceneNode.AddLine(connectionLines, node.Center, hull.Nodes[connection.NodeIndex].Center, FlowMapConnectionColor);
+                        }
+                    }
+                }
+
+                if (triangleInds.Count > 0)
+                {
+                    scene.Add(new NavMeshSceneNode(scene, verts, triangleInds, lineInds)
+                    {
+                        LayerName = layerName,
+                        LocalBoundingBox = new AABB(minBounds, maxBounds),
+                    }, false);
+                }
+
+                if (connectionLines.Count > 0)
+                {
+                    scene.Add(new LineSceneNode(scene, [.. connectionLines])
+                    {
+                        LayerName = layerName,
+                    }, false);
+                }
+
+                verts.Clear();
+                triangleInds.Clear();
+                lineInds.Clear();
+            }
+        }
+
+        /// <summary>
         /// Parses a <see cref="NavMeshFile"/> and adds a <see cref="NavMeshSceneNode"/> per hull and one for ladders to the scene.
         /// </summary>
-        public static void AddNavNodesToScene(NavMeshFile? navMeshFile, Scene scene)
+        /// <param name="navMeshFile">The navigation mesh to draw.</param>
+        /// <param name="scene">The scene to add the nodes to.</param>
+        /// <param name="hullNames">Hull names from <see cref="NavHullNames.Read"/>, used in the layer names.</param>
+        public static void AddNavNodesToScene(NavMeshFile? navMeshFile, Scene scene, IReadOnlyList<string> hullNames)
         {
             if (navMeshFile == null || scene == null)
             {
@@ -152,8 +228,8 @@ namespace ValveResourceFormat.Renderer.SceneNodes
                         continue;
                     }
 
-                    var minBounds = new Vector3(float.MinValue);
-                    var maxBounds = new Vector3(float.MaxValue);
+                    var minBounds = new Vector3(float.MaxValue);
+                    var maxBounds = new Vector3(float.MinValue);
                     foreach (var area in hullAreas)
                     {
                         AddArea(area, verts, triangleInds, lineInds, NavMeshColor, ref minBounds, ref maxBounds);
@@ -161,7 +237,7 @@ namespace ValveResourceFormat.Renderer.SceneNodes
 
                     var sceneNode = new NavMeshSceneNode(scene, verts, triangleInds, lineInds)
                     {
-                        LayerName = $"Navigation mesh (hull {i})",
+                        LayerName = $"Navigation mesh ({NavHullNames.GetName(hullNames, i)})",
                         LocalBoundingBox = new AABB(minBounds, maxBounds),
                     };
                     scene.Add(sceneNode, false);
@@ -174,8 +250,8 @@ namespace ValveResourceFormat.Renderer.SceneNodes
 
             if (navMeshFile.Ladders != null && navMeshFile.Ladders.Length > 0)
             {
-                var minBounds = new Vector3(float.MinValue);
-                var maxBounds = new Vector3(float.MaxValue);
+                var minBounds = new Vector3(float.MaxValue);
+                var maxBounds = new Vector3(float.MinValue);
 
                 foreach (var ladder in navMeshFile.Ladders)
                 {

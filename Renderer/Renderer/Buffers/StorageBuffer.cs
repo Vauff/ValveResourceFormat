@@ -12,12 +12,29 @@ namespace ValveResourceFormat.Renderer.Buffers
     {
         private IntPtr PersistentPtr;
 
+        private static BufferStorageFlags StorageFlagsFor(BufferUsage usage) => usage switch
+        {
+            BufferUsage.Readback => BufferStorageFlags.MapPersistentBit | BufferStorageFlags.MapReadBit | BufferStorageFlags.MapCoherentBit,
+            _ => BufferStorageFlags.DynamicStorageBit,
+        };
+
+        private const BufferAccessMask ReadbackAccess = BufferAccessMask.MapPersistentBit
+            | BufferAccessMask.MapReadBit
+            | BufferAccessMask.MapCoherentBit;
+
+        /// <summary>Create an empty storage buffer.</summary>
+        private void AllocateEmpty(BufferUsage usage)
+        {
+            Debug.Assert(Size == 0);
+
+            GL.NamedBufferData(Handle, 0, IntPtr.Zero, usage.ToGLBufferUsageHint());
+        }
+
         /// <summary>Initializes a new storage buffer bound to the given reserved slot.</summary>
         /// <param name="bindingPoint">The reserved slot to bind the buffer to.</param>
-        /// <param name="name">Debug name for the buffer. Named explicitly because <see cref="ReservedBufferSlots"/>
-        /// reuses its values between the uniform and storage namespaces, so a slot cannot name itself: the
-        /// scratch slots have no meaningful name of their own, and the rest would report the uniform slot sharing
-        /// their value.</param>
+        /// <param name="name">Debug name. Must be explicit: <see cref="ReservedBufferSlots"/> values are shared
+        /// with the uniform namespace, so scratch slots have no name of their own and the rest would report the
+        /// uniform slot's name.</param>
         public StorageBuffer(ReservedBufferSlots bindingPoint, string name)
             : base(BufferTarget.ShaderStorageBuffer, (int)bindingPoint, name)
         {
@@ -25,54 +42,86 @@ namespace ValveResourceFormat.Renderer.Buffers
 
         /// <summary>Allocates a new storage buffer sized for the given number of elements.</summary>
         /// <remarks>
-        /// BufferUsageHint.DynamicRead creates a mapped buffer
+        /// <see cref="BufferUsage.Readback"/> creates a mapped buffer
         ///  </remarks>
         /// <typeparam name="T">The element type used to compute the total byte size.</typeparam>
         /// <param name="bindingPoint">The reserved slot to bind the buffer to.</param>
         /// <param name="name">Debug name for the buffer, see <see cref="StorageBuffer(ReservedBufferSlots, string)"/>.</param>
         /// <param name="elements">Number of elements to allocate space for.</param>
-        /// <param name="usage">The intended usage hint for the buffer.</param>
+        /// <param name="usage">Who writes the buffer and who reads it.</param>
         /// <returns>The newly allocated <see cref="StorageBuffer"/>.</returns>
-        public static StorageBuffer Allocate<T>(ReservedBufferSlots bindingPoint, string name, int elements, BufferUsageHint usage)
+        public static StorageBuffer Allocate<T>(ReservedBufferSlots bindingPoint, string name, int elements, BufferUsage usage)
         {
             var buffer = new StorageBuffer(bindingPoint, name) { Size = elements * Unsafe.SizeOf<T>() };
-            if (usage == BufferUsageHint.DynamicRead)
+
+            if (buffer.Size == 0)
             {
-                GL.NamedBufferStorage(buffer.Handle, buffer.Size, IntPtr.Zero, BufferStorageFlags.MapPersistentBit | BufferStorageFlags.MapReadBit | BufferStorageFlags.MapCoherentBit);
-                buffer.PersistentPtr = GL.MapNamedBuffer(buffer.Handle, BufferAccess.ReadOnly);
+                buffer.AllocateEmpty(usage);
+                return buffer;
             }
-            else
+
+            GL.NamedBufferStorage(buffer.Handle, buffer.Size, IntPtr.Zero, StorageFlagsFor(usage));
+
+            if (usage == BufferUsage.Readback)
             {
-                GL.NamedBufferData(buffer.Handle, buffer.Size, IntPtr.Zero, usage);
+                buffer.PersistentPtr = GL.MapNamedBufferRange(buffer.Handle, IntPtr.Zero, buffer.Size, ReadbackAccess);
             }
+
             return buffer;
         }
 
         /// <summary>Uploads the contents of a list to this buffer, replacing any existing data.</summary>
         /// <param name="data">The source list to upload.</param>
-        /// <param name="usageHint">The intended usage pattern for the buffer.</param>
-        public void Create<T>(List<T> data, BufferUsageHint usageHint) where T : struct
+        /// <param name="usage">Who writes the buffer and who reads it.</param>
+        public void Create<T>(List<T> data, BufferUsage usage) where T : struct
         {
-            Create(ListAccessors<T>.GetBackingArray(data), data.Count * Unsafe.SizeOf<T>(), usageHint);
+            Create(ListAccessors<T>.GetBackingArray(data), data.Count * Unsafe.SizeOf<T>(), usage);
         }
 
         /// <summary>Uploads a typed array to this buffer with the given total byte size.</summary>
         /// <param name="data">The source array to upload.</param>
         /// <param name="totalSizeInBytes">Total number of bytes to upload from <paramref name="data"/>.</param>
-        /// <param name="usageHint">The intended usage pattern for the buffer.</param>
-        public void Create<T>(T[] data, int totalSizeInBytes, BufferUsageHint usageHint) where T : struct
+        /// <param name="usage">Who writes the buffer and who reads it.</param>
+        public void Create<T>(T[] data, int totalSizeInBytes, BufferUsage usage) where T : struct
         {
+            Debug.Assert(Size == 0, "Storage can only be allocated once");
+
+            if (totalSizeInBytes == 0)
+            {
+                AllocateEmpty(usage);
+                return;
+            }
+
             Size = totalSizeInBytes;
-            GL.NamedBufferData(Handle, totalSizeInBytes, data, usageHint);
+            GL.NamedBufferStorage(Handle, totalSizeInBytes, data, StorageFlagsFor(usage));
         }
 
-        /// <summary>Uploads a read-only span to this buffer using the specified usage hint.</summary>
+        /// <summary>Uploads a read-only span to this buffer.</summary>
         /// <param name="data">The source span to upload.</param>
-        /// <param name="usageHint">The intended usage pattern for the buffer.</param>
-        public void Create<T>(ReadOnlySpan<T> data, BufferUsageHint usageHint) where T : struct
+        /// <param name="usage">Who writes the buffer and who reads it.</param>
+        public void Create<T>(ReadOnlySpan<T> data, BufferUsage usage) where T : struct
         {
+            Debug.Assert(Size == 0, "Storage can only be allocated once");
+
+            if (data.IsEmpty)
+            {
+                AllocateEmpty(usage);
+                return;
+            }
+
             Size = data.Length * Unsafe.SizeOf<T>();
-            GL.NamedBufferData(Handle, Size, ref Unsafe.As<T, byte>(ref MemoryMarshal.GetReference(data)), usageHint);
+            GL.NamedBufferStorage(Handle, Size, ref Unsafe.As<T, byte>(ref MemoryMarshal.GetReference(data)), StorageFlagsFor(usage));
+        }
+
+        /// <summary>Updates a region of this buffer from a span.</summary>
+        /// <param name="data">The source span to upload.</param>
+        /// <param name="offset">Byte offset into the buffer at which to begin writing.</param>
+        public void Update<T>(ReadOnlySpan<T> data, int offset) where T : struct
+        {
+            Debug.Assert(PersistentPtr == IntPtr.Zero);
+            Debug.Assert(offset + data.Length * Unsafe.SizeOf<T>() <= Size);
+
+            GL.NamedBufferSubData(Handle, offset, data.Length * Unsafe.SizeOf<T>(), ref Unsafe.As<T, byte>(ref MemoryMarshal.GetReference(data)));
         }
 
         /// <summary>Updates a region of this buffer with new data, allocating it first if empty.</summary>
@@ -85,7 +134,7 @@ namespace ValveResourceFormat.Renderer.Buffers
             {
                 if (offset == 0)
                 {
-                    Create(data, size, BufferUsageHint.DynamicDraw);
+                    Create(data, size, BufferUsage.Dynamic);
                     return;
                 }
 
@@ -103,13 +152,17 @@ namespace ValveResourceFormat.Renderer.Buffers
                 return;
             }
 
-
             GL.NamedBufferSubData(Handle, offset, size, data);
         }
 
         /// <summary>Zeroes the entire contents of this buffer.</summary>
         public unsafe void Clear()
         {
+            if (Size == 0)
+            {
+                return;
+            }
+
             if (PersistentPtr != IntPtr.Zero)
             {
                 // For mapped buffers, write directly to mapped memory
@@ -124,6 +177,11 @@ namespace ValveResourceFormat.Renderer.Buffers
         /// <param name="value">The value written to every 32 bit word.</param>
         public unsafe void Fill(uint value)
         {
+            if (Size == 0)
+            {
+                return;
+            }
+
             if (PersistentPtr != IntPtr.Zero)
             {
                 new Span<uint>((void*)PersistentPtr, Size / sizeof(uint)).Fill(value);

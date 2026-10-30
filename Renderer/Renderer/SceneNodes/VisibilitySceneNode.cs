@@ -1,36 +1,46 @@
-using OpenTK.Graphics.OpenGL;
 using ValveResourceFormat.Blocks;
-using ValveResourceFormat.CompiledShader;
-using ValveResourceFormat.ThirdParty;
 
 namespace ValveResourceFormat.Renderer.SceneNodes
 {
     /// <summary>
     /// Debug scene node that draws voxel visibility cluster bounds as colored wireframe boxes.
     /// </summary>
-    public class VisibilitySceneNode : SceneNode
+    public class VisibilitySceneNode : WireframeSceneNode
     {
         private readonly record struct ClusterDrawRange(int Start, int Count, ushort ClusterId);
 
-        private readonly Shader shader;
-        private readonly int vao;
-        private readonly int totalVertexCount;
-        private readonly ClusterDrawRange[] clusterDrawRanges;
+        private readonly IWorldVisibility voxelVisibility;
+        private ClusterDrawRange[] clusterDrawRanges = [];
 
         /// <summary>
         /// Initializes a new <see cref="VisibilitySceneNode"/> from the given voxel visibility data.
+        /// The cluster boxes are built when the node is first drawn.
         /// </summary>
-        public VisibilitySceneNode(Scene scene, VoxelVisibility voxelVisibility) : base(scene)
+        public VisibilitySceneNode(Scene scene, IWorldVisibility voxelVisibility)
+            : base(scene, nameof(VisibilitySceneNode))
         {
-            shader = Scene.RendererContext.ShaderLoader.LoadShader("default");
+            this.voxelVisibility = voxelVisibility;
+            LocalBoundingBox = new AABB(voxelVisibility.MinBounds, voxelVisibility.MaxBounds);
+        }
 
-            var vertices = new List<SimpleVertex>();
-            var ranges = new List<ClusterDrawRange>();
+        /// <inheritdoc/>
+        protected override List<SimpleVertex> BuildLines()
+        {
+            var clusterChildBounds = voxelVisibility.BuildClusterChildBounds();
+            var boxCount = 0;
 
-            foreach (var (clusterId, children) in voxelVisibility.BuildClusterChildBounds())
+            foreach (var children in clusterChildBounds.Values)
+            {
+                boxCount += children.Count;
+            }
+
+            var vertices = new List<SimpleVertex>(boxCount * ShapeSceneNode.BoxLineVertexCount);
+            var ranges = new List<ClusterDrawRange>(clusterChildBounds.Count);
+
+            foreach (var (clusterId, children) in clusterChildBounds)
             {
                 var start = vertices.Count;
-                var color = GetClusterColor(clusterId);
+                var color = GetIdColor(clusterId);
 
                 foreach (var (min, max) in children)
                 {
@@ -44,65 +54,27 @@ namespace ValveResourceFormat.Renderer.SceneNodes
             }
 
             clusterDrawRanges = [.. ranges];
-            totalVertexCount = vertices.Count;
-
-            GL.CreateBuffers(1, out int vboHandle);
-
-#if DEBUG
-            var label = nameof(VisibilitySceneNode);
-            GL.ObjectLabel(ObjectLabelIdentifier.Buffer, vboHandle, label.Length, label);
-#endif
-
-            GL.NamedBufferData(vboHandle, totalVertexCount * SimpleVertex.InputLayout.Stride,
-                ListAccessors<SimpleVertex>.GetBackingArray(vertices), BufferUsageHint.StaticDraw);
-
-            vao = SimpleVertex.InputLayout.CreateVertexArray(nameof(VisibilitySceneNode), vboHandle);
-
-            LocalBoundingBox = new AABB(voxelVisibility.MinBounds, voxelVisibility.MaxBounds);
+            return vertices;
         }
 
         /// <inheritdoc/>
-        public override void Render(Scene.RenderContext context)
+        protected override void DrawLines(Scene.RenderContext context)
         {
-            if (totalVertexCount == 0 || context.RenderPass is not RenderPass.Translucent and not RenderPass.Outline)
+            var pvs = context.View?.Pvs ?? default;
+
+            if (pvs.IsEmpty)
             {
+                base.DrawLines(context);
                 return;
             }
 
-            var renderShader = context.ReplacementShader ?? shader;
-            renderShader.Use();
-            renderShader.SetUniform3x4("transform", Transform);
-            renderShader.SetBoneAnimationData(false);
-
-            using var _ = Scene.RendererContext.RenderState.Scope(depthWrite: false);
-
-            VertexArray.Bind(vao, renderShader);
-
-            if (Scene.CurrentFramePvs == null)
+            foreach (var range in clusterDrawRanges)
             {
-                GL.DrawArraysInstancedBaseInstance(PrimitiveType.Lines, 0, totalVertexCount, 1, Id);
-            }
-            else
-            {
-                foreach (var range in clusterDrawRanges)
+                if (range.ClusterId < (uint)(pvs.Length * 8) && MathUtils.GetBit(pvs.Span, range.ClusterId))
                 {
-                    if (range.ClusterId < (uint)(Scene.CurrentFramePvs.Length * 8) && (Scene.CurrentFramePvs[range.ClusterId >> 3] & (1 << (range.ClusterId & 7))) != 0)
-                    {
-                        GL.DrawArraysInstancedBaseInstance(PrimitiveType.Lines, range.Start, range.Count, 1, Id);
-                    }
+                    DrawLines(range.Start, range.Count);
                 }
             }
-        }
-
-        private static Color32 GetClusterColor(ushort clusterId)
-        {
-            var h = MurmurHash2.Hash(clusterId, 0x3501A674);
-
-            var r = (byte)(((h & 0x3FF) / 1023.0f * 0.6f + 0.2f) * 255);
-            var g = (byte)((((h >> 10) & 0x3FF) / 1023.0f * 0.6f + 0.2f) * 255);
-            var b = (byte)((((h >> 20) & 0x3FF) / 1023.0f * 0.6f + 0.2f) * 255);
-
-            return new Color32(r, g, b, 255);
         }
     }
 }

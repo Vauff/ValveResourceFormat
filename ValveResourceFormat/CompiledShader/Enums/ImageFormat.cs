@@ -68,6 +68,12 @@ public enum ImageFormat
     R32G32_UINT = 58,
     R16_UINT = 59,
     R16G16_UINT = 60,
-    IMAGE_FORMAT_R11G11B10_FLOAT = 61,
+    R11G11B10_FLOAT = 61,
+    R9G9B9E5_FLOAT = 62,
+    R32_SINT = 63,
+    RGBA8888_UINT = 64,
+    IMC2 = 65,
+    NV12 = 66,
+    R8_UNORM = 67,
 #pragma warning restore CS1591
 }

@@ -2,11 +2,11 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "generate": "docfx metadata",
+    "generate": "dotnet build ../Misc/SourceGenerators/SourceGenerators.csproj -c Release && docfx metadata && node .vitepress/resolve-xrefs.js",
     "dev": "vitepress dev",
     "build": "vitepress build",
     "preview": "vitepress preview",
-    "format": "prettier --write --ignore-path .prettierignore ."
+    "format": "prettier --write --ignore-path .prettierignore . ../*.md"
   },
   "devDependencies": {
     "js-yaml": "^5.0.0",

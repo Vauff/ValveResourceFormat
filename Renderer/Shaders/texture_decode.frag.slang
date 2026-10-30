@@ -27,11 +27,12 @@ uniform vec4 g_vInputTextureSize;
 
 #define YCoCg_Conversion (1 << 0)
 #define RGBM (1 << 1)
-#define HemiOctIsoRoughness_RG_B (1 << 2)
+#define HemiOctNormal (1 << 2)
 #define NormalizeNormals (1 << 3)
 #define Dxt5nm_AlphaGreen (1 << 4)
 #define ColorSpace_Linear (1 << 5)
 #define ColorSpace_Srgb (1 << 6)
+#define BlueToAlpha (1 << 8)
 
 uniform int g_nSelectedMip;
 uniform int g_nSelectedDepth;
@@ -90,7 +91,6 @@ vec3 EquirectangularProjection(vec2 vTexCoord)
 // https://wiki.panotools.org/Cubic_Projection
 vec3 CubicProjection(vec2 vTexCoord)
 {
-//   /*
     vec4 vTop = vec4(0, 3, 0, 0);
     vec4 vFront = vec4(2, 5, 1, 6);
     vec4 vBottom = vec4(0, 4, 0, 0);
@@ -110,16 +110,20 @@ vec3 CubicProjection(vec2 vTexCoord)
 uniform bool g_bTextureViewer = false;
 uniform vec3 g_vCheckerboardTheme = vec3(0.9);
 uniform bool g_bCapturingScreenshot = false;
-uniform bool g_bShowLightBackground = false;
 uniform bool g_bVisualizeTiling = false;
 uniform vec2 g_vViewportSize;
 uniform vec2 g_vViewportPosition;
 uniform float g_flScale = 1.0;
 uniform int g_nChannelSplitMode;
 uniform int g_nCubemapProjectionType;
+uniform int g_nSpriteSheetMode = 0;
+uniform vec4 g_vSpriteFrameMinMax = vec4(0.0, 0.0, 1.0, 1.0);
 
 #define g_bCubeEquiRectangularProjection (g_nCubemapProjectionType == 1)
 #define g_bCubeCubicProjection (g_nCubemapProjectionType == 2)
+
+#define g_bSpriteSheetOutlineFrame (g_nSpriteSheetMode == 1)
+#define g_bSpriteSheetCropToFrame (g_nSpriteSheetMode == 2)
 
 vec2 AdjustTextureViewerUvs(vec2 vTexCoord)
 {
@@ -165,6 +169,7 @@ void main()
 
     vec3 vBackgroundColor = vec3(0.0);
     int nColorSliceBoundsIndex = 0;
+    vec2 vSheetBoundsCoord = vec2(0.0);
 
     if (g_bTextureViewer)
     {
@@ -191,6 +196,15 @@ void main()
         {
             vChannelSliceTexCoord.x = fract(vChannelSliceTexCoord.x);
             vTexCoord.xy = bIsWideImage ? vChannelSliceTexCoord.yx : vChannelSliceTexCoord.xy;
+        }
+
+        vSheetBoundsCoord = vTexCoord.xy;
+
+        if (g_bSpriteSheetCropToFrame)
+        {
+            vec2 vFrameSize = g_vSpriteFrameMinMax.zw - g_vSpriteFrameMinMax.xy;
+            vSheetBoundsCoord = vTexCoord.xy / vFrameSize;
+            vTexCoord.xy += g_vSpriteFrameMinMax.xy;
         }
     }
 
@@ -228,18 +242,20 @@ void main()
         vColor.rgba = vColor.agbr;
     }
 
-    if ((g_nDecodeFlags & HemiOctIsoRoughness_RG_B) != 0)
+    if ((g_nDecodeFlags & BlueToAlpha) != 0)
     {
-        float flRoughness = vColor.b;
-        vColor.rgb = PackToColor(oct_to_float32x3(vec2(vColor.x + vColor.y - 1.003922, vColor.x - vColor.y)));
-        vColor.a = flRoughness;
+        vColor.a = vColor.b;
+    }
+
+    if ((g_nDecodeFlags & HemiOctNormal) != 0)
+    {
+        vColor.rgb = PackToColor(HemiOctToFloat32x3(vec2(vColor.x + vColor.y - 1.003922, vColor.x - vColor.y)));
     }
 
     if ((g_nDecodeFlags & NormalizeNormals) != 0)
     {
         vec2 normalXy = UnpackFromColor(vColor.rg);
-        float derivedZ = sqrt(1.0 - (normalXy.x * normalXy.x) - (normalXy.y * normalXy.y));
-        derivedZ = mix(derivedZ, 1.0, isnan(derivedZ)); // todo: becomes NaN if we are out of bounds
+        float derivedZ = sqrt(max(0.0, 1.0 - dot(normalXy, normalXy)));
         vColor.rgb = PackToColor(vec3(normalXy.xy, derivedZ));
     }
 
@@ -283,7 +299,6 @@ void main()
         vec4 vRemappedColor = vec4(vColor[vRemapIndices.x], vColor[vRemapIndices.y], vColor[vRemapIndices.z], vColor[vRemapIndices.w]);
 
         vColorOutput = mix(vec4(0, 0, 0, 1), vRemappedColor, bWriteMask);
-        //vColorOutput = vec4(vColorOutput.rgb, 1.0);
     }
 
     if (g_bTextureViewer)
@@ -291,7 +306,8 @@ void main()
         float flBackgroundMix = 1.0;
 
         const float flMaxUv = g_bVisualizeTiling ? 2.0 : 1.0;
-        bool bWithinImageBounds = vTexCoord.x < flMaxUv && vTexCoord.y < flMaxUv && vTexCoord.x >= 0.0 && vTexCoord.y >= 0.0;
+        vec2 vBoundsCoord = g_bSpriteSheetCropToFrame ? vSheetBoundsCoord : vTexCoord.xy;
+        bool bWithinImageBounds = vBoundsCoord.x < flMaxUv && vBoundsCoord.y < flMaxUv && vBoundsCoord.x >= 0.0 && vBoundsCoord.y >= 0.0;
 
         if (g_nChannelSplitMode > 0 && (bWithinImageBounds || nColorSliceBoundsIndex > 0))
         {
@@ -309,9 +325,26 @@ void main()
 
         if (bWithinImageBounds)
         {
-            flBackgroundMix -= vColorOutput.a;
+            flBackgroundMix -= g_bCapturingScreenshot ? 1.0 : vColorOutput.a;
         }
 
         vColorOutput.rgb = mix(vColorOutput.rgb, vBackgroundColor, flBackgroundMix);
+
+        if (g_bSpriteSheetOutlineFrame)
+        {
+            vec2 vMin = g_vSpriteFrameMinMax.xy;
+            vec2 vMax = g_vSpriteFrameMinMax.zw;
+            vec2 vThickness = fwidth(vTexCoord.xy) * 1.5;
+
+            bool bInsideX = vTexCoord.x >= vMin.x - vThickness.x && vTexCoord.x <= vMax.x + vThickness.x;
+            bool bInsideY = vTexCoord.y >= vMin.y - vThickness.y && vTexCoord.y <= vMax.y + vThickness.y;
+            bool bOnVerticalEdge = (abs(vTexCoord.x - vMin.x) < vThickness.x || abs(vTexCoord.x - vMax.x) < vThickness.x) && bInsideY;
+            bool bOnHorizontalEdge = (abs(vTexCoord.y - vMin.y) < vThickness.y || abs(vTexCoord.y - vMax.y) < vThickness.y) && bInsideX;
+
+            if (bOnVerticalEdge || bOnHorizontalEdge)
+            {
+                vColorOutput = vec4(1.0, 0.5, 0.0, 1.0);
+            }
+        }
     }
 }

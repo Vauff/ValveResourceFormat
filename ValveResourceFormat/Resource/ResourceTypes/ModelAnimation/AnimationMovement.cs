@@ -70,6 +70,11 @@ namespace ValveResourceFormat.ResourceTypes.ModelAnimation
         public Vector3 Position { get; }
 
         /// <summary>
+        /// Gets a value indicating whether every motion parameter of this segment is zero, so it moves nothing.
+        /// </summary>
+        public bool IsZero => V0 == 0f && V1 == 0f && Angle == 0f && Vector == Vector3.Zero && Position == Vector3.Zero;
+
+        /// <summary>
         /// Initializes a new instance of the <see cref="AnimationMovement"/> class.
         /// </summary>
         public AnimationMovement(KVObject frameBlock)
@@ -79,8 +84,8 @@ namespace ValveResourceFormat.ResourceTypes.ModelAnimation
             V0 = frameBlock.GetFloatProperty("v0");
             V1 = frameBlock.GetFloatProperty("v1");
             Angle = frameBlock.GetFloatProperty("angle");
-            Vector = new Vector3(frameBlock.GetFloatArray("vector"));
-            Position = new Vector3(frameBlock.GetFloatArray("position"));
+            Vector = frameBlock.GetSubCollection("vector").ToVector3();
+            Position = frameBlock.GetSubCollection("position").ToVector3();
         }
 
         /// <summary>
@@ -106,7 +111,7 @@ namespace ValveResourceFormat.ResourceTypes.ModelAnimation
         private static MovementData Lerp(Vector3 aPos, float aAngle, Vector3 bPos, float bAngle, float t)
         {
             var position = Vector3.Lerp(aPos, bPos, t);
-            var angle = float.Lerp(aAngle, bAngle, t);
+            var angle = MathUtils.Lerp(aAngle, bAngle, t);
 
             return new MovementData(position, angle);
         }

@@ -20,7 +20,7 @@ internal class ShaderHotReload : IDisposable
         var paths = new List<string>(watchers.Capacity);
         paths.AddRange(ShaderRegistry.Directories);
 
-        // Only present when this assembly was built from the shader source files, rather than using the embedded copies
+        // Only set when built from shader source files, not the embedded copies
         if (ShaderParser.ShaderSourceDirectory != null)
         {
             paths.Add(ShaderParser.ShaderSourceDirectory);
@@ -102,9 +102,17 @@ internal class ShaderHotReload : IDisposable
     public void ReloadShaders(string? name = null)
     {
         using var lockedGl = ViewerControl.MakeCurrent();
-        ShaderLoader.ReloadAllShaders(name);
-        ShadersReloaded?.Invoke(this, name);
-        ViewerControl.GLControl?.Invalidate();
+
+        try
+        {
+            ShaderLoader.ReloadAllShaders(name);
+        }
+        finally
+        {
+            // The shaders that did compile are replaced even when others fail
+            ShadersReloaded?.Invoke(this, name);
+            ViewerControl.GLControl?.Invalidate();
+        }
     }
 
     private void Hotload(object sender, FileSystemEventArgs e)

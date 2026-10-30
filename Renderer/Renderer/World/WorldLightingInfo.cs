@@ -3,37 +3,13 @@ using System.Linq;
 using System.Runtime.CompilerServices;
 using Microsoft.Extensions.Logging;
 using OpenTK.Graphics.OpenGL;
-using ValveResourceFormat.Renderer.Buffers;
+using ValveResourceFormat.IO;
+using ValveResourceFormat.Particles;
 using ValveResourceFormat.Renderer.SceneEnvironment;
+using ValveResourceFormat.ResourceTypes;
 
 namespace ValveResourceFormat.Renderer.World
 {
-    /// <summary>
-    /// Storage format for environment map cubemap textures.
-    /// </summary>
-    public enum CubemapType : byte
-    {
-        /// <summary>No environment cubemap data.</summary>
-        None,
-        /// <summary>Each probe has its own individual cubemap texture.</summary>
-        IndividualCubemaps,
-        /// <summary>All probe cubemaps are packed into a single texture array.</summary>
-        CubemapArray,
-    }
-
-    /// <summary>
-    /// Storage format for light probe irradiance data.
-    /// </summary>
-    public enum LightProbeType : byte
-    {
-        /// <summary>No light probe data.</summary>
-        None,
-        /// <summary>Each probe has its own individual irradiance texture.</summary>
-        IndividualProbes,
-        /// <summary>All probe irradiance data is packed into a single atlas texture.</summary>
-        ProbeAtlas,
-    }
-
     /// <summary>Which light face a binned barn light slot holds, so a cull bit read back later traces to
     /// the light it was about. Rebuilt every frame, so it only holds against the frame that produced it.</summary>
     /// <param name="Light">Light owning the slot.</param>
@@ -43,12 +19,14 @@ namespace ValveResourceFormat.Renderer.World
     /// <summary>
     /// Scene lighting data including lightmaps, reflection probes, and shadow maps.
     /// </summary>
-    public class WorldLightingInfo(Scene scene)
+    public class WorldLightingInfo(Scene scene) : IParticleLighting
     {
         /// <summary>Gets the lightmap textures indexed by uniform name.</summary>
         public Dictionary<string, RenderTexture> Lightmaps { get; } = [];
         /// <summary>Gets the list of scene light probes.</summary>
         public List<SceneLightProbe> LightProbes { get; } = [];
+        /// <summary>Gets the atlas the light probes sample, once <see cref="BuildProbeAtlas"/> has run.</summary>
+        public LightProbeAtlas? ProbeAtlas { get; private set; }
         /// <summary>Gets the list of environment map probes.</summary>
         public List<SceneEnvMap> EnvMaps { get; } = [];
         /// <summary>Gets the list of real-time barn lights.</summary>
@@ -68,56 +46,39 @@ namespace ValveResourceFormat.Renderer.World
         /// <summary>Gets or sets the GPU lighting constants buffer for the scene.</summary>
         public LightingConstants LightingData { get; set; } = new();
 
-        /// <summary>Gets or sets the storage format used for environment map cubemaps in this scene.</summary>
-        public CubemapType CubemapType
-        {
-            get => (CubemapType)scene.RenderAttributes.GetValueOrDefault("S_SCENE_CUBEMAP_TYPE");
-            set => scene.RenderAttributes["S_SCENE_CUBEMAP_TYPE"] = (byte)value;
-        }
-
-        /// <summary>Gets or sets the storage format used for light probe irradiance data in this scene.</summary>
-        public LightProbeType LightProbeType
-        {
-            get => (LightProbeType)scene.RenderAttributes.GetValueOrDefault("S_SCENE_PROBE_TYPE");
-            set => scene.RenderAttributes["S_SCENE_PROBE_TYPE"] = (byte)value;
-        }
+        /// <inheritdoc/>
+        /// <remarks>A scene without baked lighting answers white, as the particle shaders light it; one with baked lighting answers a flat grey.</remarks>
+        public Vector3 SampleAmbientLight(Vector3 position)
+            => HasValidLightProbes || HasValidLightmaps ? new Vector3(0.3f) : Vector3.One;
 
         /// <summary>
-        /// Gets or sets whether barn, rect and omni lights take their intensity from <c>brightness_legacy</c>.
+        /// Creates baked lighting combo args for an object, based on object and scene lighting state.
         /// </summary>
-        public bool UsesLegacyBarnBrightness { get; set; }
+        public Dictionary<string, byte> CreateShaderArguments(bool hasLightmapUvs = false, bool hasVertexLighting = false)
+        {
+            var arguments = new Dictionary<string, byte>(scene.RenderAttributes);
+
+            if (hasLightmapUvs && HasValidLightmaps)
+            {
+                arguments["D_BAKED_LIGHTING_FROM_LIGHTMAP"] = 1;
+            }
+            else if (hasVertexLighting)
+            {
+                arguments["D_BAKED_LIGHTING_FROM_VERTEX_STREAM"] = 1;
+            }
+            else if (HasValidLightProbes)
+            {
+                arguments["D_BAKED_LIGHTING_FROM_PROBE"] = 1;
+            }
+
+            return arguments;
+        }
 
         /// <summary>Gets a value indicating whether the lightmap contains baked shadow data.</summary>
-        public bool HasBakedShadowsFromLightmap => scene.RenderAttributes.GetValueOrDefault("S_LIGHTMAP_VERSION_MINOR") > 0;
+        public bool HasBakedShadowsFromLightmap => HasValidLightmaps && scene.RenderAttributes.GetValueOrDefault("S_LIGHTMAP_VERSION_MINOR") > 0;
         /// <summary>Gets or sets a value indicating whether dynamic shadow rendering is enabled.</summary>
         public bool EnableDynamicShadows { get; set; } = true;
 
-        /// <summary>Number of sun shadow cascades rendered and sampled. Cascade 0 is the tightest.</summary>
-        public const int SunCascadeCount = 2;
-
-        /// <summary>Gets the combined view-projection matrices used for sun shadow rendering, one per cascade.</summary>
-        public Matrix4x4[] SunViewProjections { get; } = new Matrix4x4[SunCascadeCount];
-        /// <summary>Gets the frustums used for sun light shadow caster culling, one per cascade.</summary>
-        public Frustum[] SunLightFrustums { get; } = CreateSunLightFrustums();
-        /// <summary>Gets the normalized direction sun light travels, away from the sun.</summary>
-        public Vector3 SunCastDirection { get; private set; } = Vector3.UnitX;
-
-        /// <summary>Gets the number of cascades in use after the last <see cref="UpdateSunLightFrustum"/> call. Cascades beyond it only keep their layer cleared, which samples as fully lit.</summary>
-        public int ActiveSunCascadeCount { get; private set; } = SunCascadeCount;
-
-        private static Frustum[] CreateSunLightFrustums()
-        {
-            var frustums = new Frustum[SunCascadeCount];
-
-            for (var i = 0; i < frustums.Length; i++)
-            {
-                frustums[i] = new Frustum();
-            }
-
-            return frustums;
-        }
-        /// <summary>Gets or sets the depth bias applied to sun light shadows to reduce self-shadowing artifacts.</summary>
-        public float SunLightShadowBias { get; set; } = 0.001f;
         /// <summary>Gets or sets a scale factor applied to the sun light shadow coverage area.</summary>
         public float SunLightShadowCoverageScale { get; set; } = 1f;
         /// <summary>Gets or sets a value indicating whether the sun light frustum is fitted to the scene bounds rather than the camera.</summary>
@@ -129,9 +90,48 @@ namespace ValveResourceFormat.Renderer.World
         /// <summary>Gets the shadow mapper that culls and packs light shadow faces each frame.</summary>
         public ShadowMapper ShadowMapper { get; } = new();
 
-        private readonly BarnLightConstants[] BinnedBarnLightGpuData = new BarnLightConstants[BarnLightConstants.MAX_BARN_LIGHTS];
-        private readonly BarnLightCullVolume[] BinnedBarnLightCullVolumes = new BarnLightCullVolume[BarnLightConstants.MAX_BARN_LIGHTS];
-        private readonly BarnLightFaceSlot[] BinnedBarnLightFaceSlots = new BarnLightFaceSlot[BarnLightConstants.MAX_BARN_LIGHTS];
+        private readonly BarnLightConstants[] BinnedBarnLightGpuData = new BarnLightConstants[BarnLightConstants.MAX_BARN_LIGHT_FACES];
+        private readonly BarnLightCullVolume[] BinnedBarnLightCullVolumes = new BarnLightCullVolume[BarnLightConstants.MAX_BARN_LIGHT_FACES];
+        private readonly BarnLightFaceSlot[] BinnedBarnLightFaceSlots = new BarnLightFaceSlot[BarnLightConstants.MAX_BARN_LIGHT_FACES];
+
+        private BarnLightSortKey[] BarnLightSortKeys = new BarnLightSortKey[BarnLightConstants.MAX_BARN_LIGHTS];
+
+        /// <summary>What decides which visible lights make the per view cap, in order of priority.</summary>
+        private struct BarnLightSortKey : IComparable<BarnLightSortKey>
+        {
+            public int BinnedIndex;
+            public float ScreenSize;
+            public float DistanceSquared;
+            public float Luminance;
+            public float Facing;
+            public float LightFade;
+            public float ShadowFade;
+
+            /// <summary>Orders the most important light first: larger on screen, then nearer, brighter and facing the camera's view.</summary>
+            public readonly int CompareTo(BarnLightSortKey other)
+            {
+                var screenSize = other.ScreenSize.CompareTo(ScreenSize);
+                if (screenSize != 0)
+                {
+                    return screenSize;
+                }
+
+                var distance = DistanceSquared.CompareTo(other.DistanceSquared);
+                if (distance != 0)
+                {
+                    return distance;
+                }
+
+                var luminance = other.Luminance.CompareTo(Luminance);
+                if (luminance != 0)
+                {
+                    return luminance;
+                }
+
+                var facing = other.Facing.CompareTo(Facing);
+                return facing != 0 ? facing : BinnedIndex.CompareTo(other.BinnedIndex);
+            }
+        }
 
         private Dictionary<string, int> BarnLightCookiePaths { get; } = new(StringComparer.OrdinalIgnoreCase);
         private StorageBuffer? BarnLightStorageBuffer;
@@ -139,6 +139,7 @@ namespace ValveResourceFormat.Renderer.World
         private RenderTexture? DefaultCookieAtlas;
         private int CookieSamplerClampBorder;
         private int CookieSamplerWrap;
+        private bool WarnedAboutTooManyLights;
 
         /// <summary>Binds the scene's lightmap, light probe atlas, and barn light cookie textures to their reserved units.</summary>
         public void BindLightmapTextures()
@@ -154,10 +155,19 @@ namespace ValveResourceFormat.Renderer.World
                 GL.BindTextureUnit((int)lightmapSlot, texture.Handle);
             }
 
-            if (LightProbeType == LightProbeType.ProbeAtlas && LightProbes.Count > 0)
+            // Shaders always declare the array, and sample nothing from it in a scene without environment maps
+            var envMapArray = EnvMapArray ?? scene.RendererContext.MaterialLoader.GetDefaultCubeArray();
+            GL.BindTextureUnit((int)ReservedTextureSlots.EnvironmentMap, envMapArray.Handle);
+
+            if (ProbeAtlas != null)
             {
-                BindProbeTexture("g_tLPV_Irradiance", LightProbes[0].Irradiance);
-                BindProbeTexture("g_tLPV_Shadows", LightProbes[0].DirectLightShadows);
+                // A texture no volume has is still sampled, and reads as no direct light and no shadow
+                var noDirectLight = scene.RendererContext.MaterialLoader.GetDefaultBlackVolume();
+
+                BindProbeTexture("g_tLPV_Irradiance", ProbeAtlas.Irradiance);
+                BindProbeTexture("g_tLPV_Indices", ProbeAtlas.DirectLightIndices ?? noDirectLight);
+                BindProbeTexture("g_tLPV_Scalars", ProbeAtlas.DirectLightScalars ?? noDirectLight);
+                BindProbeTexture("g_tLPV_Shadows", ProbeAtlas.DirectLightShadows ?? noDirectLight);
             }
 
             // Always bind something, even when the scene has no cookies: the cookie samplers are 2D arrays,
@@ -176,25 +186,103 @@ namespace ValveResourceFormat.Renderer.World
             GL.BindSampler((int)ReservedTextureSlots.LightCookieTextureWrap, CookieSamplerWrap);
         }
 
-        /// <summary>Binds the per-draw light probe volume textures. Individual-probe scenes only.</summary>
-        public void BindInstanceLightProbeTextures(SceneLightProbe lightProbe)
+        /// <summary>
+        /// Sets up the atlas the light probes sample: the one the map baked, or else one packed from the volumes that
+        /// were each baked into textures of their own. Only volumes in it are lit by, see <see cref="IsInProbeAtlas"/>.
+        /// </summary>
+        internal void BuildProbeAtlas()
         {
-            if (LightProbeType != LightProbeType.IndividualProbes)
+            if (ProbeAtlas != null || LightProbes.Count == 0)
             {
                 return;
             }
 
-            BindProbeTexture("g_tLPV_Irradiance", lightProbe.Irradiance);
+            // Shaders read one atlas, so volumes with textures of their own are not packed with a baked one
+            if (LightProbes.Find(static volume => IsInBakedAtlas(volume) && volume.Irradiance != null) is { } bakedVolume)
+            {
+                ProbeAtlas = LightProbeAtlas.FromBaked(bakedVolume);
 
-            if (LightmapGameVersionNumber == 1)
-            {
-                BindProbeTexture("g_tLPV_Indices", lightProbe.DirectLightIndices);
-                BindProbeTexture("g_tLPV_Scalars", lightProbe.DirectLightScalars);
+                if (LightProbes.Count(static volume => !IsInBakedAtlas(volume)) is > 0 and var ownTextures)
+                {
+                    scene.RendererContext.Logger.LogWarning("{Count} light probe volumes with textures of their own are left out, the map baked the others into an atlas", ownTextures);
+                }
+
+                return;
             }
-            else if (LightmapGameVersionNumber >= 2)
+
+            var rendererContext = scene.RendererContext;
+            ProbeAtlas = LightProbeAtlas.Pack(LightProbes, rendererContext.MaterialLoader, rendererContext.Logger);
+        }
+
+        /// <summary>Gets the cubemap array the environment maps sample, once <see cref="BuildEnvMapArray"/> has run.</summary>
+        public RenderTexture? EnvMapArray { get; private set; }
+
+        private RenderTexture? packedEnvMapArray;
+
+        /// <summary>
+        /// Sets up the cubemap array the environment maps sample: the one the map baked, or else one packed from the
+        /// cubemaps baked as separate textures. Environment maps not in it are removed.
+        /// </summary>
+        internal void BuildEnvMapArray()
+        {
+            if (EnvMapArray != null || EnvMaps.Count == 0)
             {
-                BindProbeTexture("g_tLPV_Shadows", lightProbe.DirectLightShadows);
+                return;
             }
+
+            // Shaders read one array, so separate cubemaps are not packed with a baked one
+            var array = EnvMaps.Find(static envMap => envMap.EnvMapTexture.Target == TextureTarget.TextureCubeMapArray)?.EnvMapTexture;
+
+            if (array == null)
+            {
+                var rendererContext = scene.RendererContext;
+                array = packedEnvMapArray = EnvironmentMapArray.Pack(EnvMaps, rendererContext.MaterialLoader, rendererContext.Logger);
+            }
+
+            if (array == null)
+            {
+                EnvMaps.Clear();
+                EnvMapHandshakes.Clear();
+                return;
+            }
+
+            if (EnvMaps.RemoveAll(envMap => envMap.EnvMapTexture != array) is > 0 and var removed)
+            {
+                scene.RendererContext.Logger.LogWarning("{Count} environment maps are not in the cubemap array and are left out", removed);
+
+                foreach (var (handshake, envMap) in EnvMapHandshakes.ToList())
+                {
+                    if (envMap.EnvMapTexture != array)
+                    {
+                        EnvMapHandshakes.Remove(handshake);
+                    }
+                }
+            }
+
+            EnvMapArray = array;
+        }
+
+        /// <summary>Deletes the cubemap array, when it was packed for the scene.</summary>
+        internal void DeleteEnvMapArray()
+        {
+            packedEnvMapArray?.Delete();
+            packedEnvMapArray = null;
+            EnvMapArray = null;
+        }
+
+        // A volume placed in an atlas the map baked, rather than with textures of its own
+        private static bool IsInBakedAtlas(SceneLightProbe volume) => volume.AtlasSize != Vector3.Zero;
+
+        /// <summary>Gets whether a light probe volume has a place in <see cref="ProbeAtlas"/>, and so can be sampled.</summary>
+        /// <param name="volume">The volume.</param>
+        internal bool IsInProbeAtlas(SceneLightProbe volume)
+            => ProbeAtlas != null && volume.Irradiance != null && volume.AtlasSize != Vector3.Zero;
+
+        /// <summary>Deletes the light probe atlas, when it was packed for the scene.</summary>
+        internal void DeleteProbeAtlas()
+        {
+            ProbeAtlas?.Delete();
+            ProbeAtlas = null;
         }
 
         /// <summary>Binds a light probe volume texture to the unit its sampler reads.</summary>
@@ -210,40 +298,29 @@ namespace ValveResourceFormat.Renderer.World
         }
 
         /// <summary>
-        /// Registers an environment map with the scene, setting the cubemap type on the first entry.
+        /// Registers an environment map with the scene. Separate cubemaps are packed into an array before they are
+        /// sampled, see <see cref="BuildEnvMapArray"/>.
         /// </summary>
         /// <param name="envmap">The environment map to add.</param>
         public void AddEnvironmentMap(SceneEnvMap envmap)
         {
-            if (EnvMaps.Count == 0)
-            {
-                CubemapType = envmap.EnvMapTexture.Target switch
-                {
-                    TextureTarget.TextureCubeMapArray => CubemapType.CubemapArray,
-                    TextureTarget.TextureCubeMap => CubemapType.IndividualCubemaps,
-                    _ => CubemapType.None,
-                };
-
-                if (CubemapType == CubemapType.CubemapArray)
-                {
-                    Lightmaps.TryAdd("g_tEnvironmentMap", envmap.EnvMapTexture);
-                }
-            }
-            else
-            {
-                var first = EnvMaps[0];
-                if (envmap.EnvMapTexture.Target != first.EnvMapTexture.Target)
-                {
-                    scene.RendererContext.Logger.LogError("Envmap texture target mismatch {EnvMapTarget} != {FirstTarget}", envmap.EnvMapTexture.Target, first.EnvMapTexture.Target);
-                }
-            }
-
             EnvMaps.Add(envmap);
 
             if (envmap.HandShake > 0)
             {
                 scene.LightingInfo.EnvMapHandshakes.Add(envmap.HandShake, envmap);
             }
+        }
+
+        /// <summary>Forgets every registered environment map and light probe, for the entities that register them to spawn again.</summary>
+        internal void ClearVolumes()
+        {
+            EnvMaps.Clear();
+            EnvMapHandshakes.Clear();
+            LightProbes.Clear();
+            ProbeHandshakes.Clear();
+            DeleteProbeAtlas();
+            DeleteEnvMapArray();
         }
 
         /// <summary>
@@ -261,7 +338,7 @@ namespace ValveResourceFormat.Renderer.World
             {
                 (_, { Irradiance: null }) => false,
                 (1, { DirectLightIndices: null } or { DirectLightScalars: null }) => false,
-                (2 or 3 or 4, { DirectLightShadows: null }) => false,
+                (2 or 3 or 4 or 5, { DirectLightShadows: null }) => false,
                 _ => true,
             };
 
@@ -271,168 +348,73 @@ namespace ValveResourceFormat.Renderer.World
 
             if (lightProbe.HandShake > 0)
             {
-                scene.LightingInfo.ProbeHandshakes.Add(lightProbe.HandShake, lightProbe);
+                scene.LightingInfo.ProbeHandshakes[lightProbe.HandShake] = lightProbe;
             }
         }
 
-        // Depth extent, on each side of the eye, that sun shadow casters are culled within. The
-        // rendered depth range is tightened to the collected casters by FitSunLightDepthRange.
-        private const float SunShadowCullDepthRange = 8192f;
+        private List<SceneLight> storedLights = [];
+        private bool usesUniformLightStore;
 
-        // How far each cascade's coverage square is shifted toward the view, as a fraction of its
-        // half-extent. Keeps the camera comfortably inside the square while spending most of the
-        // area on what is in front of it.
-        private const float SunShadowForwardShiftFraction = 0.5f;
-
-        // Cascade half-extents as fractions of the base coverage size, innermost first. The
-        // outermost stays near the legacy single-map coverage, which was always generous; the
-        // inner cascade spends its equal resolution on close-up density instead of area.
-        private static readonly float[] SunCascadeExtentFractions = [1f / 8f, 1f / 1.2f];
-
-        // Keeps the innermost cascade usable at low resolution settings, where the base
-        // coverage is small enough that an eighth of it would hug the camera.
-        private const float MinSunCascadeHalfExtent = 128f;
-
-        private readonly Matrix4x4[] sunShadowView = new Matrix4x4[SunCascadeCount];
-        private readonly Vector3[] sunShadowEye = new Vector3[SunCascadeCount];
-        private readonly float[] sunShadowHalfExtent = new float[SunCascadeCount];
-        private bool sunShadowFitsDepthToCasters;
-
-        /// <summary>Recalculates <see cref="SunViewProjections"/> and <see cref="SunLightFrustums"/> to fit the current camera view. Cascade extents follow <see cref="SunCascadeExtentFractions"/>. The frustums get a generous depth range for caster culling; once a cascade's casters are collected, <see cref="FitSunLightDepthRange"/> tightens its rendered range around them.</summary>
-        /// <param name="camera">The active camera used to position the sun shadow frustum.</param>
-        /// <param name="shadowMapSize">The shadow map resolution used to compute coverage and texel snapping.</param>
-        public void UpdateSunLightFrustum(Camera camera, float shadowMapSize = 512f)
+        /// <summary>
+        /// Stores the map's lights to GPU, replacing any stored before.
+        /// </summary>
+        public void StoreLights(List<SceneLight> lights)
         {
-            // The uniform stores surface-to-sun; the frustum looks along the rays, away from the sun
-            var toSun = new Vector3(LightingData.SunDirection.X, LightingData.SunDirection.Y, LightingData.SunDirection.Z);
-            var sunDir = toSun.LengthSquared() > 0.0001f ? Vector3.Normalize(-toSun) : Vector3.UnitX;
+            storedLights = lights;
+            usesUniformLightStore = (LightmapVersionNumber, LightmapGameVersionNumber) is (6, 0) or (8, 0) or (8, 1);
 
-            var baseHalfExtent = Math.Max(shadowMapSize / 2.5f, 512f) * SunLightShadowCoverageScale;
-            var bias = 0.001f;
-
-            // Shift each coverage square toward the view. A caster shares its light-space footprint
-            // with the shadow it casts, so area behind the view catches nothing the visible region
-            // needs; casters toward the sun are captured along depth, not by the square.
-            var forwardOnLightPlane = camera.Forward - sunDir * Vector3.Dot(camera.Forward, sunDir);
-
-            sunShadowFitsDepthToCasters = true;
-
-            // When the whole scene fits into the first cascade, fit it directly and skip the rest
-            var sceneBoundsMode = false;
-            var sceneEye = Vector3.Zero;
-            var sceneHalfExtent = 0f;
-            var sceneNearPlaneExtend = 0f;
-
-            if (UseSceneBoundsForSunLightFrustum)
+            if (usesUniformLightStore)
             {
-                var staticBounds = scene.StaticOctree.Root.GetBounds();
-                var dynamicBounds = scene.DynamicOctree.Root.GetBounds();
-                var sceneBounds = staticBounds.Union(dynamicBounds);
-                var max = Math.Max(sceneBounds.Size.X, Math.Max(sceneBounds.Size.Y, sceneBounds.Size.Z));
+                StoreLightMappedLights_V1(lights);
 
-                if (max > 0 && max < shadowMapSize)
-                {
-                    sceneNearPlaneExtend = max / 2f;
-                    sceneEye = staticBounds.Center - sunDir * sceneNearPlaneExtend;
-                    sceneHalfExtent = max * 1.6f;
-                    bias = 0.01f;
-                    sceneBoundsMode = true;
-                    sunShadowFitsDepthToCasters = false;
-                }
+                // Not in the store itself, which light styles run every tick
+                scene.RendererContext.Logger.LogDebug(
+                    "Lightmap version {Major}.{Minor}: {Stationary} stationary and {Dynamic} per-pixel lights of {Total} light entities",
+                    LightmapVersionNumber, LightmapGameVersionNumber, LightingData.StaticLightCount,
+                    LightingData.DynamicLightCount - LightingData.StaticLightCount, lights.Count);
             }
-
-            // A sun pointing straight down leaves no horizontal axis to snap against, and world up is
-            // no use as a reference either, so the frame is completed against forward instead
-            var upReference = MathF.Abs(sunDir.Z) < 0.999f ? Vector3.UnitZ : Vector3.UnitX;
-            var right = Vector3.Normalize(Vector3.Cross(sunDir, upReference));
-            var up = Vector3.Cross(right, sunDir);
-
-            // When the whole scene already fits into the first cascade, the wider ones add nothing
-            var singleCascade = sceneBoundsMode;
-
-            ActiveSunCascadeCount = singleCascade ? 1 : SunCascadeCount;
-
-            for (var cascade = 0; cascade < SunCascadeCount; cascade++)
+            else
             {
-                if (singleCascade && cascade > 0)
-                {
-                    // The shader falls through identical coordinates into the cleared outer layer,
-                    // which reads fully lit, matching the single-frustum edge fade.
-                    SunViewProjections[cascade] = SunViewProjections[0];
-                    SunLightFrustums[cascade].SetEmpty();
-                    continue;
-                }
-
-                float bbox;
-                float farPlane;
-                float nearPlaneExtend;
-                Vector3 eye;
-
-                if (sceneBoundsMode)
-                {
-                    bbox = sceneHalfExtent;
-                    farPlane = bbox;
-                    nearPlaneExtend = sceneNearPlaneExtend;
-                    eye = sceneEye;
-                }
-                else
-                {
-                    bbox = MathF.Max(baseHalfExtent * SunCascadeExtentFractions[cascade], MinSunCascadeHalfExtent);
-                    farPlane = SunShadowCullDepthRange;
-                    nearPlaneExtend = SunShadowCullDepthRange;
-                    eye = camera.Location + forwardOnLightPlane * (bbox * SunShadowForwardShiftFraction);
-                }
-
-                // Stabilize shadow map by snapping eye position to texel-sized increments in world space
-                var texelWorldSize = (4.0f * bbox) / shadowMapSize;
-
-                // Project eye onto shadow camera's right/up axes and snap
-                var eyeOffsetX = Vector3.Dot(eye, right);
-                var eyeOffsetY = Vector3.Dot(eye, up);
-                var eyeOffsetZ = Vector3.Dot(eye, sunDir);
-
-                eyeOffsetX = MathF.Round(eyeOffsetX / texelWorldSize) * texelWorldSize;
-                eyeOffsetY = MathF.Round(eyeOffsetY / texelWorldSize) * texelWorldSize;
-
-                eye = right * eyeOffsetX + up * eyeOffsetY + sunDir * eyeOffsetZ;
-
-                var sunCameraView = Matrix4x4.CreateLookAt(eye, eye + sunDir, upReference);
-                var sunCameraProjection = Matrix4x4.CreateOrthographicOffCenter(-bbox, bbox, -bbox, bbox, farPlane, -nearPlaneExtend);
-
-                SunViewProjections[cascade] = sunCameraView * sunCameraProjection;
-                SunLightFrustums[cascade].Update(SunViewProjections[cascade]);
-
-                sunShadowView[cascade] = sunCameraView;
-                sunShadowEye[cascade] = eye;
-                sunShadowHalfExtent[cascade] = bbox;
+                StoreLightMappedLights_V2(lights);
             }
-
-            SunLightShadowBias = bias;
-            SunCastDirection = sunDir;
         }
 
-        /// <summary>Tightens the depth range of a cascade's <see cref="SunViewProjections"/> entry around the collected shadow casters, given their extent along <see cref="SunCastDirection"/> in world units. A tight range shrinks the world-space size of the normalized shadow bias. Receivers outside the range clamp in the shader and still compare correctly against every caster, and since the fit derives from the same culled set that renders, it covers every rendered caster by construction. <see cref="SunLightFrustums"/> keeps the generous culling range.</summary>
-        /// <param name="cascade">The cascade index to tighten.</param>
-        /// <param name="casterMin">Smallest caster projection onto the cast direction, or <see cref="float.MaxValue"/> when no casters were collected.</param>
-        /// <param name="casterMax">Largest caster projection onto the cast direction.</param>
-        public void FitSunLightDepthRange(int cascade, float casterMin, float casterMax)
+        private bool storedLightsChanged;
+
+        /// <summary>Marks the stored lights for <see cref="StoreChangedLights"/>.</summary>
+        public void MarkStoredLightsChanged() => storedLightsChanged = true;
+
+        /// <summary>Stores the lights again if they changed since they were last stored.</summary>
+        public void StoreChangedLights()
         {
-            if (!sunShadowFitsDepthToCasters || casterMin > casterMax)
+            if (!storedLightsChanged)
             {
                 return;
             }
 
-            var eyeDepth = Vector3.Dot(sunShadowEye[cascade], SunCastDirection);
+            storedLightsChanged = false;
+            UpdateGpuLightBuffers();
+        }
 
-            // Quantized so the range holds still while casters move within it
-            const float quantize = 64f;
-            var depthMin = Math.Clamp(MathF.Floor((casterMin - eyeDepth) / quantize) * quantize, -SunShadowCullDepthRange, SunShadowCullDepthRange - quantize);
-            var depthMax = Math.Clamp(MathF.Ceiling((casterMax - eyeDepth) / quantize) * quantize, depthMin + quantize, SunShadowCullDepthRange);
+        /// <summary>Re-stores the GPU light properties.</summary>
+        public void UpdateGpuLightBuffers()
+        {
+            if (storedLights.Count == 0)
+            {
+                return;
+            }
 
-            var bbox = sunShadowHalfExtent[cascade];
-            var projection = Matrix4x4.CreateOrthographicOffCenter(-bbox, bbox, -bbox, bbox, depthMax, depthMin);
+            if (usesUniformLightStore)
+            {
+                StoreLightMappedLights_V1(storedLights);
+                return;
+            }
 
-            SunViewProjections[cascade] = sunShadowView[cascade] * projection;
+            var envLight = storedLights.FirstOrDefault(static l => l.Entity == SceneLight.EntityType.Environment);
+            if (envLight != null)
+            {
+                StoreSunLight(envLight, envLight.BakedShadowMask);
+            }
         }
 
         /// <summary>
@@ -443,17 +425,19 @@ namespace ValveResourceFormat.Renderer.World
         /// <param name="lights">The list of scene lights to store.</param>
         public void StoreLightMappedLights_V1(List<SceneLight> lights)
         {
-            void AddLight(SceneLight light, uint index)
+            void AddLight(SceneLight light, uint index, float colorScale)
             {
+                var range = light.GetAttenuatedRange();
+
                 LightingData.LightPosition_Type[index] = new Vector4(light.Position, (int)light.Type);
-                LightingData.LightDirection_InvRange[index] = new Vector4(light.Direction, 1.0f / light.Range);
+                LightingData.LightDirection_InvRange[index] = new Vector4(light.Direction, range > 0f ? 1f / range : 0f);
                 LightingData.LightToWorld[index] = light.Transform;
 
                 // g_vBakedLightColor: linear color premultiplied by brightness, render-specular flag in w.
-                // The strength texels hold plain sqrt(saturate(attenuation) * visibility); lights that
-                // look far dimmer than their surroundings in baked cubemaps (like the "light_disabled"
-                // prefabs) are scripted to raise their brightness at runtime, not scaled at load.
-                var premultipliedColor = ColorSpace.SrgbGammaToLinear(light.Color) * light.Brightness * light.BrightnessScale;
+                // Stationary lights also carry the scale of their baked strengths; lights that look far
+                // dimmer than their surroundings in baked cubemaps (like the "light_disabled" prefabs)
+                // are scripted to raise their brightness at runtime, not scaled at load.
+                var premultipliedColor = ColorSpace.SrgbGammaToLinear(light.Color) * light.Brightness * light.BrightnessScale * light.StyleBrightness * colorScale;
                 LightingData.LightColor_Brightness[index] = new Vector4(premultipliedColor, light.RenderSpecular ? 1f : 0f);
 
                 // zw carry the remaining render gates (diffuse, transmissive); specular sits in the color
@@ -468,21 +452,18 @@ namespace ValveResourceFormat.Renderer.World
                         MathF.Cos(float.DegreesToRadians(light.SpotOuterAngle)),
                         diffuseGate, transmissiveGate);
 
-                // g_vSingleLightFalloffParams. The shader evaluates 1 / (x * d + y * d^2) in world units,
-                // so the coefficients carry the range normalization: the entity's attenuation is stated
-                // over the light's range, not per unit. Without it a quadratic light is 1/d^2 with no
-                // scale, which is black everywhere past a couple of units. The bias then makes the curve
-                // reach zero exactly at the range, where the normalized distance is 1.
-                var invRange = light.Range > 0f ? 1f / light.Range : 0f;
-                var falloffAtRange = light.AttenuationLinear + light.AttenuationQuadratic;
+                // g_vSingleLightFalloffParams: the raw linear and quadratic terms, as the shader evaluates
+                // saturate(1 / (x * d + y * d^2) - w) in world units before the color, which carries the
+                // q*10000 + l*100 + c scale. The bias w brings the curve to zero at the range; a light with a
+                // constant term gets none.
+                // TODO: light_ortho packs other values here, with no distance limit in z
+                var linear = light.AttenuationLinear;
+                var quadratic = light.AttenuationQuadratic;
+                var hasBias = light.AttenuationConstant == 0f && range > 0f;
+                var falloffAtRange = (quadratic * range * range) + (linear * range) + 1.1920929e-7f;
 
-                LightingData.LightFallOff[index] = new Vector4(
-                    light.AttenuationLinear * invRange,
-                    light.AttenuationQuadratic * invRange * invRange,
-                    light.Range * light.Range,
-                    falloffAtRange > 0f ? 1f / falloffAtRange : 0f);
+                LightingData.LightFallOff[index] = new Vector4(linear, quadratic, range * range, hasBias ? 1f / falloffAtRange : 0f);
             }
-
 
             foreach (var light in lights)
             {
@@ -494,7 +475,7 @@ namespace ValveResourceFormat.Renderer.World
                 }
 
                 var index = (uint)light.StationaryLightIndex;
-                AddLight(light, index);
+                AddLight(light, index, light.BakedStrengthScale);
 
                 LightingData.StaticLightCount = Math.Max(LightingData.StaticLightCount, index + 1);
             }
@@ -519,19 +500,19 @@ namespace ValveResourceFormat.Renderer.World
             {
                 if (currentLightIndex >= LightingConstants.MAX_LIGHTS)
                 {
-                    scene.RendererContext.Logger.LogWarning("Too many lights in scene. Some lights were removed");
+                    if (!WarnedAboutTooManyLights)
+                    {
+                        WarnedAboutTooManyLights = true;
+                        scene.RendererContext.Logger.LogWarning("Too many lights in scene. Some lights were removed");
+                    }
+
                     break;
                 }
 
-                AddLight(light, currentLightIndex++);
+                AddLight(light, currentLightIndex++, light.AttenuationColorScale);
             }
 
             LightingData.DynamicLightCount = currentLightIndex;
-
-            scene.RendererContext.Logger.LogDebug(
-                "Lightmap version {Major}.{Minor}: {Stationary} stationary and {Dynamic} per-pixel lights of {Total} light entities",
-                LightmapVersionNumber, LightmapGameVersionNumber, LightingData.StaticLightCount,
-                currentLightIndex - LightingData.StaticLightCount, lights.Count);
 
             var envLight = lights.FirstOrDefault(static l => l.Entity == SceneLight.EntityType.Environment);
             if (envLight != null)
@@ -544,21 +525,183 @@ namespace ValveResourceFormat.Renderer.World
         /// <summary>Points the sun uniforms at the given Euler angles, keeping the sun color.</summary>
         public void SetSunDirectionFromAngles(Vector3 angles)
         {
-            LightingData.SunDirection = new Vector4(-EntityTransformHelper.EulerAnglesToForwardDirection(angles), 0f);
+            LightingData.SunDirection = new Vector4(-EntityTransformHelper.EulerAnglesToForwardDirection(angles), LightingData.SunDirection.W);
+            UpdateAmbientLighting();
         }
 
         /// <summary>
+        /// Fills the ambient lighting with a sky color that fades into a ground color over the hemisphere, for
+        /// scenes without an environment light of their own.
+        /// </summary>
+        /// <param name="sky">Linear color of the ambient lighting facing up.</param>
+        /// <param name="ground">Linear color of the ambient lighting facing down.</param>
+        public void SetHemisphereAmbientLighting(Vector3 sky, Vector3 ground)
+        {
+            skyLight = sky;
+            groundLight = ground;
+            UpdateAmbientLighting();
+        }
+
+        private Vector3 skyLight;
+        private Vector3? groundLight;
+        private Vector3 skyAmbientBounce;
+
+        /// <summary>
+        /// Rebuilds the ambient lighting that fills in where no light probe volume reaches: the sky from
+        /// above, and the sun and sky the ground bounces back from below. It only varies with height.
+        /// </summary>
+        private void UpdateAmbientLighting()
+        {
+            if (groundLight is { } ground)
+            {
+                var skyVertical = (skyLight - ground) * 0.5f;
+                var skyConstant = (skyLight + ground) * 0.5f;
+
+                LightingData.AmbientLightingSHR = new Vector4(0f, 0f, skyVertical.X, skyConstant.X);
+                LightingData.AmbientLightingSHG = new Vector4(0f, 0f, skyVertical.Y, skyConstant.Y);
+                LightingData.AmbientLightingSHB = new Vector4(0f, 0f, skyVertical.Z, skyConstant.Z);
+                return;
+            }
+
+            var sunDown = -LightingData.SunDirection.Z;
+            var sunBounce = LightingData.SunColor.AsVector3() * skyAmbientBounce * 0.5f;
+            var skyBounce = skyLight * skyAmbientBounce * 0.5f;
+
+            var vertical = (skyLight * 0.5f) - skyBounce + (sunBounce * sunDown);
+            var constant = (skyLight * 0.5f) + skyBounce + (sunBounce * MathF.Abs(sunDown));
+
+            LightingData.AmbientLightingSHR = new Vector4(0f, 0f, vertical.X, constant.X);
+            LightingData.AmbientLightingSHG = new Vector4(0f, 0f, vertical.Y, constant.Y);
+            LightingData.AmbientLightingSHB = new Vector4(0f, 0f, vertical.Z, constant.Z);
+        }
+
+        /// <summary>
+        /// Gets the roughness the highlight of the sun is no sharper than. Only CS2 keeps the sun from shining as a
+        /// point; the other games leave its highlight as sharp as the material is.
+        /// </summary>
+        /// <param name="lightMinRoughness">The minimum roughness the light itself asks for.</param>
+        /// <returns>The minimum roughness, zero where it does not apply.</returns>
+        public float GetSunMinRoughness(float lightMinRoughness = SceneLight.MinSpecularRoughness)
+            => scene.RendererContext.FileLoader.GameInfo.Game == Game.Csgo
+                ? MathF.Max(SceneLight.MinSpecularRoughness, lightMinRoughness)
+                : 0f;
+
+        /// <summary>
         /// Stores the environment light into the dedicated sun uniforms, which work across all
-        /// lightmap versions like the HLVR sun fast path. The baked shadow data is the V2 one-hot
-        /// channel mask, or the sun's baked light index in X for V1.
+        /// lightmap versions. The baked shadow data is the V2 one-hot channel mask, or the sun's
+        /// baked light index in X for V1.
         /// </summary>
         private void StoreSunLight(SceneLight envLight, Vector4 bakedShadowData)
         {
-            var premultipliedColor = ColorSpace.SrgbGammaToLinear(envLight.Color) * envLight.Brightness * envLight.BrightnessScale;
+            var brightness = envLight.Brightness * envLight.BrightnessScale * envLight.StyleBrightness;
+            var premultipliedColor = ColorSpace.SrgbGammaToLinear(envLight.Color) * brightness;
 
-            LightingData.SunDirection = new Vector4(-envLight.Direction, 0f);
+            LightingData.SunDirection = new Vector4(-envLight.Direction, GetSunMinRoughness(envLight.MinRoughness));
             LightingData.SunColor = new Vector4(premultipliedColor, envLight.RenderSpecular ? 1f : 0f);
             LightingData.SunLightBakedShadowMask = bakedShadowData;
+
+            skyLight = ColorSpace.SrgbGammaToLinear(envLight.SkyColor) * envLight.SkyIntensity;
+            groundLight = envLight.GroundColor is { } groundColor
+                ? ColorSpace.SrgbGammaToLinear(groundColor) * envLight.SkyIntensity
+                : null;
+            skyAmbientBounce = ColorSpace.SrgbGammaToLinear(envLight.SkyAmbientBounce);
+            UpdateAmbientLighting();
+
+            var ambientDirectionColor = ColorSpace.SrgbGammaToLinear(envLight.AmbientDirectionColor) * envLight.AmbientDirectionIntensity;
+            LightingData.AmbientDirection_ShadowAmount = new Vector4(envLight.AmbientDirection, envLight.AmbientShadowAmount);
+            LightingData.AmbientDirectionColor = new Vector4(ambientDirectionColor, 0f);
+
+            // The independent part of the highlight is scaled like the sun, the rest only by the light falling on the albedo
+            var specularColor = ColorSpace.SrgbGammaToLinear(envLight.SpecularColor);
+            var specularIndependence = MathUtils.Saturate(envLight.SpecularIndependence);
+            LightingData.SpecularDirection_Power = new Vector4(envLight.SpecularDirection, envLight.SpecularPower);
+            LightingData.SpecularAlbedoColor = new Vector4(specularColor * (1f - specularIndependence), 0f);
+            LightingData.SpecularLitColor = new Vector4(specularColor * specularIndependence * brightness, 0f);
+
+            LastStaticSunCascade = GetLastStaticSunCascade(envLight);
+            IsSunShadowBaked = envLight.HasMixedShadows;
+
+            HasOwnSun = true;
+            isSunBorrowed = false;
+        }
+
+        private int GetLastStaticSunCascade(SceneLight envLight)
+        {
+            if (!envLight.HasMixedShadows)
+            {
+                return int.MaxValue;
+            }
+
+            // CS2 ignores the light's key and renders static objects into every cascade at its high shadow quality settings
+            if (scene.RendererContext.FileLoader.GameInfo.Game == Game.Csgo)
+            {
+                return int.MaxValue;
+            }
+
+            return envLight.CascadeRenderStaticObjects;
+        }
+
+        /// <summary>
+        /// Gets the last sun shadow cascade that static objects cast into, -1 for none. With mixed shadows the
+        /// lightmap holds their sun shadows, so only the nearest cascades redraw them.
+        /// </summary>
+        public int LastStaticSunCascade { get; private set; } = int.MaxValue;
+
+        /// <summary>Gets whether the map's own sun is a mixed light, so the lightmap holds the sun shadows of static geometry.</summary>
+        public bool IsSunShadowBaked { get; private set; }
+
+        /// <summary>Gets whether the source map has an environment light.</summary>
+        public bool HasOwnSun { get; private set; }
+
+        private bool isSunBorrowed;
+
+        /// <summary>Uses the sun from <paramref name="donor"/> when this map has none, or clears it when <paramref name="donor"/> is <see langword="null"/>.</summary>
+        public void BorrowSun(WorldLightingInfo? donor)
+        {
+            if (HasOwnSun)
+            {
+                return;
+            }
+
+            if (donor == null)
+            {
+                if (isSunBorrowed)
+                {
+                    LightingData.SunDirection = Vector4.Zero;
+                    LightingData.SunColor = Vector4.Zero;
+                    LightingData.AmbientLightingSHR = Vector4.Zero;
+                    LightingData.AmbientLightingSHG = Vector4.Zero;
+                    LightingData.AmbientLightingSHB = Vector4.Zero;
+                    LightingData.AmbientDirection_ShadowAmount = Vector4.Zero;
+                    LightingData.AmbientDirectionColor = Vector4.Zero;
+                    LightingData.SpecularDirection_Power = Vector4.Zero;
+                    LightingData.SpecularAlbedoColor = Vector4.Zero;
+                    LightingData.SpecularLitColor = Vector4.Zero;
+                    LastStaticSunCascade = int.MaxValue;
+                    isSunBorrowed = false;
+                }
+
+                return;
+            }
+
+            LightingData.SunDirection = donor.LightingData.SunDirection;
+            LightingData.SunColor = donor.LightingData.SunColor;
+            LightingData.AmbientLightingSHR = donor.LightingData.AmbientLightingSHR;
+            LightingData.AmbientLightingSHG = donor.LightingData.AmbientLightingSHG;
+            LightingData.AmbientLightingSHB = donor.LightingData.AmbientLightingSHB;
+            LightingData.AmbientDirection_ShadowAmount = donor.LightingData.AmbientDirection_ShadowAmount;
+            LightingData.AmbientDirectionColor = donor.LightingData.AmbientDirectionColor;
+            LightingData.SpecularDirection_Power = donor.LightingData.SpecularDirection_Power;
+            LightingData.SpecularAlbedoColor = donor.LightingData.SpecularAlbedoColor;
+            LightingData.SpecularLitColor = donor.LightingData.SpecularLitColor;
+
+            // The borrowed sun is the same light, so the same cascades take static objects
+            LastStaticSunCascade = donor.LastStaticSunCascade;
+
+            // These lightmaps have no sun baked in, so nothing is in baked shadow
+            LightingData.SunLightBakedShadowMask = new Vector4(-1f, 0f, 0f, 0f);
+
+            isSunBorrowed = true;
         }
 
         /// <summary>
@@ -575,6 +718,7 @@ namespace ValveResourceFormat.Renderer.World
             }
 
             LightingData.NumBarnLights = 0; // changed dynamically
+            BarnLights.Clear();
 
             var filtered = lights.Where(SceneLight.IsRealTimeLight).ToList();
             if (filtered.Count == 0)
@@ -603,13 +747,25 @@ namespace ValveResourceFormat.Renderer.World
             BarnLightShadowAtlasSize = atlasSize;
             LightingData.NumBarnLights = 0;
 
-            scene.LightBinner.PollBarnLightVisibility();
+            var binner = scene.ShadingLightBinner;
+            binner?.PollBarnLightVisibility();
 
             ShadowMapper.Bin(BarnLights, camera, atlasSize, BarnLightCookiePaths,
-                scene.LightBinner.VisibilitySequence);
+                binner?.VisibilitySequence ?? 0);
 
-            foreach (ref readonly var binned in ShadowMapper.BinnedLights)
+            var tanHalfHorizontalFov = MathF.Tan(camera.GetFOV() * 0.5f) * camera.AspectRatio;
+            var binnedLights = ShadowMapper.BinnedLights;
+
+            if (BarnLightSortKeys.Length < binnedLights.Length)
             {
+                BarnLightSortKeys = new BarnLightSortKey[binnedLights.Length];
+            }
+
+            var keyCount = 0;
+
+            for (var binnedIndex = 0; binnedIndex < binnedLights.Length; binnedIndex++)
+            {
+                ref readonly var binned = ref binnedLights[binnedIndex];
                 var light = binned.Light;
 
                 // Wanted shadows but got no placements, don't render the light.
@@ -624,20 +780,47 @@ namespace ValveResourceFormat.Renderer.World
                     continue;
                 }
 
-                if (LightingData.NumBarnLights + light.BarnFaces.Length > BarnLightConstants.MAX_BARN_LIGHTS)
-                {
-                    if (!light.WasDropped)
-                    {
-                        light.WasDropped = true;
-                        scene.RendererContext.Logger.LogWarning(
-                            "Max barn light count ({Max}) reached, dropping light '{LightName}'",
-                            BarnLightConstants.MAX_BARN_LIGHTS, light.Name);
-                    }
+                // Lights and their shadows fade out as they get small on screen
+                var screenSize = light.ComputeScreenSize(camera.Location, tanHalfHorizontalFov);
+                var (lightFade, shadowFade) = light.ComputeScreenSizeFades(screenSize);
 
+                if (lightFade <= 0f)
+                {
                     continue;
                 }
 
+                var faceColor = light.BarnFaces[0].GpuData.BarnLightColor_flCookie.AsVector3();
+
+                BarnLightSortKeys[keyCount++] = new BarnLightSortKey
+                {
+                    BinnedIndex = binnedIndex,
+                    ScreenSize = screenSize,
+                    DistanceSquared = Vector3.DistanceSquared(camera.Location, light.BoundsCenter),
+                    Luminance = MathUtils.Luminance(faceColor),
+                    Facing = Vector3.Dot(camera.Forward, light.Direction),
+                    LightFade = lightFade,
+                    ShadowFade = shadowFade,
+                };
+            }
+
+            var sortedKeys = BarnLightSortKeys.AsSpan(0, keyCount);
+            sortedKeys.Sort();
+
+            // Past the cap the least important lights are dropped silently, counted per light while the
+            // buffers below hold one entry per face
+            var keptKeys = sortedKeys[..Math.Min(keyCount, BarnLightConstants.MAX_BARN_LIGHTS)];
+
+            foreach (var key in keptKeys)
+            {
+                ref readonly var binned = ref binnedLights[key.BinnedIndex];
+                var light = binned.Light;
+
+                var lightFade = key.LightFade;
+                var shadowFade = key.ShadowFade;
+                var colorScale = lightFade * light.StyleBrightness;
+
                 var anyFaceDropped = false;
+                var hasRangeCutoff = light.UsesOmni2Faces && light.FallOff > 0f;
 
                 for (var faceIndex = 0; faceIndex < light.BarnFaces.Length; faceIndex++)
                 {
@@ -661,10 +844,10 @@ namespace ValveResourceFormat.Renderer.World
                         }
 
                         data.BarnLightShadowOffsetScale = placement.OffsetScale;
-                        data.BarnLightShadowScale = 1.0f;
+                        data.BarnLightShadowScale = shadowFade;
                     }
 
-                    var hasRangeCutoff = light.Entity == SceneLight.EntityType.Omni2 && light.FallOff > 0f;
+                    data.BarnLightColor_flCookie *= new Vector4(colorScale, colorScale, colorScale, 1f);
 
                     BinnedBarnLightFaceSlots[LightingData.NumBarnLights] = new BarnLightFaceSlot(light, faceIndex);
 
@@ -687,15 +870,6 @@ namespace ValveResourceFormat.Renderer.World
             BarnLightStorageBuffer?.Update(BinnedBarnLightGpuData, 0, binnedCount * Unsafe.SizeOf<BarnLightConstants>());
         }
 
-        /// <summary>Clears cached shadow map data for all registered barn lights.</summary>
-        public void ClearBarnShadowCache()
-        {
-            foreach (var light in BarnLights)
-            {
-                Scene.ClearShadowCache(light);
-            }
-        }
-
         private void RebuildCookieAtlas()
         {
             BarnLightCookieAtlas?.Delete();
@@ -715,7 +889,7 @@ namespace ValveResourceFormat.Renderer.World
 
             if (cookieTextures.Count > 0)
             {
-                using var _ = scene.RendererContext.RenderState.Scope();
+                using var _ = GraphicsContext.RenderState.Scope();
                 BarnLightCookieAtlas = BuildCookieAtlas(cookieTextures);
             }
         }
@@ -726,8 +900,7 @@ namespace ValveResourceFormat.Renderer.World
         /// </summary>
         private static RenderTexture CreateDefaultCookieAtlas()
         {
-            var atlas = new RenderTexture(TextureTarget.Texture2DArray, 1, 1, 1, 1, "EmptyCookieAtlas");
-            GL.TextureStorage3D(atlas.Handle, 1, SizedInternalFormat.Srgb8Alpha8, 1, 1, 1);
+            var atlas = RenderTexture.Create3D(TextureTarget.Texture2DArray, 1, 1, 1, ImageFormat.RGBA8888, 1, "EmptyCookieAtlas", srgb: true);
             GL.TextureSubImage3D(atlas.Handle, 0, 0, 0, 0, 1, 1, 1, PixelFormat.Rgba, PixelType.UnsignedByte, new byte[] { 255, 255, 255, 255 });
 
             return atlas;
@@ -743,16 +916,10 @@ namespace ValveResourceFormat.Renderer.World
 
             var numLayers = textures.Count + 1;
 
-            var atlas = new RenderTexture(TextureTarget.Texture2DArray, atlasSize, atlasSize, numLayers, 1, "CookieAtlas");
-            GL.TextureStorage3D(atlas.Handle, 1, SizedInternalFormat.Srgb8Alpha8, atlasSize, atlasSize, numLayers);
+            var atlas = RenderTexture.Create3D(TextureTarget.Texture2DArray, atlasSize, atlasSize, numLayers, ImageFormat.RGBA8888, 1, "CookieAtlas", srgb: true);
 
-            GL.CreateFramebuffers(1, out int readFbo);
-            GL.CreateFramebuffers(1, out int drawFbo);
-
-#if DEBUG
-            GL.ObjectLabel(ObjectLabelIdentifier.Framebuffer, readFbo, 18, "CookieAtlasBlitSrc");
-            GL.ObjectLabel(ObjectLabelIdentifier.Framebuffer, drawFbo, 18, "CookieAtlasBlitDst");
-#endif
+            var readFbo = GraphicsDevice.CreateFramebuffer("CookieAtlasBlitSrc");
+            var drawFbo = GraphicsDevice.CreateFramebuffer("CookieAtlasBlitDst");
 
             // First layer is full white
             GL.NamedFramebufferTextureLayer(drawFbo, FramebufferAttachment.ColorAttachment0, atlas.Handle, 0, 0);
@@ -779,32 +946,21 @@ namespace ValveResourceFormat.Renderer.World
 
         private void CreateCookieSamplers()
         {
-            GL.CreateSamplers(1, out CookieSamplerClampBorder);
+            var clampBorder = new Sampler(nameof(CookieSamplerClampBorder));
+            clampBorder.SetWrapMode(RsTextureAddressMode.Border, RsTextureAddressMode.Border);
+            clampBorder.SetFiltering(TextureMinFilter.Linear, TextureMagFilter.Linear);
+            CookieSamplerClampBorder = clampBorder.Handle;
 
-#if DEBUG
-            GL.ObjectLabel(ObjectLabelIdentifier.Sampler, CookieSamplerClampBorder, nameof(CookieSamplerClampBorder).Length, nameof(CookieSamplerClampBorder));
-#endif
-
-            GL.SamplerParameter(CookieSamplerClampBorder, SamplerParameterName.TextureWrapS, (int)TextureWrapMode.ClampToBorder);
-            GL.SamplerParameter(CookieSamplerClampBorder, SamplerParameterName.TextureWrapT, (int)TextureWrapMode.ClampToBorder);
-            GL.SamplerParameter(CookieSamplerClampBorder, SamplerParameterName.TextureMinFilter, (int)TextureMinFilter.Linear);
-
-            GL.CreateSamplers(1, out CookieSamplerWrap);
-
-#if DEBUG
-            GL.ObjectLabel(ObjectLabelIdentifier.Sampler, CookieSamplerWrap, nameof(CookieSamplerWrap).Length, nameof(CookieSamplerWrap));
-#endif
-
-            GL.SamplerParameter(CookieSamplerWrap, SamplerParameterName.TextureWrapS, (int)TextureWrapMode.Repeat);
-            GL.SamplerParameter(CookieSamplerWrap, SamplerParameterName.TextureWrapT, (int)TextureWrapMode.Repeat);
-            GL.SamplerParameter(CookieSamplerWrap, SamplerParameterName.TextureMinFilter, (int)TextureMinFilter.Linear);
+            var wrap = new Sampler(nameof(CookieSamplerWrap));
+            wrap.SetWrapMode(RsTextureAddressMode.Wrap, RsTextureAddressMode.Wrap);
+            wrap.SetFiltering(TextureMinFilter.Linear, TextureMagFilter.Linear);
+            CookieSamplerWrap = wrap.Handle;
         }
 
         /// <summary>Allocates the GPU storage buffer used to pass barn light data to shaders.</summary>
         public void CreateBarnLightBuffer()
         {
-            BarnLightStorageBuffer ??= StorageBuffer.Allocate<BarnLightConstants>(
-                ReservedBufferSlots.BarnLights, nameof(ReservedBufferSlots.BarnLights), BarnLightConstants.MAX_BARN_LIGHTS, BufferUsageHint.DynamicDraw);
+            BarnLightStorageBuffer ??= StorageBuffer.Allocate<BarnLightConstants>(ReservedBufferSlots.BarnLights, nameof(ReservedBufferSlots.BarnLights), BarnLightConstants.MAX_BARN_LIGHT_FACES, BufferUsage.Dynamic);
         }
 
         /// <summary>Binds the barn light storage buffer to its reserved shader slot.</summary>

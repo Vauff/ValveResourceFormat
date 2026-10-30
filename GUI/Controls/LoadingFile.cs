@@ -1,4 +1,3 @@
-using System;
 using System.Drawing;
 using System.IO;
 using System.Windows.Forms;
@@ -25,10 +24,24 @@ namespace GUI.Controls
                 AddLargeIcon(fileName);
             }
 
-            // The panel auto-sizes to fit the file name label. Anchor=None only keeps it centered when the
-            // parent resizes, not when the panel itself grows, so a long file name would push it off center.
-            // Re-center it ourselves whenever its size changes.
+            // Anchor=None only centers on parent resize, not when a long file name grows the panel,
+            // so re-center whenever its size changes.
             tableLayoutPanel1.SizeChanged += (_, _) => CenterContent();
+        }
+
+        /// <summary>
+        /// Says what the file is waiting on under its name, or takes the line away again when passed null.
+        /// </summary>
+        public void SetStatus(string? status)
+        {
+            if (IsDisposed)
+            {
+                return;
+            }
+
+            statusLabel.Text = status;
+            statusLabel.Visible = !string.IsNullOrEmpty(status);
+            statusLabel.Update();
         }
 
         protected override void OnLayout(LayoutEventArgs levent)
@@ -63,11 +76,14 @@ namespace GUI.Controls
                 Margin = new Padding(4, 0, 4, 8),
             };
 
-            // Insert a new top row for the icon and push the label/progress bar down into the rows below it.
-            tableLayoutPanel1.RowCount = 3;
+            tableLayoutPanel1.RowCount++;
             tableLayoutPanel1.RowStyles.Insert(0, new RowStyle(SizeType.AutoSize));
-            tableLayoutPanel1.SetRow(label1, 1);
-            tableLayoutPanel1.SetRow(progressBar1, 2);
+
+            foreach (Control control in tableLayoutPanel1.Controls)
+            {
+                tableLayoutPanel1.SetRow(control, tableLayoutPanel1.GetRow(control) + 1);
+            }
+
             tableLayoutPanel1.Controls.Add(iconBox, 0, 0);
         }
 
@@ -75,11 +91,12 @@ namespace GUI.Controls
         {
             base.OnCreateControl();
 
-
             BackColor = Themer.CurrentThemeColors.AppMiddle;
             ForeColor = Themer.CurrentThemeColors.Contrast;
 
             label1.BackColor = Themer.CurrentThemeColors.AppMiddle;
+            statusLabel.BackColor = Themer.CurrentThemeColors.AppMiddle;
+            statusLabel.ForeColor = Themer.CurrentThemeColors.ContrastSoft;
             progressBar1.BackColor = Themer.CurrentThemeColors.AppMiddle;
             tableLayoutPanel1.BackColor = Themer.CurrentThemeColors.AppMiddle;
 

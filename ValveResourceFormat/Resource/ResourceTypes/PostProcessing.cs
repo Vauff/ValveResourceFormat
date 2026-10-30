@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using ValveKeyValue;
 using ValveResourceFormat.Serialization.KeyValues;
 
@@ -7,6 +6,7 @@ namespace ValveResourceFormat.ResourceTypes
     /// <summary>
     /// Represents a post-processing resource.
     /// </summary>
+    /// <seealso href="https://s2v.app/SchemaExplorer/cs2/materialsystem2/PostProcessingResource_t">PostProcessingResource_t</seealso>
     public class PostProcessing : KeyValuesOrNTRO
     {
         /// <summary>
@@ -97,8 +97,8 @@ namespace ValveResourceFormat.ResourceTypes
         /// </summary>
         public byte[] GetRAWData()
         {
-            var lut = GetColorCorrectionLUT().Clone() as byte[];
-            Debug.Assert(lut != null);
+            var lut = GetColorCorrectionLUT();
+            var raw = new byte[lut.Length - lut.Length / 4];
 
             var j = 0;
             for (var i = 0; i < lut.Length; i++)
@@ -109,10 +109,10 @@ namespace ValveResourceFormat.ResourceTypes
                     continue;
                 }
 
-                lut[j++] = lut[i];
+                raw[j++] = lut[i];
             }
 
-            return lut[..j];
+            return raw;
         }
 
         /// <summary>
@@ -120,8 +120,10 @@ namespace ValveResourceFormat.ResourceTypes
         /// </summary>
         public string ToValvePostProcessing(bool preloadLookupTable = false, string lutFileName = "")
         {
-            var outKV3 = new KVObject();
-            outKV3.Add("_class", "CPostProcessData");
+            var outKV3 = new KVObject
+            {
+                { "_class", "CPostProcessData" }
+            };
 
             var layers = KVObject.Array();
 

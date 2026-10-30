@@ -26,8 +26,8 @@ namespace ValveResourceFormat.Renderer.Buffers
         public uint ProjectionType;
         /// <summary>Tint color applied to the environment map.</summary>
         public Vector3 Color;
-        /// <summary>Index of the associated light probe volume.</summary>
-        public uint AssociatedLPV;
+        /// <summary>Shader index of the light probe volume sharing this probe's handshake, -1 when there is none.</summary>
+        public int AssociatedLPV;
         /// <summary>Spherical harmonics normalization coefficients.</summary>
         public Vector4 NormalizationSH;
     }
@@ -39,7 +39,7 @@ namespace ValveResourceFormat.Renderer.Buffers
     public class EnvMapArray
     {
         /// <summary>Maximum number of environment map probes supported per scene.</summary>
-        public const int MAX_ENVMAPS = 144;
+        public const int MAX_ENVMAPS = 320;
 
         /// <summary>Array of environment map probe data entries.</summary>
         [MarshalAs(UnmanagedType.ByValArray, SizeConst = MAX_ENVMAPS)]

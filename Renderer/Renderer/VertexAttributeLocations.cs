@@ -1,5 +1,4 @@
 using System.Collections.Frozen;
-using System.Diagnostics.CodeAnalysis;
 using System.Linq;
 using System.Reflection;
 using ValveResourceFormat.Blocks;
@@ -62,8 +61,8 @@ namespace ValveResourceFormat.Renderer
         [VertexAttributeName("vTANGENT", Semantic = "TANGENT")]
         Tangent,
 
-        /// <summary>Vertex color.</summary>
-        [VertexAttributeName("vCOLOR", Semantic = "COLOR")]
+        /// <summary>Vertex color, or the vertex paint tint that some materials read from a texcoord stream.</summary>
+        [VertexAttributeName("vCOLOR", "vVertexColor", Semantic = "COLOR")]
         Color,
 
         /// <summary>Secondary texture coordinates.</summary>
@@ -90,8 +89,9 @@ namespace ValveResourceFormat.Renderer
         [VertexAttributeName("vLightmapUV", "vLightmapUVW")]
         LightmapUV,
 
-        /// <summary>Baked per vertex lighting, the second color stream.</summary>
-        [VertexAttributeName("vCOLOR1", "vPerVertexLighting", Semantic = "COLOR", SemanticIndex = 1)]
+        /// <summary>Baked per vertex lighting, the second color stream. Particle trails put their uv flip and
+        /// crop here.</summary>
+        [VertexAttributeName("vCOLOR1", "vPerVertexLighting", "vTrailUvCrop", Semantic = "COLOR", SemanticIndex = 1)]
         Color1,
 
         /// <summary>Spelling some meshes use for the weight stream.</summary>

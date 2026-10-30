@@ -41,6 +41,9 @@ namespace GUI.Utils
             /// <summary>For anything that needs to be accented</summary>
             public required Color Accent { get; init; }
 
+            /// <summary>Background for items that must draw attention, like a pending update. Text on it is white.</summary>
+            public required Color Attention { get; init; }
+
             /// <summary>Sets special windows flags on forms which changes some otherwise unthemeable portions to dark/light</summary>
             public required SystemColorMode ColorMode { get; init; }
         }
@@ -69,6 +72,7 @@ namespace GUI.Utils
 
             HoverAccent = Color.FromArgb(0, 66, 151),
             Accent = Color.FromArgb(99, 161, 255),
+            Attention = Color.FromArgb(214, 55, 55),
 
             ColorMode = SystemColorMode.Dark,
         };
@@ -89,6 +93,7 @@ namespace GUI.Utils
 
             HoverAccent = Color.FromArgb(140, 191, 255),
             Accent = Color.FromArgb(99, 161, 255),
+            Attention = Color.FromArgb(200, 40, 40),
 
             ColorMode = SystemColorMode.Classic,
         };
@@ -129,6 +134,8 @@ namespace GUI.Utils
             control.ResumeLayout(true);
         }
 
+        private static readonly Dictionary<Type, PropertyInfo?> BorderStyleProperties = [];
+
         private static void ThemeControlInternal(Control control)
         {
             if (control is ExplorerControl or TreeViewWithSearchResults)
@@ -136,7 +143,13 @@ namespace GUI.Utils
                 return;
             }
 
-            var borderStyleInfo = control.GetType().GetProperty("BorderStyle");
+            var controlType = control.GetType();
+            if (!BorderStyleProperties.TryGetValue(controlType, out var borderStyleInfo))
+            {
+                borderStyleInfo = controlType.GetProperty("BorderStyle");
+                BorderStyleProperties[controlType] = borderStyleInfo;
+            }
+
             if (borderStyleInfo != null)
             {
                 var borderStyle = (BorderStyle?)borderStyleInfo.GetValue(control);
@@ -298,7 +311,9 @@ namespace GUI.Utils
             if (control is TreeView treeView)
             {
                 treeView.BorderStyle = BorderStyle.None;
-                treeView.BackColor = CurrentThemeColors.AppSoft;
+
+                // A tree of check boxes sits among the checked lists of a viewer's controls, and takes their color
+                treeView.BackColor = treeView is GLViewerTreeSelectionControl.CompactTreeView ? CurrentThemeColors.AppMiddle : CurrentThemeColors.AppSoft;
                 treeView.ForeColor = CurrentThemeColors.Contrast;
                 treeView.LineColor = CurrentThemeColors.Border;
             }
@@ -504,9 +519,25 @@ namespace GUI.Utils
             }
         }
 
+        protected override void OnRenderMenuItemBackground(ToolStripItemRenderEventArgs e)
+        {
+            if (e.Item is ThemedToolStripMenuItem { Highlighted: true, Enabled: true, Selected: false, Pressed: false })
+            {
+                using var brush = new SolidBrush(Themer.CurrentThemeColors.Attention);
+                e.Graphics.FillRectangle(brush, new Rectangle(Point.Empty, e.Item.Size));
+                return;
+            }
+
+            base.OnRenderMenuItemBackground(e);
+        }
+
         protected override void OnRenderItemText(ToolStripItemTextRenderEventArgs e)
         {
-            if (e.Item.Enabled)
+            if (e.Item is ThemedToolStripMenuItem { Highlighted: true, Enabled: true, Selected: false, Pressed: false })
+            {
+                e.TextColor = Color.White;
+            }
+            else if (e.Item.Enabled)
             {
                 e.TextColor = Themer.CurrentThemeColors.Contrast;
             }

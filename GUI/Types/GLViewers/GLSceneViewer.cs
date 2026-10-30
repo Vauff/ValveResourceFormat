@@ -9,11 +9,16 @@ using GUI.Utils;
 using OpenTK.Graphics.OpenGL;
 using ValveResourceFormat.Renderer;
 using ValveResourceFormat.Renderer.Audio;
+using ValveResourceFormat.Renderer.Editor;
+using ValveResourceFormat.Renderer.Editor.Entities;
+using ValveResourceFormat.Renderer.Editor.Picking;
+using ValveResourceFormat.Renderer.Editor.Selection;
+using ValveResourceFormat.Renderer.Editor.ToolRender;
 using ValveResourceFormat.Renderer.Input;
 using ValveResourceFormat.Renderer.Materials;
+using ValveResourceFormat.Renderer.SceneEnvironment;
 using ValveResourceFormat.Renderer.SceneNodes;
 using ValveResourceFormat.Renderer.Utils;
-using static ValveResourceFormat.Renderer.PickingTexture;
 
 namespace GUI.Types.GLViewers
 {
@@ -23,13 +28,19 @@ namespace GUI.Types.GLViewers
         public UserInput Input { get; protected set; }
 
         public ValveResourceFormat.Renderer.TextRenderer TextRenderer { get; protected set; }
+        private readonly CrosshairRenderer crosshairRenderer;
 
-        protected PickingTexture? Picker { get; set; }
+        protected internal ScenePicker? Picker { get; private set; }
+
+        /// <summary>The nodes selected in this viewer, drawn with an outline and helpers.</summary>
+        protected internal SelectionSet Selection { get; } = new();
+
+        /// <summary>Text drawn in the top-left corner of the viewport, such as stats for the selection.</summary>
+        protected ValveResourceFormat.Renderer.TextRenderer.TextMemory ScreenDebugText { get; set; }
 
         protected QuadOverdraw? QuadOverdrawRenderer { get; set; }
 
         public Scene Scene { get; }
-        public Scene? SkyboxScene => Renderer.SkyboxScene;
         public VrfGuiContext GuiContext;
 
         /// <summary>Optional sound event player, created by viewers that play scene audio.</summary>
@@ -58,6 +69,7 @@ namespace GUI.Types.GLViewers
         private bool showStaticOctree;
         private bool showDynamicOctree;
         private bool showVisDebug;
+        protected bool ShowSpeed { get; set; }
         private bool showPhysicsTraces;
         private PhysicsTraceDebugRenderer? physicsTraceRenderer;
 
@@ -72,14 +84,30 @@ namespace GUI.Types.GLViewers
         private PerfDisplay perfDisplay;
         private ComboBox? perfDisplayComboBox;
 
-        /// <summary>Set by escape to release the mouse in walk mode, cleared by clicking back into the viewport.</summary>
-        private bool mouseReleased;
+        private volatile HashSet<string>? chosenLayers;
+        private volatile bool visibilityDirty;
+        private string? currentRenderMode;
+
+        /// <summary>Gets whether the viewer has its own switches for what of the tools is drawn.</summary>
+        protected virtual bool HasToolsVisibilityControls => false;
+
+        /// <summary>Gets the mode shown at the top of the viewport and its colour, or <see langword="null"/> to show none.</summary>
+        protected virtual (string Text, Color32 Color)? ModeLabel => null;
 
         private readonly List<RenderModes.RenderMode> renderModes = new(RenderModes.Items.Count);
         private int renderModeCurrentIndex;
         private ComboBox? renderModeComboBox;
+        private ComboBox? cubemapColorsComboBox;
+        private bool isCubemapsRenderMode;
         private InfiniteGrid? baseGrid;
-        protected SelectedNodeRenderer? SelectedNodeRenderer;
+        private SelectionVisuals? selectionVisuals;
+        private ToolsPass? toolsPass;
+
+        /// <summary>What tools-only content the view draws, which decides the tools materials the renderer draws.</summary>
+        protected ToolsVisibility Tools { get; } = new();
+
+        /// <summary>The editor entities of the view, which draw what Hammer shows of them.</summary>
+        protected HammerEntityVisuals EntityVisuals { get; }
 
         static readonly TimeSpan FpsUpdateTimeSpan = TimeSpan.FromSeconds(0.1);
 
@@ -103,7 +131,11 @@ namespace GUI.Types.GLViewers
 
             Renderer = new(rendererContext);
             Input = new UserInput(Renderer);
+            EntityVisuals = new HammerEntityVisuals(rendererContext.FileLoader, rendererContext.Logger);
+            Renderer.EntitySystem.ToolVisuals = EntityVisuals;
+            Renderer.Settings.DrawFilter = Tools;
             TextRenderer = new(rendererContext, Renderer.Camera);
+            crosshairRenderer = new CrosshairRenderer(rendererContext);
             Scene = Renderer.Scene;
 
 #if DEBUG
@@ -116,6 +148,15 @@ namespace GUI.Types.GLViewers
             // Delete GL resources before the base disposes the GL context
             physicsTraceRenderer?.Delete();
             physicsTraceRenderer = null;
+
+            selectionVisuals?.Delete();
+            selectionVisuals = null;
+
+            toolsPass?.Dispose();
+            toolsPass = null;
+
+            Picker?.Delete();
+            Picker = null;
 
             soundPlayer?.Dispose();
             soundPlayer = null;
@@ -132,6 +173,9 @@ namespace GUI.Types.GLViewers
 
             renderModeComboBox?.Dispose();
             renderModeComboBox = null;
+
+            cubemapColorsComboBox?.Dispose();
+            cubemapColorsComboBox = null;
 
 #if DEBUG
             ShaderHotReload.ShadersReloaded -= OnHotReload;
@@ -152,16 +196,52 @@ namespace GUI.Types.GLViewers
 
                 UiControl.AddCheckBox("Show Static Octree", showStaticOctree, (v) => showStaticOctree = v);
                 UiControl.AddCheckBox("Show Dynamic Octree", showDynamicOctree, (v) => showDynamicOctree = v);
-                UiControl.AddCheckBox("Show Tool Materials", Scene.ShowToolsMaterials, (v) =>
+                if (!HasToolsVisibilityControls)
                 {
-                    Scene.ShowToolsMaterials = v;
+                    UiControl.AddCheckBox("Show Tools", Tools.ShowTools, (v) => Tools.ShowTools = v);
+                }
 
-                    SkyboxScene?.ShowToolsMaterials = v;
-                });
+                if (Renderer.Scenes.Any(static scene => scene.LightingInfo.LightProbes.Count > 0))
+                {
+                    var lightProbeGridComboBox = UiControl.AddSelection("Light Probe Grid", (_, i) =>
+                    {
+                        foreach (var scene in Renderer.Scenes)
+                        {
+                            scene.LightingDebug.LightProbeGrid = (LightProbeDebugGridMode)i;
+                        }
+                    });
+
+                    lightProbeGridComboBox.Items.AddRange(["Off", "Closest", "Closest and keep", "All"]);
+                    lightProbeGridComboBox.SelectedIndex = (int)Scene.LightingDebug.LightProbeGrid;
+
+                    // Mirror samples show the cubemaps reaching into each volume
+                    var lightProbeGridSurfaceComboBox = UiControl.AddSelection("Light Probe Grid Surface", (_, i) =>
+                    {
+                        var mirror = i == 1;
+
+                        foreach (var scene in Renderer.Scenes)
+                        {
+                            scene.LightingDebug.LightProbeGridAlbedo = mirror ? new Color32(255, 255, 255, 255) : new Color32(128, 128, 128, 255);
+                            scene.LightingDebug.LightProbeGridRoughness = mirror ? 0f : 0.5f;
+                            scene.LightingDebug.LightProbeGridMetalness = mirror ? 1f : 0f;
+                        }
+                    });
+
+                    lightProbeGridSurfaceComboBox.Items.AddRange(["Diffuse", "Mirror"]);
+                    lightProbeGridSurfaceComboBox.SelectedIndex = 0;
+                }
+
+                if (Renderer.Scenes.Any(static scene => scene.LightingInfo.EnvMaps.Exists(static envMap => envMap.EntityData != null)))
+                {
+                    cubemapColorsComboBox = UiControl.AddSelection("Cubemap Debug Colors", (_, _) => ApplyCubemapColors());
+                    cubemapColorsComboBox.Items.AddRange(["Off", "Reflections and markers", "Markers only"]);
+                    cubemapColorsComboBox.SelectedIndex = 0;
+                    cubemapColorsComboBox.Parent!.Visible = isCubemapsRenderMode;
+                }
 
                 if (this is GLWorldViewer)
                 {
-                    UiControl.AddCheckBox("Show Occluded Bounds", Scene.OcclusionDebugEnabled, (v) => Scene.OcclusionDebugEnabled = v);
+                    UiControl.AddCheckBox("Show Occluded Bounds", Renderer.Settings.OcclusionDebugEnabled, (v) => Renderer.Settings.OcclusionDebugEnabled = v);
 
                     if (Scene.VoxelVisibility != null)
                     {
@@ -169,12 +249,14 @@ namespace GUI.Types.GLViewers
                     }
                 }
 
-                if (Scene.PhysicsWorld != null)
+                if (!Renderer.EntitySystem.PhysicsWorld.IsEmpty)
                 {
                     UiControl.AddCheckBox("Debug Physics Traces", showPhysicsTraces, v => showPhysicsTraces = v);
                 }
 
                 UiControl.AddCheckBox("Debug Sound Sources", Renderer.ShowSoundDebug, v => Renderer.ShowSoundDebug = v);
+
+                UiControl.AddCheckBox("Disable threaded sim", !Renderer.ParallelSimulation, v => Renderer.ParallelSimulation = !v);
 
                 perfDisplayComboBox = UiControl.AddSelection("Debug Performance", (_, i) => perfDisplay = (PerfDisplay)i);
                 perfDisplayComboBox.Items.AddRange([nameof(PerfDisplay.Off), nameof(PerfDisplay.Stats), nameof(PerfDisplay.Timings), nameof(PerfDisplay.Allocations)]);
@@ -212,20 +294,19 @@ namespace GUI.Types.GLViewers
         protected void UpdateSunAngles()
         {
             sunAngles.X = Math.Clamp(sunAngles.X, 0f, 89f);
-            sunAngles.Y %= 360f;
+            sunAngles.Y = MathUtils.Wrap(sunAngles.Y, 0f, 360f);
 
             Scene.LightingInfo.SetSunDirectionFromAngles(new Vector3(sunAngles.X, sunAngles.Y, 0f));
         }
 
         public virtual void PostSceneLoad()
         {
-            Scene.Initialize();
-            if (Scene.PhysicsWorld != null)
+            foreach (var scene in Renderer.Scenes)
             {
-                Input.PhysicsWorld = Scene.PhysicsWorld;
+                scene.Initialize();
             }
 
-            SkyboxScene?.Initialize();
+            Input.PhysicsWorld = Renderer.EntitySystem.PhysicsWorld;
 
             if (Scene.FogInfo.CubeFogActive)
             {
@@ -255,7 +336,7 @@ namespace GUI.Types.GLViewers
                 }
 
                 // If there is no bbox, LookAt will break camera, so +1 to location
-                var offset = Math.Max(bbox.Max.X, Math.Max(bbox.Max.Y, bbox.Max.Z)) + 1f * 1.5f;
+                var offset = bbox.Max.MaxComponent() + 1f * 1.5f;
                 offset = Math.Clamp(offset, 0f, 2000f);
                 var location = new Vector3(offset, 0, offset);
 
@@ -269,12 +350,64 @@ namespace GUI.Types.GLViewers
             }
 
             Scene.StaticOctree.DebugRenderer = new(Scene.StaticOctree, Scene.RendererContext, false);
-            Scene.DynamicOctree.DebugRenderer = new(Scene.DynamicOctree, Scene.RendererContext, true);
+            Scene.DynamicOctree.DebugRenderer = new(Scene.DynamicOctree, Scene.RendererContext);
         }
 
         protected abstract void LoadScene();
 
-        protected abstract void OnPicked(object? sender, PickingTexture.PickingResponse pixelInfo);
+        /// <summary>Handles a resolved pick, with the GL context current. Viewers that do nothing with picks leave this empty.</summary>
+        protected virtual void OnPicked(PickResult result)
+        {
+        }
+
+        /// <summary>Collects the per frame counters and the CPU and GPU timings even while the performance overlay does not show them.</summary>
+        internal bool CaptureStats { get; set; }
+
+        /// <summary>Sets the field of view of the rendered camera, and of the input camera that frames objects with it.</summary>
+        internal void SetFieldOfView(float fieldOfView)
+        {
+            RendererContext.FieldOfView = fieldOfView;
+            Renderer.Camera.FieldOfView = fieldOfView;
+            Renderer.Camera.CreateProjectionMatrix();
+            Input.Camera.FieldOfView = fieldOfView;
+            Input.Camera.CreateProjectionMatrix();
+        }
+
+        internal static AABB SelectionBounds(SceneNode node)
+        {
+            var bbox = node.BoundingBox;
+            var maxSpan = bbox.Size.MaxComponent();
+
+            // Empty or degenerate bounds (e.g. a particle system that finished playing)
+            // would put the camera inside the node or at a garbage position.
+            if (!float.IsFinite(maxSpan) || maxSpan < 1f)
+            {
+                bbox = PointBounds(node.Transform.Translation);
+            }
+
+            // Bounds of a 3D sky node are mapped to where the sky appears in the world
+            return bbox.Transform(node.Scene.ToViewerWorld);
+        }
+
+        internal static AABB PointBounds(Vector3 point) => new(point, 32f);
+
+        internal void FocusCameraOnBounds(in AABB bbox)
+        {
+            var center = bbox.Center;
+
+            var size = bbox.Size * 1.25f;
+
+            // Framed by what the bounds cover from where the camera will be: their longest axis would
+            // stand a cable or a trigger brush off by its own length. The floor keeps something player
+            // sized from filling the view with nothing around it to place it by.
+            var framing = Input.Camera.GetFramingDistance(size, -CameraPlacement.PreferredDirection(size));
+            var distance = Math.Max(framing, 192f);
+            var location = CameraPlacement.FindOrbitPosition(Renderer.EntitySystem.PhysicsWorld, center, distance, size);
+
+            Input.SaveCameraForTransition();
+            Input.Camera.SetLocation(location);
+            Input.Camera.LookAt(center);
+        }
 
         protected override void OnResize(int w, int h)
         {
@@ -292,7 +425,7 @@ namespace GUI.Types.GLViewers
         {
             base.OnMouseWheel(delta, location);
 
-            if (!Input.NoClip)
+            if (Input.WalkMode)
             {
                 return;
             }
@@ -313,14 +446,14 @@ namespace GUI.Types.GLViewers
         {
             base.OnMouseUp(sender, e);
 
-            if (!Input.NoClip)
+            if (Input.WalkMode)
             {
                 return;
             }
 
-            if (!MouseDragged)
+            if (!MouseDragged || GrabbedMouse)
             {
-                Picker?.RequestNextFrame(InitialMousePosition.X, InitialMousePosition.Y, PickingIntent.Select);
+                Picker?.Request(new PickRequest(InitialMousePosition.X, InitialMousePosition.Y, PickIntent.Select, GetPickModifiers()));
             }
         }
 
@@ -328,9 +461,7 @@ namespace GUI.Types.GLViewers
         {
             base.OnMouseDown(sender, e);
 
-            mouseReleased = false;
-
-            if (!Input.NoClip)
+            if (Input.WalkMode)
             {
                 return;
             }
@@ -339,26 +470,47 @@ namespace GUI.Types.GLViewers
             {
                 if (e.Clicks == 2)
                 {
-                    var intent = Control.ModifierKeys.HasFlag(Keys.Control)
-                        ? PickingIntent.Open
-                        : PickingIntent.Details;
-                    Picker?.RequestNextFrame(e.X, e.Y, intent);
+                    var modifiers = GetPickModifiers();
+                    var intent = modifiers.HasFlag(PickModifiers.Control)
+                        ? PickIntent.Open
+                        : PickIntent.Details;
+                    Picker?.Request(new PickRequest(e.X, e.Y, intent, modifiers));
                 }
             }
+        }
+
+        // Read when the click happens, since the pick only resolves on a later frame
+        private static PickModifiers GetPickModifiers()
+        {
+            var keys = Control.ModifierKeys;
+            var modifiers = PickModifiers.None;
+
+            if ((keys & Keys.Control) != 0)
+            {
+                modifiers |= PickModifiers.Control;
+            }
+
+            if ((keys & Keys.Shift) != 0)
+            {
+                modifiers |= PickModifiers.Shift;
+            }
+
+            if ((keys & Keys.Alt) != 0)
+            {
+                modifiers |= PickModifiers.Alt;
+            }
+
+            return modifiers;
         }
 
         protected override void OnGLLoad()
         {
             base.OnGLLoad();
 
-            GL.CreateQueries(QueryTarget.TimeElapsed, 1, out frametimeQuery1);
-            GL.CreateQueries(QueryTarget.TimeElapsed, 1, out frametimeQuery2);
+            ReportLoadingStatus("Preparing renderer…");
 
-#if DEBUG
-            const string queryLabel = "Frame Time Query";
-            GL.ObjectLabel(ObjectLabelIdentifier.Query, frametimeQuery1, queryLabel.Length, queryLabel);
-            GL.ObjectLabel(ObjectLabelIdentifier.Query, frametimeQuery2, queryLabel.Length, queryLabel);
-#endif
+            frametimeQuery1 = GraphicsDevice.CreateQuery(QueryTarget.TimeElapsed, "Frame Time Query");
+            frametimeQuery2 = GraphicsDevice.CreateQuery(QueryTarget.TimeElapsed, "Frame Time Query");
 
             // Needed to fix crash on certain drivers
             GL.BeginQuery(QueryTarget.TimeElapsed, frametimeQuery2);
@@ -367,17 +519,20 @@ namespace GUI.Types.GLViewers
             TextRenderer.Load();
             Renderer.Postprocess.Load(NumSamples);
 
-            Renderer.Postprocess.FullScreenGamma = 2.01f; // 100% Brightness
-            Renderer.Postprocess.ExposureCompensation = -0.4f; // eyeballed
-
             baseGrid = new InfiniteGrid(Scene);
-            SelectedNodeRenderer = new(Scene.RendererContext);
+            Debug.Assert(MainFramebuffer != null);
+
+            selectionVisuals = new(Selection, EntityVisuals, Tools, Scene.RendererContext);
+            toolsPass = new(Scene.RendererContext, MainFramebuffer);
             Picker = new(Scene.RendererContext, OnPicked);
 
             QuadOverdrawRenderer = new(Scene.RendererContext);
             QuadOverdrawRenderer.Load();
 
-            Renderer.ShadowTextureSize = Settings.Config.ShadowResolution;
+            var shadowQuality = Settings.Config.ShadowResolution;
+            Renderer.ShadowTextureSize = Math.Min(shadowQuality, 2048);
+            Renderer.SunCascadeCount = shadowQuality >= 4096 ? 3 : 2;
+            Renderer.Settings.StaticSunShadows = shadowQuality >= 2048; // High and Very High
             Renderer.Initialize();
 
             Renderer.MainFramebuffer = MainFramebuffer;
@@ -390,11 +545,15 @@ namespace GUI.Types.GLViewers
             timer.Stop();
             Log.Debug(GetType().Name, $"Loading scene time: {timer.Elapsed}, shader variants: {Scene.RendererContext.ShaderLoader.ShaderCount}, materials: {Scene.RendererContext.MaterialLoader.MaterialCount}");
 
+            ReportLoadingStatus("Initializing scene…");
+
             PostSceneLoad();
 
-            GuiContext.ClearCache();
             GuiContext.GLPostLoadAction?.Invoke(this);
             GuiContext.GLPostLoadAction = null;
+
+            ReportLoadingStatus("Compiling shaders…");
+            Scene.RendererContext.ShaderLoader.LinkLoadedShaders();
         }
 
         /// <summary>
@@ -410,9 +569,16 @@ namespace GUI.Types.GLViewers
             Debug.Assert(MainFramebuffer != null);
 
             Scene.RendererContext.ShaderLoader.LinkLoadedShaders();
-            Renderer.DisableAllCulling = true;
+
+            // Culling is off, but hidden layers stay out, as their nodes may build their geometry on first draw
+            ApplyPendingVisibility();
+            Renderer.Settings.DisableAllCulling = true;
 
             Renderer.Camera.CopyFrom(Input.Camera);
+            Renderer.Prewarming = true;
+
+            var decals = Scene.ProjectedDecals;
+            var prewarmDecal = decals.SpawnImpactDecal(Renderer.Camera.Location, Vector3.UnitZ, -Vector3.UnitZ, surfacePropertyHash: 0);
 
             try
             {
@@ -426,22 +592,24 @@ namespace GUI.Types.GLViewers
             }
             finally
             {
-                Renderer.DisableAllCulling = false;
+                decals.Remove(prewarmDecal);
+
+                Renderer.Settings.DisableAllCulling = false;
+                Renderer.Prewarming = false;
             }
         }
 
-        protected override void OnFirstPaint()
+        protected void ReportLoadingStatus(string status) => GuiContext.LoadingProgress?.Report(status);
+
+        protected override void PrewarmRenderer()
         {
-            base.OnFirstPaint();
+            ReportLoadingStatus("Compiling shaders…");
 
-            if (this is GLWorldViewer)
-            {
-                var start = Stopwatch.GetTimestamp();
+            var start = Stopwatch.GetTimestamp();
 
-                PrewarmDrawCalls();
+            PrewarmDrawCalls();
 
-                Log.Debug(GetType().Name, $"Prewarm time: {Stopwatch.GetElapsedTime(start)}");
-            }
+            Log.Debug(GetType().Name, $"Prewarm time: {Stopwatch.GetElapsedTime(start)}");
         }
 
         /// <summary>
@@ -472,8 +640,8 @@ namespace GUI.Types.GLViewers
                 return;
             }
 
-            soundPlayer.LoadSoundEvents();
-            soundPlayer.LoadSoundscapes();
+            // TODO: load soundevents once per game not per sub context
+            soundPlayer.LoadAsync(Scene.RendererContext.CancellationToken);
 
             // todo: collision filter 'default' and 'blocksound'
             // const float OcclusionEndMargin = 48f;
@@ -508,6 +676,8 @@ namespace GUI.Types.GLViewers
 
             Input.EnableMouseLook = true;
 
+            ApplyPendingVisibility();
+
             if (loadedDefaultLighting && Input.NoClip && (CurrentlyPressedKeys & TrackedKeys.Control) != 0)
             {
                 var delta = new Vector2(LastMouseDelta.Y, LastMouseDelta.X);
@@ -521,7 +691,7 @@ namespace GUI.Types.GLViewers
 
             // Walk mode keeps simulating while the cursor is over the ui, otherwise player
             // physics and teleports stay frozen until the mouse moves back over the viewport.
-            if (MouseOverRenderArea || Input.ForceUpdate || !Input.NoClip)
+            if (MouseOverRenderArea || Input.ForceUpdate || Input.WalkMode)
             {
                 Input.MouseSensitivity = Settings.Config.MouseSensitivity;
                 Input.SmoothCameraEnabled = Settings.Config.SmoothCameraEnabled;
@@ -543,19 +713,27 @@ namespace GUI.Types.GLViewers
                 var wheelDelta = ConsumePendingMouseWheelDelta();
 
                 Input.MouseSensitivity = Settings.Config.MouseSensitivity;
-                var wasNoClip = Input.NoClip;
+                var wasWalkMode = Input.WalkMode;
                 Input.Tick(frameTime, pressedKeys, new Vector2(mouseDelta.X, mouseDelta.Y), Renderer.Camera);
                 LastMouseDelta = mouseDelta;
 
                 // cancel unintentional selection
-                if (wasNoClip && !Input.NoClip)
+                if (!wasWalkMode && Input.WalkMode)
                 {
-                    SelectedNodeRenderer?.SelectNode(null);
+                    Selection.Clear();
+                    OnWalkModeEntered();
                 }
 
-                GrabbedMouse = MouseOverRenderArea && !Input.NoClip && !Paused && !mouseReleased;
-            }
+                // Walk mode and mouse look aim with the mouse, so they hold the cursor. Leaving both,
+                // pausing, escape, or the viewport losing focus hands it back.
+                var wantsMouseLook = (Input.WalkMode || Input.MouseLook) && !Paused && !MouseReleased;
 
+                // Taking the cursor needs it over the viewport, but keeping it does not, or a fast
+                // look that outran the pointer would drop the grab on its way past the edge.
+                var alreadyHoldingCursor = GrabbedMouse;
+
+                GrabbedMouse = wantsMouseLook && (alreadyHoldingCursor || MouseOverRenderArea);
+            }
         }
 
         /// <summary>
@@ -592,9 +770,13 @@ namespace GUI.Types.GLViewers
             });
         }
 
+        /// <summary>Draws viewer specific lines over the scene, after the frame's camera is final.</summary>
+        protected virtual void RenderOverlayLines(Scene.RenderContext renderContext)
+        {
+        }
+
         protected void DrawWorldSpaceText(string text, float size, Vector3 position, Color32 color, Scene.RenderContext renderContext)
         {
-            Scene.WantsSceneDepth = true;
             TextRenderer.AddTextBillboard(position, new ValveResourceFormat.Renderer.TextRenderer.TextRenderRequest
             {
                 Scale = size,
@@ -610,17 +792,25 @@ namespace GUI.Types.GLViewers
             Debug.Assert(MainFramebuffer != null);
             Debug.Assert(GLDefaultFramebuffer != null);
 
-            Renderer.PostprocessRender(MainFramebuffer, GLDefaultFramebuffer);
+            Debug.Assert(toolsPass != null && selectionVisuals != null);
+
+            // The tools are drawn over the final image, so they keep their colors whatever the exposure
+            toolsPass.Render(Renderer, GLDefaultFramebuffer, selectionVisuals, TextRenderer);
+        }
+
+        protected override void OnBufferSwapped(double blockedMs, double framePeriodMs)
+        {
+            Renderer.PerfStats.Timings.SetBufferSwapTime(blockedMs, framePeriodMs);
         }
 
         protected override void OnPaint(float frameTime)
         {
             Debug.Assert(MainFramebuffer != null);
             Debug.Assert(Picker != null);
-            Debug.Assert(SelectedNodeRenderer != null);
+            Debug.Assert(selectionVisuals != null);
 
-            Renderer.PerfStats.Capture = perfDisplay == PerfDisplay.Stats;
-            Renderer.PerfStats.Timings.Capture = perfDisplay == PerfDisplay.Timings;
+            Renderer.PerfStats.Capture = perfDisplay == PerfDisplay.Stats || CaptureStats;
+            Renderer.PerfStats.Timings.Capture = perfDisplay == PerfDisplay.Timings || CaptureStats;
             Renderer.PerfStats.Allocations.Capture = perfDisplay == PerfDisplay.Allocations;
 
             Renderer.PerfStats.MarkFrameBegin();
@@ -636,48 +826,58 @@ namespace GUI.Types.GLViewers
 
             using (new GLDebugGroup("Update Loop"))
             {
+                var timestep = frameTime;
+
+#if DEBUG
+                // Automation can hold the simulation still or step it by exact amounts, and then holds
+                // the dither still too, so that identical frames are identical to the pixel
+                Renderer.Postprocess.AnimateDither = !Automation.AutomationClock.Advance(ref timestep);
+#endif
+
                 var updateContext = new Scene.UpdateContext
                 {
                     TextRenderer = TextRenderer,
-                    Timestep = frameTime,
+                    Timestep = timestep,
                     Camera = Renderer.Camera,
                 };
 
                 Renderer.Update(updateContext);
 
-                SelectedNodeRenderer.Update(renderContext, updateContext);
+                Input.LateUpdate(Renderer.Camera);
+
+                if (ScreenDebugText.Length > 0)
+                {
+                    TextRenderer.AddTextRelative(new ValveResourceFormat.Renderer.TextRenderer.TextRenderRequest
+                    {
+                        X = 0.005f,
+                        Y = 0.03f,
+                        Scale = 14f,
+                        Text = ScreenDebugText,
+                    }, Renderer.Camera);
+                }
+                selectionVisuals.Update(renderContext, updateContext);
             }
 
             // After the update, so the listener is placed with this frame's camera vectors rather than
             // this frame's position and last frame's facing
             UpdateSoundPlayer();
 
-            Renderer.ForceResolveSceneDepth = ShowBaseGrid;
+            Renderer.ForceResolveSceneDepth = ShowBaseGrid || !Selection.IsEmpty;
 
             var quadOverdrawThisFrame = false;
 
             using (new GLDebugGroup("Scenes Render"))
             {
-                if (Picker.ActiveNextFrame)
-                {
-                    using var _ = new GLDebugGroup("Picker Object Id Render");
-                    renderContext.ReplacementShader = Picker.Shader;
-                    renderContext.Framebuffer = Picker;
+                Picker.Render(Renderer, renderContext);
 
-                    Renderer.RenderScenesWithView(renderContext);
-                    Picker.Finish();
-                }
-                else if (Picker.IsDebugActive)
+                if (Picker.Texture.IsDebugActive)
                 {
-                    renderContext.ReplacementShader = Picker.DebugShader;
+                    renderContext.ReplacementShader = Picker.Texture.DebugShader;
                 }
                 else if (QuadOverdrawRenderer?.IsActive == true)
                 {
                     QuadOverdrawRenderer.Prepare(MainFramebuffer.Width, MainFramebuffer.Height);
-                    renderContext.ReplacementShader = QuadOverdrawRenderer.SceneShader;
 
-                    // set to true to render quad overdraw later, first draw the scene normally in order to have a depth buffer
-                    // so things dont look weird in quad overdraw
                     quadOverdrawThisFrame = true;
                 }
 
@@ -688,7 +888,11 @@ namespace GUI.Types.GLViewers
                     using (new GLDebugGroup("Quad Overdraw Counting Pass"))
                     {
                         QuadOverdrawRenderer!.BeginCountingPass(MainFramebuffer);
+
+                        renderContext.OverdrawShader = QuadOverdrawRenderer.SceneShader;
                         Renderer.RenderScenesWithView(renderContext);
+                        renderContext.OverdrawShader = null;
+
                         QuadOverdrawRenderer.EndCountingPass(MainFramebuffer);
                     }
 
@@ -698,7 +902,7 @@ namespace GUI.Types.GLViewers
 
             using (new GLDebugGroup("Lines Render"))
             {
-                SelectedNodeRenderer.Render();
+                RenderOverlayLines(renderContext);
 
                 if (showStaticOctree && Scene.StaticOctree.DebugRenderer != null)
                 {
@@ -710,15 +914,15 @@ namespace GUI.Types.GLViewers
                     Scene.DynamicOctree.DebugRenderer.Render();
                 }
 
-                if (Scene.OcclusionDebugEnabled && Scene.OcclusionDebug != null)
+                if (Renderer.Settings.OcclusionDebugEnabled && Scene.OcclusionDebug != null)
                 {
                     Scene.OcclusionDebug.Render();
                 }
 
-                if (showPhysicsTraces && Scene.PhysicsWorld != null)
+                if (showPhysicsTraces && !Renderer.EntitySystem.PhysicsWorld.IsEmpty)
                 {
                     physicsTraceRenderer ??= new PhysicsTraceDebugRenderer(Scene.RendererContext);
-                    physicsTraceRenderer.Render(Scene.PhysicsWorld, Input, Renderer.Camera);
+                    physicsTraceRenderer.Render(Renderer.EntitySystem.PhysicsWorld, Input, Renderer.Camera);
                 }
 
                 if (ShowBaseGrid && baseGrid != null)
@@ -780,7 +984,25 @@ namespace GUI.Types.GLViewers
 
             BlitFramebufferToScreen();
 
-            if (GrabbedMouse)
+            if (Input.ShowCrosshair)
+            {
+                crosshairRenderer.Render(Renderer.Camera);
+            }
+
+            if (ModeLabel is { } modeLabel)
+            {
+                TextRenderer.AddTextRelative(new ValveResourceFormat.Renderer.TextRenderer.TextRenderRequest
+                {
+                    X = 0.5f,
+                    Y = 0.03f,
+                    Scale = 14f,
+                    Color = modeLabel.Color,
+                    Text = modeLabel.Text,
+                    CenterHorizontal = true,
+                }, Renderer.Camera);
+            }
+
+            if (GrabbedMouse && ShowSpeed)
             {
                 TextRenderer.AddTextRelative(new ValveResourceFormat.Renderer.TextRenderer.TextRenderRequest
                 {
@@ -813,20 +1035,28 @@ namespace GUI.Types.GLViewers
                 }
 
                 AddLine(
-                    cluster <= 1 ? "No PVS at this position" : $"PVS cluster {cluster}",
-                    cluster <= 1 ? new Color32(255, 0, 0) : Color32.White
+                    cluster < 0 ? "No PVS at this position" : $"PVS cluster {cluster}",
+                    cluster < 0 ? new Color32(255, 0, 0) : Color32.White
                 );
 
-                if (Scene.CurrentFramePvs != null)
+                var pvs = Renderer.MainViewState?.Pvs ?? default;
+
+                if (!pvs.IsEmpty)
                 {
-                    var visCount = Scene.CurrentFramePvs.Sum(b => BitOperations.PopCount(b));
-                    AddLine($"PVS visible: {visCount}/{Scene.VoxelVisibility.BaseClusterCount} clusters", Color32.White);
+                    var visCount = 0;
+
+                    foreach (var b in pvs.Span)
+                    {
+                        visCount += BitOperations.PopCount(b);
+                    }
+
+                    AddLine($"PVS visible: {visCount}/{Scene.VoxelVisibility.ClusterCount} clusters", Color32.White);
                 }
             }
 
             if (perfDisplay == PerfDisplay.Stats)
             {
-                Renderer.PerfStats.DisplayStats(TextRenderer, Renderer.Camera, Scene, SkyboxScene);
+                Renderer.PerfStats.DisplayStats(TextRenderer, Renderer.Camera, Renderer.Scenes, Renderer.MainViewState?.LightBinner);
             }
             else if (perfDisplay == PerfDisplay.Timings)
             {
@@ -838,7 +1068,7 @@ namespace GUI.Types.GLViewers
             }
 
             TextRenderer.Render(Renderer.Camera, Renderer.ResolvedSceneDepth);
-            Picker?.TriggerEventIfAny();
+            Picker?.DispatchResults();
 
             Renderer.PerfStats.MarkFrameEnd();
         }
@@ -882,6 +1112,7 @@ namespace GUI.Types.GLViewers
             UiControl.AddCheckBox("Show Wireframe", Renderer.IsWireframe, (v) => Renderer.IsWireframe = v);
         }
 
+        /// <summary>Adds the render mode dropdown on the right of the toolbar above the viewport.</summary>
         protected void AddRenderModeSelectionControl()
         {
             if (renderModeComboBox != null)
@@ -891,7 +1122,14 @@ namespace GUI.Types.GLViewers
 
             Debug.Assert(UiControl != null);
 
-            renderModeComboBox = UiControl.AddSelection("Render Mode", (_, i) =>
+            renderModeComboBox = UiControl.AddToolbarSelection(OnRenderModeSelected, "Render mode");
+
+            // Hands the keyboard back to the viewport, which the dropdown took
+            renderModeComboBox.DropDownClosed += (_, _) => GLControl?.Focus();
+
+            SetAvailableRenderModes();
+
+            void OnRenderModeSelected(string name, int i)
             {
                 if (renderModeCurrentIndex < -1)
                 {
@@ -914,9 +1152,7 @@ namespace GUI.Types.GLViewers
 
                 renderModeCurrentIndex = i;
                 SetRenderMode(renderMode.Name);
-            }, true, true);
-
-            SetAvailableRenderModes();
+            }
         }
 
         private void SetAvailableRenderModes(bool keepCurrentSelection = false)
@@ -925,7 +1161,7 @@ namespace GUI.Types.GLViewers
             {
                 var selectedIndex = 0;
                 var currentlySelected = keepCurrentSelection ? renderModeComboBox.SelectedItem?.ToString() : null;
-                var supportedRenderModes = new HashSet<string>(Picker.Shader.RenderModes);
+                var supportedRenderModes = new HashSet<string>(Picker.Texture.Shader.RenderModes);
 
                 if (QuadOverdrawRenderer != null)
                 {
@@ -981,56 +1217,129 @@ namespace GUI.Types.GLViewers
             }
         }
 
+        /// <summary>Called on the render thread when the camera starts walking as the player.</summary>
+        protected virtual void OnWalkModeEntered()
+        {
+        }
+
+        /// <summary>Shows the chosen layers from the next frame.</summary>
         protected void SetEnabledLayers(HashSet<string> layers)
         {
-            Scene.SetEnabledLayers(layers);
-            SkyboxScene?.SetEnabledLayers(layers);
+            chosenLayers = layers;
+            RequestVisibilityUpdate();
+        }
+
+        /// <summary>
+        /// Reapplies what is shown at the start of the next frame. Nodes are added and removed on the render
+        /// thread, so they are only walked there.
+        /// </summary>
+        protected void RequestVisibilityUpdate() => visibilityDirty = true;
+
+        private void ApplyPendingVisibility()
+        {
+            if (visibilityDirty)
+            {
+                visibilityDirty = false;
+                ApplyVisibility();
+            }
+        }
+
+        /// <summary>Applies the chosen layers. Runs on the render thread.</summary>
+        protected virtual void ApplyVisibility()
+        {
+            if (chosenLayers is not { } layers)
+            {
+                return;
+            }
+
+            foreach (var scene in Renderer.Scenes)
+            {
+                scene.SetEnabledLayers(FilterLayers(layers));
+            }
+        }
+
+        /// <summary>Narrows the chosen layers to the ones that end up shown.</summary>
+        protected virtual HashSet<string> FilterLayers(HashSet<string> layers) => layers;
+
+        // Only shown in the Cubemaps render mode; the choice is kept for when that mode is selected again
+        private void ApplyCubemapColors()
+        {
+            var mode = isCubemapsRenderMode && cubemapColorsComboBox != null
+                ? (EnvMapDebugColorsMode)Math.Max(cubemapColorsComboBox.SelectedIndex, 0)
+                : EnvMapDebugColorsMode.Off;
+
+            foreach (var scene in Renderer.Scenes)
+            {
+                scene.LightingDebug.EnvMapColors = mode;
+            }
         }
 
         private void SetRenderMode(string renderMode)
         {
             Debug.Assert(Picker != null);
-            Debug.Assert(SelectedNodeRenderer != null);
+            Debug.Assert(selectionVisuals != null);
 
-            Renderer.ViewBuffer!.Data!.RenderMode = RenderModes.GetShaderId(renderMode);
+            Renderer.Settings.RenderMode = RenderModes.GetShaderId(renderMode);
 
-            Renderer.Postprocess.Enabled = Renderer.ViewBuffer.Data.RenderMode == 0;
+            Renderer.Postprocess.Enabled = Renderer.Settings.RenderMode == 0;
 
-            Scene.EnableCompaction = renderMode != "Meshlets";
-            SkyboxScene?.EnableCompaction = Scene.EnableCompaction;
+            Renderer.Settings.EnableCompaction = renderMode != "Meshlets";
 
-            Picker.SetRenderMode(renderMode);
+            Picker.Texture.SetRenderMode(renderMode);
             QuadOverdrawRenderer?.SetRenderMode(renderMode);
-            SelectedNodeRenderer.SetRenderMode(renderMode);
 
-            foreach (var node in Scene.AllNodes)
+            isCubemapsRenderMode = renderMode == "Cubemaps";
+
+            // The label and the box together, so the row is gone rather than empty
+            cubemapColorsComboBox?.Parent!.Visible = isCubemapsRenderMode;
+
+            ApplyCubemapColors();
+
+            selectionVisuals.LightingBindings = renderMode switch
             {
-                node.SetRenderMode(renderMode);
+                "Cubemaps" => LightingBindingDisplay.EnvMaps,
+                "Irradiance" or "Illumination" => LightingBindingDisplay.LightProbe,
+                _ => LightingBindingDisplay.None,
+            };
+
+            currentRenderMode = renderMode;
+            ApplyRenderModeToNodes();
+        }
+
+        /// <summary>Gives every node the chosen render mode, for the nodes added since it was chosen.</summary>
+        protected void ApplyRenderModeToNodes()
+        {
+            if (currentRenderMode is not { } renderMode)
+            {
+                return;
             }
 
-            if (SkyboxScene != null)
+            foreach (var node in Renderer.Scenes.SelectMany(static scene => scene.AllNodes))
             {
-                foreach (var node in SkyboxScene.AllNodes)
-                {
-                    node.SetRenderMode(renderMode);
-                }
+                node.SetRenderMode(renderMode);
             }
         }
 
         protected override void OnKeyDown(Keys keyData)
         {
-            Debug.Assert(SelectedNodeRenderer != null);
-
             if (keyData == Keys.Delete)
             {
-                SelectedNodeRenderer.DisableSelectedNodes();
+                // Hides the selection, or shows it again
+                foreach (var node in Selection.Nodes)
+                {
+                    node.LayerEnabled = !node.LayerEnabled;
+                }
+
                 return;
             }
 
             if (keyData == Keys.Escape)
             {
-                SelectedNodeRenderer.SelectNode(null);
-                mouseReleased = true;
+                Selection.Clear();
+                if (Input.WalkMode)
+                {
+                    MouseReleased = true;
+                }
             }
 
             if (keyData == Keys.Tab && perfDisplayComboBox != null)
@@ -1052,17 +1361,9 @@ namespace GUI.Types.GLViewers
                 SetAvailableRenderModes(true);
             }
 
-            foreach (var node in Scene.AllNodes)
+            foreach (var node in Renderer.Scenes.SelectMany(static scene => scene.AllNodes))
             {
                 node.UpdateVertexArrayObjects();
-            }
-
-            if (SkyboxScene != null)
-            {
-                foreach (var node in SkyboxScene.AllNodes)
-                {
-                    node.UpdateVertexArrayObjects();
-                }
             }
 
             GLControl?.Invalidate();

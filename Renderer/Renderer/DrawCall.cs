@@ -7,6 +7,7 @@ namespace ValveResourceFormat.Renderer
     /// <summary>
     /// Single GPU draw operation with geometry, material, and render state.
     /// </summary>
+    /// <seealso href="https://s2v.app/SchemaExplorer/cs2/modellib/CMaterialDrawDescriptor">CMaterialDrawDescriptor</seealso>
     public class DrawCall
     {
         /// <summary>Gets or sets the OpenGL primitive type for this draw call.</summary>
@@ -33,7 +34,9 @@ namespace ValveResourceFormat.Renderer
         /// <summary>Gets or sets the optional bounding box used for draw-level culling.</summary>
         public AABB? DrawBounds { get; set; }
 
-        /// <summary>Gets or sets the mesh identifier used for picking.</summary>
+        internal uint InstanceBufferIndex { get; set; }
+
+        /// <summary>Gets or sets the mesh identifier, which replacement shaders can tell draws apart by.</summary>
         public int MeshId { get; set; }
 
         /// <summary>Gets or sets the index of the first meshlet for this draw call.</summary>
@@ -55,8 +58,24 @@ namespace ValveResourceFormat.Renderer
         /// draw and holds it.</summary>
         private int vao;
 
+        private VertexDrawBuffer[] vertexBuffers = [];
+
         /// <summary>Gets the vertex buffer bindings used by this draw call.</summary>
-        public required VertexDrawBuffer[] VertexBuffers { get; init; }
+        public required VertexDrawBuffer[] VertexBuffers
+        {
+            get => vertexBuffers;
+            init => vertexBuffers = value;
+        }
+
+        /// <summary> Add a new vertex buffer. The attributes may override existing ones.</summary>
+        public void AddVertexBuffer(VertexDrawBuffer buffer)
+        {
+            vertexBuffers = [buffer, .. vertexBuffers];
+            vao = 0;
+        }
+
+        /// <summary>Gets the index of this draw call among the draw calls of its mesh.</summary>
+        public int Index { get; init; }
 
         /// <summary>Gets or sets the data type of each element in the index buffer.</summary>
         public DrawElementsType IndexType { get; set; }
@@ -76,7 +95,6 @@ namespace ValveResourceFormat.Renderer
             _ => throw new UnreachableException(nameof(IndexType))
         };
 
-
         /// <summary>Replaces the material and rebuilds the vertex array state.</summary>
         /// <param name="newMaterial">The new material to assign.</param>
         public void SetNewMaterial(RenderMaterial newMaterial)
@@ -86,7 +104,7 @@ namespace ValveResourceFormat.Renderer
         }
 
         /// <summary>Returns the VAO for this draw call, creating it if necessary. Locations are canonical,
-        /// so it serves the material shader and every replacement shader (depth only, outline, picking).</summary>
+        /// so it serves the material shader and every replacement shader.</summary>
         /// <returns>The OpenGL VAO handle.</returns>
         public int GetVertexArrayObject()
         {
@@ -109,6 +127,7 @@ namespace ValveResourceFormat.Renderer
     /// <summary>
     /// Index buffer binding for draw calls.
     /// </summary>
+    /// <seealso href="https://s2v.app/SchemaExplorer/cs2/modellib/CRenderBufferBinding">CRenderBufferBinding</seealso>
     public readonly struct IndexDrawBuffer
     {
         /// <summary>Gets the OpenGL buffer object handle.</summary>

@@ -1,6 +1,8 @@
 #version 460
 
-#include "common/ViewConstants.slang"
+#pragma IgnoreMaterialData
+
+#include "common/view_constants.slang"
 
 #define F_DEBUG_PICKER 0 // VRF: visualize picking IDs with colors
 
@@ -16,7 +18,6 @@ flat in uint meshletId;
 uniform uint meshId;
 uniform uint shaderId;
 uniform uint shaderProgramId;
-uniform uint isSkybox;
 
 #if F_DEBUG_PICKER == 1
     out vec4 outputColor;
@@ -71,6 +72,6 @@ uniform uint isSkybox;
     out uvec4 outputColor;
     void main()
     {
-        outputColor = uvec4(sceneObjectId, meshId, isSkybox, 0);
+        outputColor = uvec4(sceneObjectId, meshId, g_nSceneIndex, 0);
     }
 #endif

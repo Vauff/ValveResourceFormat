@@ -2,9 +2,12 @@ using System.Drawing;
 using System.Linq;
 using System.Threading.Tasks;
 using System.Windows.Forms;
+using GUI.Forms;
 using GUI.Utils;
 using SkiaSharp;
-using ValveResourceFormat.Renderer.Utils;
+using ValveResourceFormat.IO.Fgd;
+using ValveResourceFormat.Renderer.Editor.Entities;
+using ValveResourceFormat.Renderer.Editor.Helpers;
 using ValveResourceFormat.ResourceTypes;
 using ValveResourceFormat.Serialization.KeyValues;
 using static ValveResourceFormat.ResourceTypes.EntityLump;
@@ -107,9 +110,7 @@ namespace GUI.Types.Viewers
             GuiContext = guiContext;
             Entities = entities;
             SelectEntityFunc = selectAndFocusEntity;
-            EntityInfo.OutputsGrid.CellDoubleClick += EntityInfoGrid_OutputCellDoubleClick;
-            EntityInfo.InputsGrid.CellDoubleClick += EntityInfoGrid_InputCellDoubleClick;
-            EntityInfo.ResourceAddDataGridExternalRef(guiContext);
+            EntityInfo.LinkedResourceActivated += OnLinkedResourceActivated;
             EntityViewerGrid.OwnerDraw = true;
 
             InitializeImageList();
@@ -143,7 +144,7 @@ namespace GUI.Types.Viewers
                 {
                     if (t.Exception != null)
                     {
-                        Log.Error(nameof(EntityViewer), t.Exception.ToString());
+                        Log.Error(nameof(EntityViewer), $"Failed to load entity icons for \"{GuiContext.DisplayPath}\": {t.Exception}");
                     }
                 });
             }
@@ -152,6 +153,9 @@ namespace GUI.Types.Viewers
         private void UpdateGrid()
         {
             var filteredEntities = new List<(Entity Entity, string Classname, string Targetname)>(Entities.Count);
+
+            var isKeyEmpty = string.IsNullOrEmpty(SearchData.Key);
+            var isValueEmpty = string.IsNullOrEmpty(SearchData.Value);
 
             foreach (var entity in Entities)
             {
@@ -184,9 +188,6 @@ namespace GUI.Types.Viewers
                         }
                         break;
                 }
-
-                var isKeyEmpty = string.IsNullOrEmpty(SearchData.Key);
-                var isValueEmpty = string.IsNullOrEmpty(SearchData.Value);
 
                 // match key and value together
                 if (!isKeyEmpty && !isValueEmpty)
@@ -482,60 +483,55 @@ namespace GUI.Types.Viewers
             EntityPropertiesGroup.Text = groupBoxName;
         }
 
-        private void EntityInfoGrid_OutputCellDoubleClick(object? sender, DataGridViewCellEventArgs e)
+        private void OnLinkedResourceActivated(object? sender, LinkedResource link)
         {
-            if (e.ColumnIndex == 1)
+            switch (link)
             {
-                var entityName = (string)(EntityInfo.OutputsGrid[e.ColumnIndex, e.RowIndex].Value ?? string.Empty);
+                case LinkedEntities { Entities: var entities }:
+                    ShowLinkedEntities(entities);
+                    break;
 
-                if (string.IsNullOrEmpty(entityName))
-                {
-                    return;
-                }
-
-                foreach (var entity in Entities)
-                {
-                    var targetname = entity.GetStringProperty("targetname", string.Empty);
-                    if (string.IsNullOrEmpty(targetname))
-                    {
-                        continue;
-                    }
-
-                    if (entityName == targetname)
-                    {
-                        ShowEntityProperties(entity);
-                        EntityInfo.ShowPropertiesTab();
-                    }
-                }
+                case LinkedFile { Path: var path }:
+                    Resource.OpenExternalReference(GuiContext, path);
+                    break;
             }
         }
 
-        private void EntityInfoGrid_InputCellDoubleClick(object? sender, DataGridViewCellEventArgs e)
+        private void ShowLinkedEntities(IReadOnlyList<Entity> entities)
         {
-            if (e.ColumnIndex == 0)
+            var targets = entities.ToHashSet();
+            ListViewItem? firstItem = null;
+
+            EntityViewerGrid.SelectedIndexChanged -= EntityViewerGrid_SelectionChanged;
+
+            try
             {
-                var entityName = (string)(EntityInfo.InputsGrid[e.ColumnIndex, e.RowIndex].Value ?? string.Empty);
+                EntityViewerGrid.SelectedItems.Clear();
 
-                if (string.IsNullOrEmpty(entityName))
+                foreach (ListViewItem item in EntityViewerGrid.Items)
                 {
-                    return;
-                }
-
-                foreach (var entity in Entities)
-                {
-                    var targetname = entity.GetStringProperty("targetname", string.Empty);
-                    if (string.IsNullOrEmpty(targetname))
+                    if (item.Tag is Entity entity && targets.Contains(entity))
                     {
-                        continue;
-                    }
-
-                    if (entityName == targetname)
-                    {
-                        ShowEntityProperties(entity);
-                        EntityInfo.ShowPropertiesTab();
+                        item.Selected = true;
+                        firstItem ??= item;
                     }
                 }
             }
+            finally
+            {
+                EntityViewerGrid.SelectedIndexChanged += EntityViewerGrid_SelectionChanged;
+            }
+
+            if (firstItem is not { Tag: Entity firstEntity })
+            {
+                // Filtered out of the list
+                ShowEntityProperties(entities[0]);
+                return;
+            }
+
+            firstItem.Focused = true;
+            firstItem.EnsureVisible();
+            ShowEntityProperties(firstEntity);
         }
 
         private void EntityViewerGrid_Resize(object sender, EventArgs e)
@@ -568,7 +564,7 @@ namespace GUI.Types.Viewers
             }
         }
 
-        private readonly static string[] ToolSpriteTextureKeys = ["g_tColorA", "g_tColorB", "g_tColorC", "g_tColor"];
+        private static readonly string[] ToolSpriteTextureKeys = ["g_tColorA", "g_tColorB", "g_tColorC", "g_tColor"];
 
         private static string? GetTextureFromMaterial(Material material)
         {
@@ -645,24 +641,24 @@ namespace GUI.Types.Viewers
         {
             EntityIconLoadAttempted.Add(classname);
 
-            var hammerEntity = HammerEntities.Get(classname);
-
-            if (hammerEntity?.Icons != null)
+            if (EntityClassCatalog.Get(GuiContext, VrfGuiContext.Logger).FindClass(classname) is not { } entityClass)
             {
-                foreach (var iconPath in hammerEntity.Icons)
-                {
-                    if (!iconPath.EndsWith(".vmat", StringComparison.Ordinal))
-                    {
-                        continue;
-                    }
+                return -1;
+            }
 
-                    using var bitmap = LoadIconBitmap(iconPath);
-                    if (bitmap != null)
-                    {
-                        var index = AddBitmapToImageList(bitmap);
-                        EntityIconCache[classname] = index;
-                        return index;
-                    }
+            foreach (var helper in entityClass.Helpers)
+            {
+                if (!helper.Name.Equals("iconsprite", StringComparison.OrdinalIgnoreCase) || IconHelper.GetDeclaredMaterialName(helper) is not { } iconPath)
+                {
+                    continue;
+                }
+
+                using var bitmap = LoadIconBitmap(iconPath);
+                if (bitmap != null)
+                {
+                    var index = AddBitmapToImageList(bitmap);
+                    EntityIconCache[classname] = index;
+                    return index;
                 }
             }
 

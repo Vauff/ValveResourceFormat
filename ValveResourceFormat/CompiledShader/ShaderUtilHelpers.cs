@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Text;
 using ValveResourceFormat.Serialization.VfxEval;
 
 namespace ValveResourceFormat.CompiledShader
@@ -221,47 +222,71 @@ namespace ValveResourceFormat.CompiledShader
         }
 
         /// <summary>
+        /// Formats the enabled combos of a configuration state, for example <c>S_MODE_DEPTH, S_DETAIL=2</c>.
+        /// </summary>
+        /// <param name="combos">The static or dynamic combos of a program.</param>
+        /// <param name="state">The configuration state, one value per combo.</param>
+        /// <returns>The combos with a non-zero value, or an empty string when there are none.</returns>
+        public static string FormatComboState(VfxCombo[] combos, int[] state)
+        {
+            var parts = new List<string>();
+
+            for (var i = 0; i < state.Length; i++)
+            {
+                if (state[i] == 0)
+                {
+                    continue;
+                }
+
+                parts.Add(state[i] == 1 ? combos[i].Name : $"{combos[i].Name}={state[i].ToString(CultureInfo.InvariantCulture)}");
+            }
+
+            return string.Join(", ", parts);
+        }
+
+        /// <summary>
         /// Combines an integer array into a comma-separated string.
         /// </summary>
-        /// <param name="ints0">The integer array to combine.</param>
+        /// <param name="values">The integer array to combine.</param>
         /// <param name="includeParenth">Whether to include parentheses around the result.</param>
         /// <returns>A string representation of the integer array.</returns>
-        public static string CombineIntArray(int[] ints0, bool includeParenth = false)
+        public static string CombineIntArray(int[] values, bool includeParenth = false)
         {
-            if (ints0.Length == 0)
+            if (values.Length == 0)
             {
                 return $"_";
             }
 
-            var valueString = "";
-            foreach (var i in ints0)
+            var builder = new StringBuilder();
+            foreach (var i in values)
             {
-                valueString += $"{i},";
+                builder.Append(i.ToString(CultureInfo.InvariantCulture)).Append(',');
             }
-            valueString = valueString[0..^1];
+            builder.Length--;
+            var valueString = builder.ToString();
             return includeParenth ? $"({valueString})" : $"{valueString}";
         }
 
         /// <summary>
         /// Combines an integer array into a space-separated, padded string.
         /// </summary>
-        /// <param name="ints0">The integer array to combine.</param>
+        /// <param name="values">The integer array to combine.</param>
         /// <param name="padding">The padding width for each value.</param>
         /// <returns>A padded string representation of the integer array.</returns>
-        public static string CombineIntsSpaceSep(int[] ints0, int padding = 5)
+        public static string CombineIntsSpaceSep(int[] values, int padding = 5)
         {
-            if (ints0.Length == 0)
+            if (values.Length == 0)
             {
                 return $"_".PadLeft(padding);
             }
 
-            var valueString = "";
-            foreach (var v in ints0)
+            var builder = new StringBuilder();
+            foreach (var v in values)
             {
-                var intPadded = $"{(v != 0 ? v : "_")}".PadLeft(padding);
-                valueString += $"{intPadded}";
+                var text = v != 0 ? v.ToString(CultureInfo.InvariantCulture) : "_";
+                builder.Append(text.PadLeft(padding));
             }
-            return $"{valueString}";
+            return builder.ToString();
         }
 
         /// <summary>
@@ -283,66 +308,61 @@ namespace ValveResourceFormat.CompiledShader
         /// <summary>
         /// Combines a string array into a space-separated, padded string.
         /// </summary>
-        /// <param name="strings0">The string array to combine.</param>
+        /// <param name="strings">The string array to combine.</param>
         /// <param name="padding">The padding width for each string.</param>
         /// <returns>A padded string representation of the string array.</returns>
-        public static string CombineStringsSpaceSep(string[] strings0, int padding = 5)
+        public static string CombineStringsSpaceSep(string[] strings, int padding = 5)
         {
-            var combinedString = "";
-            foreach (var s in strings0)
+            var builder = new StringBuilder();
+            foreach (var s in strings)
             {
-                combinedString += s.PadLeft(padding);
+                builder.Append(s.PadLeft(padding));
             }
-            return combinedString;
+            return builder.ToString();
         }
 
         /// <summary>
         /// Combines a string array into a comma-separated string.
         /// </summary>
-        /// <param name="strings0">The string array to combine.</param>
+        /// <param name="strings">The string array to combine.</param>
         /// <param name="includeParenth">Whether to include parentheses around the result.</param>
         /// <returns>A string representation of the string array.</returns>
-        public static string CombineStringArray(string[] strings0, bool includeParenth = false)
+        public static string CombineStringArray(string[] strings, bool includeParenth = false)
         {
-            if (strings0.Length == 0)
+            if (strings.Length == 0)
             {
                 return $"_";
             }
 
-            var combinedString = "";
-            foreach (var s in strings0)
-            {
-                combinedString += $"{s}, ";
-            }
-            combinedString = combinedString[0..^2];
+            var combinedString = string.Join(", ", strings);
             return includeParenth ? $"({combinedString})" : $"{combinedString}";
         }
 
         /// <summary>
         /// Combines a string array with line breaks at a specified length.
         /// </summary>
-        /// <param name="strings0">The string array to combine.</param>
+        /// <param name="strings">The string array to combine.</param>
         /// <param name="breakLen">The maximum line length before breaking to a new line.</param>
         /// <returns>An array of strings broken at the specified length.</returns>
-        public static string[] CombineValuesBreakString(string[] strings0, int breakLen)
+        public static string[] CombineValuesBreakString(string[] strings, int breakLen)
         {
             List<string> stringCollection = [];
-            if (strings0.Length == 0)
+            if (strings.Length == 0)
             {
                 stringCollection.Add("");
                 return [.. stringCollection];
             }
-            var line = strings0[0] + ", ";
-            for (var i = 1; i < strings0.Length; i++)
+            var line = strings[0] + ", ";
+            for (var i = 1; i < strings.Length; i++)
             {
-                if (line.Length + strings0[i].Length + 1 < breakLen)
+                if (line.Length + strings[i].Length + 1 < breakLen)
                 {
-                    line += strings0[i] + ", ";
+                    line += strings[i] + ", ";
                 }
                 else
                 {
                     stringCollection.Add(line[0..^2]);
-                    line = strings0[i] + ", ";
+                    line = strings[i] + ", ";
                 }
             }
             if (line.Length > 0)
@@ -355,12 +375,12 @@ namespace ValveResourceFormat.CompiledShader
         /// <summary>
         /// Converts a byte span to a hexadecimal string representation.
         /// </summary>
-        /// <param name="databytes">The byte data to convert.</param>
+        /// <param name="bytes">The byte data to convert.</param>
         /// <param name="breakLen">The number of bytes per line (-1 for no breaks).</param>
         /// <returns>A hexadecimal string representation of the byte data.</returns>
-        public static string BytesToString(ReadOnlySpan<byte> databytes, int breakLen = 32)
+        public static string BytesToString(ReadOnlySpan<byte> bytes, int breakLen = 32)
         {
-            if (databytes.Length == 0)
+            if (bytes.Length == 0)
             {
                 return "";
             }
@@ -369,33 +389,26 @@ namespace ValveResourceFormat.CompiledShader
                 breakLen = int.MaxValue;
             }
             var count = 0;
-            var bytestring = "";
-            for (var i = 0; i < databytes.Length; i++)
+            var builder = new StringBuilder(bytes.Length * 3);
+            for (var i = 0; i < bytes.Length; i++)
             {
-                bytestring += $"{databytes[i]:X02} ";
+                builder.Append(bytes[i].ToString("X02", CultureInfo.InvariantCulture)).Append(' ');
                 if (++count % breakLen == 0)
                 {
-                    bytestring += "\n";
+                    builder.Append('\n');
                 }
             }
-            return bytestring.Trim();
+            return builder.ToString().Trim();
         }
 
         /// <summary>
         /// Parses a dynamic expression from bytecode.
         /// </summary>
-        /// <param name="dynExpDatabytes">The dynamic expression bytecode.</param>
-        /// <returns>The parsed expression string, or an error message if parsing fails.</returns>
-        public static string ParseDynamicExpression(byte[] dynExpDatabytes)
+        /// <param name="bytecode">The dynamic expression bytecode.</param>
+        /// <returns>The parsed expression string.</returns>
+        public static string ParseDynamicExpression(byte[] bytecode)
         {
-            try
-            {
-                return new VfxEval(dynExpDatabytes, omitReturnStatement: true).DynamicExpressionResult.Replace("UNKNOWN", "VAR", StringComparison.InvariantCulture);
-            }
-            catch (Exception)
-            {
-                return "[error in dyn-exp]";
-            }
+            return new VfxEval(bytecode, omitReturnStatement: true).DynamicExpressionResult.Replace("UNKNOWN", "VAR", StringComparison.Ordinal);
         }
 
         // This must be in sync with VfxVariableType without gaps
@@ -513,16 +526,18 @@ namespace ValveResourceFormat.CompiledShader
                 List<List<string>> additionalRows = [];
                 for (var i = 0; i < rowMembers.Length; i++)
                 {
-                    var multipleLines = rowMembers[i].Split("\n");
-                    if (multipleLines.Length > 1)
+                    var firstLine = rowMembers[i];
+                    if (firstLine.Contains('\n', StringComparison.Ordinal))
                     {
+                        var multipleLines = firstLine.Split("\n");
                         AddExtraLines(additionalRows, multipleLines, i);
+                        firstLine = multipleLines[0];
                     }
 
-                    newRow.Add(multipleLines[0]);
-                    if (multipleLines[0].Length > columnWidths[i])
+                    newRow.Add(firstLine);
+                    if (firstLine.Length > columnWidths[i])
                     {
-                        columnWidths[i] = multipleLines[0].Length;
+                        columnWidths[i] = firstLine.Length;
                     }
                 }
                 tabulatedValues.Add(newRow);
@@ -564,17 +579,18 @@ namespace ValveResourceFormat.CompiledShader
                 {
                     return tabbedRows;
                 }
+                var tabbedRow = new StringBuilder();
                 foreach (var rowTokens in tabulatedValues)
                 {
-                    var tabbedRow = "";
+                    tabbedRow.Clear();
                     for (var i = 0; i < rowTokens.Count; i++)
                     {
                         var pad = columnWidths[i] + spacing;
-                        tabbedRow += $"{rowTokens[i].PadRight(pad)}";
+                        tabbedRow.Append(rowTokens[i].PadRight(pad));
                     }
                     if (tabbedRow.Length > 0)
                     {
-                        tabbedRows.Add(tabbedRow[..^spacing]);
+                        tabbedRows.Add(tabbedRow.ToString(0, tabbedRow.Length - spacing));
                     }
                 }
                 if (reverse)

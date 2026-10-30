@@ -8,18 +8,16 @@ namespace ValveResourceFormat.Renderer.Entities;
 /// their velocity.
 /// </summary>
 /// <remarks>
-/// The volume is the trigger's own <c>model</c>, the brush hulls it was compiled with, supplied by
-/// <see cref="BaseTrigger.InitTrigger"/>. The destination is a plain map entity, usually an
-/// <c>info_teleport_destination</c>, that nothing simulates, so it is found through its scene node in
-/// <see cref="Activate"/> once the whole map has loaded.
+/// The volume is the trigger's own <c>model</c>, supplied by <see cref="BaseTrigger.InitTrigger"/>. The
+/// destination, usually an <c>info_teleport_destination</c>, is found in <see cref="Activate"/> once the
+/// whole map has loaded, and may be in another spawn group of the same world group.
 /// </remarks>
+/// <seealso href="https://s2v.app/SchemaExplorer/cs2/server/CTriggerTeleport">CTriggerTeleport</seealso>
 public sealed class TriggerTeleport : BaseTrigger
 {
     private (Vector3 Origin, Vector3 Angles)? destination;
 
-    /// <summary>
-    /// Initializes a <c>trigger_teleport</c> from its keyvalues.
-    /// </summary>
+    /// <summary>Initializes a <c>trigger_teleport</c> from its keyvalues.</summary>
     public TriggerTeleport(EntitySystem system, EntitySpawnInfo spawnInfo) : base(system, spawnInfo)
     {
     }
@@ -27,6 +25,8 @@ public sealed class TriggerTeleport : BaseTrigger
     /// <inheritdoc/>
     public override void Spawn()
     {
+        base.Spawn();
+
         InitTrigger();
     }
 
@@ -41,14 +41,14 @@ public sealed class TriggerTeleport : BaseTrigger
             return;
         }
 
-        // The destination is a marker nothing simulates, but it still has a scene node carrying its keyvalues
-        if (Scene.FindNodeByTargetName(targetName)?.EntityData is not { } target)
+        if (EntitySystem.FindByTargetName(targetName) is not { } target)
         {
             EntitySystem.Logger.LogWarning("trigger_teleport '{TargetName}' target '{Target}' was not found", TargetName, targetName);
             return;
         }
 
-        destination = (target.GetVector3Property("origin"), target.GetVector3Property("angles"));
+        // Not the origin keyvalue, which ignores the spawn group placement
+        destination = (target.WorldOrigin, target.WorldAngles);
     }
 
     /// <inheritdoc/>
@@ -56,7 +56,7 @@ public sealed class TriggerTeleport : BaseTrigger
     {
         base.OnStartTouch(other);
 
-        if (destination is not { } target)
+        if (destination is not { } target || !PassesTriggerFilters(other))
         {
             return;
         }

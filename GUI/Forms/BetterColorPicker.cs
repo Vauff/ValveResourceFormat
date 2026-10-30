@@ -422,7 +422,6 @@ namespace GUI.Forms
             }
         }
 
-
         protected override void OnPaint(PaintEventArgs e)
         {
             base.OnPaint(e);
@@ -440,7 +439,6 @@ namespace GUI.Forms
                 s = BetterColorPicker.S;
                 v = BetterColorPicker.V;
             }
-
 
             if (RenderImage == null || RenderImage.Width != width || RenderImage.Height != height)
             {
@@ -524,7 +522,6 @@ namespace GUI.Forms
                 mouseYPos = 0;
             }
 
-
             if (!DesignMode && BetterColorPicker != null)
             {
                 BetterColorPicker.H = (double)mouseYPos / Height * 360f;
@@ -607,7 +604,6 @@ namespace GUI.Forms
         {
             Clicked = false;
 
-            Cursor.Show();
             Cursor.Clip = Rectangle.Empty;
 
             base.OnMouseUp(e);
@@ -818,7 +814,6 @@ namespace GUI.Forms
             Clicked = false;
 
             Cursor.Clip = Rectangle.Empty;
-            Cursor.Show();
 
             base.OnMouseUp(e);
         }

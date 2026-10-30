@@ -2,11 +2,11 @@ using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Threading;
+using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using ValveKeyValue;
 using ValveResourceFormat.IO;
-using ValveResourceFormat.Renderer.Utils;
 using ValveResourceFormat.ResourceTypes;
 using ValveResourceFormat.Serialization.KeyValues;
 
@@ -22,10 +22,13 @@ public sealed class SoundEventPlayer : IDisposable
     public SoundCache SoundCache { get; }
 
     /// <summary>Gets the bank of loaded sound event definitions.</summary>
-    public SoundEventBank Bank { get; }
+    public SoundEventBank Bank { get; private set; }
 
     /// <summary>Gets the bank of loaded scripted soundscape definitions (see <see cref="LoadSoundscapes"/>).</summary>
-    public SoundscapeBank Soundscapes { get; }
+    public SoundscapeBank Soundscapes { get; private set; }
+
+    // Swapped in by ApplyLoadedBanks once done, along with its event bank
+    private Task<SoundscapeBank>? loading;
 
     /// <summary>Gets the mixer output sample rate, taken from the device.</summary>
     public int SampleRate => device.SampleRate;
@@ -69,7 +72,7 @@ public sealed class SoundEventPlayer : IDisposable
         get => volume;
         set
         {
-            value = Math.Clamp(value, 0f, 1f);
+            value = MathUtils.Saturate(value);
             if (value == volume)
             {
                 return;
@@ -99,7 +102,7 @@ public sealed class SoundEventPlayer : IDisposable
     public float SpectralCueStrength
     {
         get => spectralCueStrength;
-        set => spectralCueStrength = Math.Clamp(value, 0f, 1f);
+        set => spectralCueStrength = MathUtils.Saturate(value);
     }
 
     private float dopplerScale = 0.2f;
@@ -120,6 +123,9 @@ public sealed class SoundEventPlayer : IDisposable
     private readonly Thread mixingThread;
     private readonly Dictionary<string, SoundEvent> channels = new(StringComparer.OrdinalIgnoreCase);
     private volatile bool stopping;
+
+    // Stamps SoundEvent.PlaybackId per play, so a SoundHandle can tell its own play from a pooled reuse
+    private long nextPlaybackId;
 
     /// <summary>
     /// Active instances per "limiter_*" group (see <see cref="RegisterLimiterGroup"/>), keyed by
@@ -233,14 +239,15 @@ public sealed class SoundEventPlayer : IDisposable
             if (startMul != 1f || endMul != 1f)
             {
                 // Interpolate the gain across the chunk so a fade (or master volume change) does not step;
-                // the last frame must land exactly on endMul so chunks join without a gain step
+                // the last frame must land exactly on endMul so chunks join without a gain step, so it takes
+                // endMul directly: the lerp at 1 can round off the end value
                 var frames = buffer.Length / channelCount;
-                var lastFrame = Math.Max(frames - 1, 1);
+                var lastFrame = frames - 1;
                 var index = 0;
 
                 for (var frame = 0; frame < frames; frame++)
                 {
-                    var mul = float.Lerp(startMul, endMul, (float)frame / lastFrame);
+                    var mul = frame == lastFrame ? endMul : MathUtils.Lerp(startMul, endMul, (float)frame / lastFrame);
 
                     for (var ch = 0; ch < channelCount; ch++)
                     {
@@ -275,16 +282,14 @@ public sealed class SoundEventPlayer : IDisposable
         // reads this at an unrelated rate
         const float Smoothing = 0.05f;
 
-        mixMilliseconds = float.Lerp(mixMilliseconds, elapsedMilliseconds, Smoothing);
+        mixMilliseconds = MathUtils.Lerp(mixMilliseconds, elapsedMilliseconds, Smoothing);
         mixDutyCycle = chunkMilliseconds > 0 ? mixMilliseconds / chunkMilliseconds : 0f;
     }
 
     /// <summary>
-    /// Conventional path for an addon/workshop map's own extra sound events. Unlike the rest of a base
-    /// game's content, an addon's own files are not necessarily reachable from
-    /// "soundevents/soundevents_manifest.vrman" (that manifest ships with the base game, not the addon),
-    /// so this is always attempted directly in <see cref="LoadSoundEvents"/> regardless of what is loaded -
-    /// most content (anything that is not an addon) simply does not have the file.
+    /// Conventional path for an addon or workshop map's extra sound events. Addon files are not listed in
+    /// the base game's "soundevents/soundevents_manifest.vrman", so this is always attempted directly in
+    /// <see cref="LoadSoundEvents"/>. Most content has no such file.
     /// </summary>
     private const string AddonSoundEventsFile = "soundevents/soundevents_addon.vsndevts";
 
@@ -293,32 +298,53 @@ public sealed class SoundEventPlayer : IDisposable
     /// plus <see cref="AddonSoundEventsFile"/> when present. An optional filter matches against the file
     /// name (e.g. "game_sounds").
     /// </summary>
-    public void LoadSoundEvents(string filter = "")
+    public void LoadSoundEvents(string filter = "") => LoadSoundEventsInto(Bank, filter);
+
+    /// <summary>
+    /// Load sound events and sound scape scripts in the background, then swap them in on the next <see cref="Update"/>.
+    /// </summary>
+    public Task LoadAsync(CancellationToken cancellationToken = default) => loading = Task.Run(() =>
+    {
+        var bank = new SoundEventBank();
+        var soundscapes = new SoundscapeBank(bank);
+
+        LoadSoundEventsInto(bank, string.Empty, cancellationToken);
+        LoadSoundscapesInto(bank, soundscapes);
+
+        cancellationToken.ThrowIfCancellationRequested();
+        return soundscapes;
+    }, cancellationToken);
+
+    private void LoadSoundEventsInto(SoundEventBank bank, string filter, CancellationToken cancellationToken = default)
     {
         var stopwatch = Stopwatch.StartNew();
 
         foreach (var soundEventsFile in GetSoundEventFiles())
         {
+            cancellationToken.ThrowIfCancellationRequested();
+
             if (filter.Length == 0 || soundEventsFile.Contains(filter, StringComparison.OrdinalIgnoreCase))
             {
-                LoadSoundEventsFile(soundEventsFile);
+                LoadSoundEventsFile(bank, soundEventsFile, optional: false);
             }
         }
 
         if (filter.Length == 0 || AddonSoundEventsFile.Contains(filter, StringComparison.OrdinalIgnoreCase))
         {
-            LoadSoundEventsFile(AddonSoundEventsFile, optional: true);
+            LoadSoundEventsFile(bank, AddonSoundEventsFile, optional: true);
         }
 
         stopwatch.Stop();
-        logger.LogInformation("Loaded {Count} sound events in {ElapsedMs} ms", Bank.Count, stopwatch.ElapsedMilliseconds);
+        logger.LogInformation("Loaded {Count} sound events in {ElapsedMs} ms", bank.Count, stopwatch.ElapsedMilliseconds);
     }
 
     /// <summary>
     /// Loads sound event definitions from a single soundevent (vsndevts) file. When <paramref name="optional"/>
     /// is set, a missing file is skipped quietly instead of logging a warning (see <see cref="AddonSoundEventsFile"/>).
     /// </summary>
-    public void LoadSoundEventsFile(string fileName, bool optional = false)
+    public void LoadSoundEventsFile(string fileName, bool optional = false) => LoadSoundEventsFile(Bank, fileName, optional);
+
+    private void LoadSoundEventsFile(SoundEventBank bank, string fileName, bool optional)
     {
         using var soundEventsFile = fileLoader.LoadFileCompiled(fileName);
         if (soundEventsFile?.DataBlock == null)
@@ -340,7 +366,7 @@ public sealed class SoundEventPlayer : IDisposable
             return;
         }
 
-        Bank.AddSoundEvents(soundEventsFile.DataBlock.AsKeyValueCollection());
+        bank.AddSoundEvents(soundEventsFile.DataBlock.AsKeyValueCollection());
     }
 
     /// <summary>
@@ -349,7 +375,9 @@ public sealed class SoundEventPlayer : IDisposable
     /// single-sound-event soundscapes (see <see cref="AddSoundscape"/>), which need no separate loading
     /// step, so a missing manifest is not an error.
     /// </summary>
-    public void LoadSoundscapes()
+    public void LoadSoundscapes() => LoadSoundscapesInto(Bank, Soundscapes);
+
+    private void LoadSoundscapesInto(SoundEventBank bank, SoundscapeBank soundscapes)
     {
         var manifest = ReadKeyValues1("scripts/soundscapes_manifest.txt");
 
@@ -378,24 +406,22 @@ public sealed class SoundEventPlayer : IDisposable
 
                 if (script != null)
                 {
-                    Soundscapes.AddSoundscapes(script);
+                    soundscapes.AddSoundscapes(script);
                 }
             }
             else
             {
                 // Additional sound events used only by the soundscape script (e.g. an ambience .vsndevts)
                 // that may not otherwise be reachable from soundevents_manifest.vrman
-                LoadSoundEventsFile(fileName);
+                LoadSoundEventsFile(bank, fileName, optional: false);
             }
         }
     }
 
     /// <summary>
     /// Reads and parses a loose KeyValues1 ("VDF") text file, or null when it does not exist or fails to
-    /// parse. The raw content is wrapped in a synthetic root object before parsing: soundscape scripts
-    /// author several sibling top-level blocks with no single enclosing key, which the deserializer
-    /// otherwise silently folds into (and loses the name of) the first block instead of treating as
-    /// siblings. Hand-authored script files do show up with encoding quirks or syntax errors, so a
+    /// parse. Soundscape scripts author several sibling top-level blocks with no single enclosing key.
+    /// Hand-authored script files do show up with encoding quirks or syntax errors, so a
     /// failure here is logged and skipped rather than allowed to take down the whole load.
     /// </summary>
     // Shared across all script files: creating a serializer spins up ValveKeyValue's reflection machinery
@@ -412,13 +438,7 @@ public sealed class SoundEventPlayer : IDisposable
 
         try
         {
-            using var wrapped = new MemoryStream();
-            wrapped.Write("\"__root\"\n{\n"u8);
-            stream.CopyTo(wrapped);
-            wrapped.Write("\n}\n"u8);
-            wrapped.Position = 0;
-
-            return KeyValues1Serializer.Deserialize(wrapped);
+            return KeyValues1Serializer.DeserializeWithoutRoot(stream);
         }
         catch (Exception ex)
         {
@@ -437,14 +457,16 @@ public sealed class SoundEventPlayer : IDisposable
     /// <param name="volume">Optional programmatic volume, replacing the definition's volume property.</param>
     /// <param name="volumeScale">Multiplier applied on top of whatever volume the event ends up at, and to its children.</param>
     /// <returns>
-    /// A handle to the playing sound, or null when the event is unknown, its type is unsupported, or it
-    /// produced nothing (empty track list, dropped by its limiter). The handle is only meaningful while
-    /// the sound is <see cref="SoundEvent.Started"/>: once it stops, the instance returns to its
-    /// definition's pool and a later play of the same event may hand the same instance out again.
+    /// The playing instance, or null when the event is unknown, its type is unsupported, or it produced
+    /// nothing (empty track list, dropped by its limiter). Instances return to their definition's pool
+    /// once stopped; code that keeps a reference past this frame should wrap it in a
+    /// <see cref="SoundHandle"/>, which <see cref="Sound.Play"/> does.
     /// </returns>
     public SoundEvent? Play(string soundEventName, Vector3? position = null, string? channel = null, float? volume = null,
         float volumeScale = 1f)
     {
+        ApplyLoadedBanks();
+
         var definition = Bank.GetSoundEvent(soundEventName);
         if (definition == null)
         {
@@ -469,6 +491,7 @@ public sealed class SoundEventPlayer : IDisposable
         // Seed with the play time so each play draws a fresh deterministic sequence
         Random.Reseed(Stopwatch.GetTimestamp());
 
+        soundEvent.PlaybackId = ++nextPlaybackId;
         soundEvent.Position = position;
         soundEvent.VolumeOverride = volume;
         soundEvent.VolumeScale = volumeScale;
@@ -563,15 +586,16 @@ public sealed class SoundEventPlayer : IDisposable
     }
 
     /// <summary>
-    /// Pre-warms a sound event so its first real play does no lazy work on the frame: builds the full
-    /// instance tree (event instances, providers, child wiring) into the definition's pool, and queues
-    /// background decodes for every vsnd the tree could pick. Also safe to call again while approaching
-    /// an already-warm event - the instance work is a no-op and the decode queueing just refreshes the
-    /// sounds' cache eviction age. Returns immediately; sounds that want to play right now take priority
-    /// over the queued decodes. Unknown events and unsupported types are ignored.
+    /// Pre-warms a sound event so its first play does no lazy work: builds the full instance tree (event
+    /// instances, providers, child wiring) into the definition's pool and queues background decodes for
+    /// every vsnd the tree could pick. Safe to call again on a warm event, which only refreshes the sounds'
+    /// cache eviction age. Returns immediately; sounds playing right now take priority over the queued
+    /// decodes. Unknown events and unsupported types are ignored.
     /// </summary>
     public void Cache(string soundEventName)
     {
+        ApplyLoadedBanks();
+
         var definition = Bank.GetSoundEvent(soundEventName);
         if (definition == null)
         {
@@ -611,7 +635,7 @@ public sealed class SoundEventPlayer : IDisposable
         return false;
     }
 
-    /// <summary>Picks a random track index out of <paramref name="trackCount"/>, never repeating the previously picked track for the same sound event definition.</summary>
+    /// <summary>Picks a random track index, never repeating the previous pick for the same definition.</summary>
     internal int PickTrack(SoundEventDefinition definition, int trackCount)
     {
         if (trackCount <= 1)
@@ -731,9 +755,8 @@ public sealed class SoundEventPlayer : IDisposable
 
     /// <summary>
     /// Whether nothing solid stands between the listener and a soundscape entity. An env_soundscape only
-    /// claims the listener when it can see them, which is what keeps the one across the wall (or the floor)
-    /// from taking over the room they are actually standing in. Without an <see cref="OcclusionTrace"/> to
-    /// ask there is nothing to test against, and every region counts as visible.
+    /// claims the listener when it can see them, so one across a wall or floor cannot take over the room
+    /// they are in. Without an <see cref="OcclusionTrace"/> every region counts as visible.
     /// </summary>
     private bool HasLineOfSight(Vector3 listenerPosition, Vector3 position)
     {
@@ -749,9 +772,36 @@ public sealed class SoundEventPlayer : IDisposable
     public void Update(Camera camera)
     {
         Sound.Player = this;
+        ApplyLoadedBanks();
+
         mixer.Update(camera.Location, camera.Forward, camera.Right, camera.Up);
         UpdateSoundscape(camera.Location);
         ReportStats();
+    }
+
+    private void ApplyLoadedBanks()
+    {
+        if (loading is not { IsCompleted: true } done)
+        {
+            return;
+        }
+
+        loading = null;
+
+        if (done.IsCanceled)
+        {
+            return;
+        }
+
+        // Throws what failed the load
+        var loaded = done.GetAwaiter().GetResult();
+
+        Bank.CopyRemovalsTo(loaded.EventBank);
+        Bank = loaded.EventBank;
+        Soundscapes = loaded;
+
+        // Warmed against the empty bank, so nothing was decoded
+        warmedSoundscapes.Clear();
     }
 
     /// <summary>
@@ -775,15 +825,28 @@ public sealed class SoundEventPlayer : IDisposable
     }
 
     /// <summary>
-    /// A soundscape region (env_soundscape): while the listener is within <paramref name="Radius"/>
-    /// of <paramref name="Position"/> and can see it, <paramref name="Name"/> plays as the ambient bed -
-    /// either directly as a single sound event (see <see cref="AddSoundscape"/>), or, when
-    /// <paramref name="Scripted"/>, as every sound event a <see cref="SoundscapeBank"/> scripted
-    /// soundscape resolves to (see <see cref="AddScriptedSoundscape"/>).
-    /// A negative radius means the region has no range limit at all.
+    /// A soundscape region (env_soundscape): while the listener is within <see cref="Radius"/> of
+    /// <see cref="Position"/> and can see it, <see cref="Name"/> plays as the ambient bed - a single
+    /// sound event, or every event a <see cref="SoundscapeBank"/> soundscape resolves to when
+    /// <see cref="Scripted"/>. A class so the registering entity can toggle <see cref="Enabled"/> live.
     /// </summary>
-    public readonly record struct Soundscape(Vector3 Position, float Radius, string Name, bool Scripted)
+    public sealed class Soundscape(Vector3 position, float radius, string name, bool scripted)
     {
+        /// <summary>Gets or sets where the region is centered.</summary>
+        public Vector3 Position { get; set; } = position;
+
+        /// <summary>Gets how far the region reaches, or a negative value for one with no range limit.</summary>
+        public float Radius { get; } = radius;
+
+        /// <summary>Gets the sound event or scripted soundscape the region plays.</summary>
+        public string Name { get; } = name;
+
+        /// <summary>Gets whether <see cref="Name"/> is a scripted soundscape rather than a sound event.</summary>
+        public bool Scripted { get; } = scripted;
+
+        /// <summary>Gets or sets whether the region can claim the listener. Disabling does not silence an ambient it already started.</summary>
+        public bool Enabled { get; set; } = true;
+
         /// <summary>Gets whether this region covers the whole map ("radius" authored as -1).</summary>
         public bool Unlimited => Radius < 0f;
 
@@ -818,13 +881,19 @@ public sealed class SoundEventPlayer : IDisposable
     /// <param name="position">Where the region is centered.</param>
     /// <param name="radius">How far it reaches, or a negative value for a region that covers the whole map.</param>
     /// <param name="soundEventName">The sound event to play as the ambient bed.</param>
-    public void AddSoundscape(Vector3 position, float radius, string soundEventName)
+    /// <returns>The registered region, whose <see cref="Soundscape.Enabled"/> the caller may toggle, or null when the parameters describe no region.</returns>
+    public Soundscape? AddSoundscape(Vector3 position, float radius, string? soundEventName)
     {
-        if (radius != 0f && !string.IsNullOrEmpty(soundEventName))
+        if (radius == 0f || string.IsNullOrEmpty(soundEventName))
         {
-            Cache(soundEventName);
-            soundscapes.Add(new Soundscape(position, radius, soundEventName, Scripted: false));
+            return null;
         }
+
+        Cache(soundEventName);
+
+        var soundscape = new Soundscape(position, radius, soundEventName, scripted: false);
+        soundscapes.Add(soundscape);
+        return soundscape;
     }
 
     /// <summary>
@@ -836,13 +905,19 @@ public sealed class SoundEventPlayer : IDisposable
     /// <param name="position">Where the region is centered.</param>
     /// <param name="radius">How far it reaches, or a negative value for a region that covers the whole map.</param>
     /// <param name="soundscapeName">Name of the scripted soundscape to play.</param>
-    public void AddScriptedSoundscape(Vector3 position, float radius, string soundscapeName)
+    /// <returns>The registered region, whose <see cref="Soundscape.Enabled"/> the caller may toggle, or null when the parameters describe no region.</returns>
+    public Soundscape? AddScriptedSoundscape(Vector3 position, float radius, string? soundscapeName)
     {
-        if (radius != 0f && !string.IsNullOrEmpty(soundscapeName))
+        if (radius == 0f || string.IsNullOrEmpty(soundscapeName))
         {
-            CacheScripted(soundscapeName);
-            soundscapes.Add(new Soundscape(position, radius, soundscapeName, Scripted: true));
+            return null;
         }
+
+        CacheScripted(soundscapeName);
+
+        var soundscape = new Soundscape(position, radius, soundscapeName, scripted: true);
+        soundscapes.Add(soundscape);
+        return soundscape;
     }
 
     private void CacheScripted(string soundscapeName)
@@ -862,7 +937,7 @@ public sealed class SoundEventPlayer : IDisposable
 
     private void UpdateSoundscape(Vector3 listenerPosition)
     {
-        // The engine re-picks the listener's soundscape on a think rather than every frame, and one pass
+        // Re-picks the listener's soundscape on a timer rather than every frame, and one pass
         // here walks every region in the map and traces to the ones in range of the listener
         var now = Stopwatch.GetTimestamp();
 
@@ -878,6 +953,11 @@ public sealed class SoundEventPlayer : IDisposable
 
         foreach (var soundscape in soundscapes)
         {
+            if (!soundscape.Enabled)
+            {
+                continue;
+            }
+
             var distance = Vector3.Distance(soundscape.Position, listenerPosition);
 
             if ((soundscape.Unlimited || distance < soundscape.Radius + SoundscapePrecacheMargin)
@@ -916,20 +996,20 @@ public sealed class SoundEventPlayer : IDisposable
         var currentStillActive = activeSoundscapeEvents.Exists(static e => e.Started);
 
         if (currentStillActive
-            && activeSoundscapeScripted == closest.Value.Scripted
-            && string.Equals(activeSoundscapeName, closest.Value.Name, StringComparison.OrdinalIgnoreCase))
+            && activeSoundscapeScripted == closest.Scripted
+            && string.Equals(activeSoundscapeName, closest.Name, StringComparison.OrdinalIgnoreCase))
         {
             return;
         }
 
         // Crossfade: the outgoing ambient fades along its curve while the new one starts underneath
         FadeOutActiveSoundscape();
-        activeSoundscapeName = closest.Value.Name;
-        activeSoundscapeScripted = closest.Value.Scripted;
+        activeSoundscapeName = closest.Name;
+        activeSoundscapeScripted = closest.Scripted;
 
-        if (closest.Value.Scripted)
+        if (closest.Scripted)
         {
-            var events = Soundscapes.GetSoundEvents(closest.Value.Name);
+            var events = Soundscapes.GetSoundEvents(closest.Name);
 
             if (events != null)
             {
@@ -948,7 +1028,7 @@ public sealed class SoundEventPlayer : IDisposable
         }
         else
         {
-            var soundEvent = Play(closest.Value.Name);
+            var soundEvent = Play(closest.Name);
 
             if (soundEvent != null)
             {

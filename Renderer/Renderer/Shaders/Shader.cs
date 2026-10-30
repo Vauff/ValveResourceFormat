@@ -1,18 +1,18 @@
+using System.IO.Hashing;
+using System.Runtime.InteropServices;
+using System.Text;
 using Microsoft.Extensions.Logging;
 using OpenTK.Graphics.OpenGL;
-using ValveResourceFormat.ThirdParty;
 
 namespace ValveResourceFormat.Renderer.Shaders
 {
-    /// <summary>
-    /// OpenGL shader program with uniform management and material defaults.
-    /// </summary>
+    /// <summary>OpenGL shader program with uniform management and material defaults.</summary>
     public class Shader
     {
         /// <summary>Gets the shader name (typically a Source 2 <c>.vfx</c> shader name).</summary>
         public string Name { get; }
 
-        /// <summary>Gets the <see cref="MurmurHash2"/> hash of <see cref="Name"/>.</summary>
+        /// <summary>Gets a hash of <see cref="Name"/>, used to tell shaders apart in debug render modes.</summary>
         public uint NameHash { get; }
 
         /// <summary>Gets or sets the OpenGL program object handle.</summary>
@@ -30,11 +30,27 @@ namespace ValveResourceFormat.Renderer.Shaders
         /// <summary>Gets the static combo parameter values used to compile this shader variant.</summary>
         public required IReadOnlyDictionary<string, byte> Parameters { get; init; }
 
+        /// <summary>Gets every static combo the source declares, unlike <see cref="Parameters"/>. Shared by every variant.</summary>
+        public required IReadOnlyDictionary<string, byte> Defines { get; init; }
+
         /// <summary>Gets the set of render mode names supported by this shader.</summary>
         public required HashSet<string> RenderModes { get; init; }
 
         /// <summary>Gets the set of uniform names declared in the shader source.</summary>
-        public required HashSet<string> UniformNames { get; init; }
+        public required HashSet<string> UniformNames
+        {
+            get;
+            init
+            {
+                field = value;
+                Uniforms.EnsureCapacity(value.Count);
+
+                foreach (var uniformName in value)
+                {
+                    Uniforms[uniformName] = (ActiveUniformType.FloatVec4, -1, false);
+                }
+            }
+        }
 
         /// <summary>Gets the set of uniform names that require sRGB-to-linear conversion when setting material values.</summary>
         public required HashSet<string> SrgbUniforms { get; init; }
@@ -42,14 +58,12 @@ namespace ValveResourceFormat.Renderer.Shaders
         /// <summary>Gets the set of sampler uniform names that use material address modes via <c>// Sampler(UserConfig)</c>.</summary>
         public required HashSet<string> SamplerUserConfigUniforms { get; init; }
 
+        /// <summary>Gets the sampler uniform that holds the color of a material, annotated with <c>// RepresentativeTexture</c>, or <see langword="null"/> when the shader has none.</summary>
+        public string? RepresentativeTexture { get; init; }
+
         private GlobalsLayout globalsLayout = GlobalsLayout.Empty;
 
-        /// <summary>
-        /// Gets the packed layout of this shader's loose global uniforms. Derived from the source rather than
-        /// from the linked program, so it is known before the shader links, and is shared by every variant
-        /// compiled from the same source. A <see cref="RenderMaterial"/> only has to refill its constant
-        /// buffer when this changes, which outside of a shader reload it never does.
-        /// </summary>
+        /// <summary>Gets the packed layout of this shader's loose global uniforms, derived from the source and shared by every variant.</summary>
         public GlobalsLayout GlobalsLayout
         {
             get => globalsLayout;
@@ -84,17 +98,10 @@ namespace ValveResourceFormat.Renderer.Shaders
             }
         }
 
-        /// <summary>
-        /// Gets the set of reserved texture uniform names that this shader samples. Seeded from the parsed source,
-        /// so it is available before the program is linked, and trimmed by <see cref="EnsureLoaded"/> down to the
-        /// ones the linker kept for this variant's combos.
-        /// </summary>
+        /// <summary>Gets the reserved texture uniforms this shader samples, seeded from the source and trimmed by <see cref="EnsureLoaded"/>.</summary>
         public HashSet<string> ReservedTexturesUsed { get; init; } = [];
 
-        /// <summary>
-        /// Gets a value indicating whether the program samples <c>g_tSceneColor</c>. Declaring it is enough until
-        /// the program is linked, after which it means the linker kept it.
-        /// </summary>
+        /// <summary>Gets whether the program samples <c>g_tSceneColor</c>.</summary>
         public bool ReadsSceneColor => ReservedTexturesUsed.Contains("g_tSceneColor");
 
         private readonly Dictionary<string, (ActiveUniformType Type, int Location, bool SrgbRead)> Uniforms = [];
@@ -111,19 +118,45 @@ namespace ValveResourceFormat.Renderer.Shaders
         /// <summary>Gets the renderer context this shader was loaded for.</summary>
         internal RendererContext RendererContext { get; }
 
-        /// <summary>Gets a value indicating whether material data (textures and params) should be skipped during rendering.</summary>
-        public bool IgnoreMaterialData { get; }
+        /// <summary>
+        /// Gets a value indicating whether material data (textures and params) should be skipped during rendering,
+        /// as the source marks with <c>#pragma IgnoreMaterialData</c>.
+        /// </summary>
+        public bool IgnoreMaterialData { get; init; }
 
-        /// <summary>Replacement shader that reads the material's color texture.</summary>
-        public bool IsDepthOnlyAlphaTest => Name == "depth_only" && Parameters.GetValueOrDefault("F_ALPHA_TEST") == 1;
+        /// <summary>Gets whether this variant alpha tests, which makes it read the material's color texture.</summary>
+        public bool IsAlphaTestVariant => Parameters.GetValueOrDefault(AlphaTestCombo) == 1;
+
+        /// <summary>Gets whether the shader source declares <paramref name="combo"/> as a static combo.</summary>
+        public bool DeclaresCombo(string combo) => Defines.ContainsKey(combo);
+
+        /// <summary>Gets this shader's depth only mode, or <see langword="null"/> when it has none.</summary>
+        public Shader? DepthMode => DeclaresCombo(DepthModeCombo) ? WithCombo(DepthModeCombo, 1) : null;
+
+        /// <summary>Gets this shader's alpha test variant when it has one and the material alpha tests, and this shader otherwise.</summary>
+        public Shader WithAlphaTest(bool alphaTest)
+            => alphaTest && DeclaresCombo(AlphaTestCombo) ? WithCombo(AlphaTestCombo, 1) : this;
+
+        /// <summary>Gets this shader's morphing variant when it has one and the material's shader morphs, and this shader otherwise.</summary>
+        public Shader WithMorph(Shader materialShader)
+            => materialShader.Parameters.GetValueOrDefault(MorphCombo) == 1 && DeclaresCombo(MorphCombo) ? WithCombo(MorphCombo, 1) : this;
+
+        /// <summary>Gets this shader's quad overdraw counting mode, a depth only mode that also counts the overdraw, or <see langword="null"/> when it has none.</summary>
+        public Shader? OverdrawMode => DeclaresCombo(DepthModeCombo) ? WithCombo(DepthModeCombo, 2) : null;
+
+        /// <summary>The static combo that selects a material shader's depth only mode (1) or its quad overdraw counting mode (2).</summary>
+        public const string DepthModeCombo = "S_MODE_DEPTH";
+
+        /// <summary>The static combo that turns on alpha testing.</summary>
+        public const string AlphaTestCombo = "F_ALPHA_TEST";
+
+        /// <summary>The static combo that reads the morph composite atlas.</summary>
+        public const string MorphCombo = "F_MORPH_SUPPORTED";
 
         private readonly ShaderLoader shaderLoader;
         private Dictionary<(string Combo, byte Value), Shader>? variants;
 
-        /// <summary>
-        /// Gets this shader with one combo set differently. Cached, so a pass can pick a variant per draw
-        /// instead of loading every combination up front. Chain the calls to move on more than one combo.
-        /// </summary>
+        /// <summary>Gets this shader with one combo set differently, cached. Chain the calls to move more than one.</summary>
         public Shader WithCombo(string combo, byte value)
         {
             if (Parameters.GetValueOrDefault(combo) == value)
@@ -148,7 +181,7 @@ namespace ValveResourceFormat.Renderer.Shaders
         }
 
         /// <summary>Sets a uniform on this shader and on every variant taken from it, which are separate
-        /// programs and so hold their own copy.</summary>
+        /// programs and so hold their own copy. Variants can be taken of variants, so the walk recurses.</summary>
         public void SetUniform1AllVariants(string name, uint value)
         {
             SetUniform1(name, value);
@@ -160,7 +193,7 @@ namespace ValveResourceFormat.Renderer.Shaders
 
             foreach (var variant in variants.Values)
             {
-                variant.SetUniform1(name, value);
+                variant.SetUniform1AllVariants(name, value);
             }
         }
 
@@ -169,6 +202,9 @@ namespace ValveResourceFormat.Renderer.Shaders
 
         /// <summary>Gets those locations declared as an integer type, which need an integer format.</summary>
         public int IntegerAttributes { get; private set; }
+
+        /// <summary>Gets the renderer shader file this shader was compiled from, without stage or extension (e.g. <c>hlvr/vr_simple</c>).</summary>
+        internal string SourceFile { get; init; } = string.Empty;
 
 #if DEBUG
         /// <summary>Gets the shader file name on disk (debug builds only).</summary>
@@ -181,17 +217,12 @@ namespace ValveResourceFormat.Renderer.Shaders
         public Shader(string name, RendererContext rendererContext)
         {
             Name = name;
-            NameHash = MurmurHash2.Hash(Name, StringToken.MURMUR2SEED);
+            NameHash = XxHash32.HashToUInt32(MemoryMarshal.AsBytes(Name.AsSpan()));
             RendererContext = rendererContext;
             Default = new RenderMaterial(this);
             MaterialLoader = rendererContext.MaterialLoader;
             Logger = rendererContext.Logger;
             shaderLoader = rendererContext.ShaderLoader;
-
-            IgnoreMaterialData = Name is "picking"
-                                      or "outline"
-                                      or "depth_only"
-                                      or "quad_overdraw";
         }
 
         /// <summary>Ensures the shader program has been linked and its uniforms have been cached.</summary>
@@ -204,6 +235,7 @@ namespace ValveResourceFormat.Renderer.Shaders
 
                 GL.GetProgram(Program, GetProgramParameterName.LinkStatus, out var linkStatus);
                 IsValid = linkStatus == 1;
+                FailureLog = IsValid ? null : GetFailureLog();
 
                 DetachAndDeleteShaderObjects();
 
@@ -217,9 +249,36 @@ namespace ValveResourceFormat.Renderer.Shaders
                     VerifyGlobalsLayout();
 #endif
                 }
+                else
+                {
+                    ShaderLoader.ThrowLinkFailure(this);
+                }
             }
 
             return IsValid;
+        }
+
+        /// <summary>Gets the compile and link log of a program that failed to link, once <see cref="EnsureLoaded"/> has run.</summary>
+        public string? FailureLog { get; private set; }
+        private string GetFailureLog()
+        {
+            var log = new StringBuilder();
+
+            foreach (var obj in ShaderObjects)
+            {
+                GL.GetShader(obj, ShaderParameter.CompileStatus, out var compileStatus);
+
+                if (compileStatus != 1)
+                {
+                    GL.GetShaderInfoLog(obj, out var compileLog);
+                    log.AppendLine(compileLog);
+                }
+            }
+
+            GL.GetProgramInfoLog(Program, out var linkLog);
+            log.Append(linkLog);
+
+            return log.ToString();
         }
 
         private void DetachAndDeleteShaderObjects()
@@ -231,10 +290,7 @@ namespace ValveResourceFormat.Renderer.Shaders
             }
         }
 
-        /// <summary>
-        /// Deletes the program and the buffer holding its default globals. Any stage objects that
-        /// <see cref="EnsureLoaded"/> did not get to clean up are deleted with it.
-        /// </summary>
+        /// <summary>Deletes the program, its default globals buffer, and any stage objects still attached.</summary>
         public void Delete()
         {
             if (Program == 0)
@@ -256,10 +312,7 @@ namespace ValveResourceFormat.Renderer.Shaders
             Default.Delete();
         }
 
-        /// <summary>
-        /// Caches the attribute locations the linked program reads, and verifies each landed where its
-        /// <see cref="VertexSlot"/> puts it. Attributes the linker dropped are not active.
-        /// </summary>
+        /// <summary>Caches the attribute locations the linked program reads, and verifies each landed on its <see cref="VertexSlot"/>.</summary>
         private void StoreRequiredAttributes()
         {
             GL.GetProgram(Program, GetProgramParameterName.ActiveAttributes, out var attributeCount);
@@ -300,11 +353,7 @@ namespace ValveResourceFormat.Renderer.Shaders
             }
         }
 
-        /// <summary>
-        /// A shader whose attributes the renderer cannot place is an authoring fault, so development builds
-        /// stop on it. A release build only logs, because a mounted shader must not take the viewer down
-        /// from inside a draw call.
-        /// </summary>
+        /// <summary>Stops on an unplaceable attribute in development builds, and only logs in release.</summary>
         private void ReportBadAttribute(string message)
         {
             Logger.LogError("{Message}", message);
@@ -371,7 +420,8 @@ namespace ValveResourceFormat.Renderer.Shaders
                     continue;
                 }
 
-                var isTexture = type is >= ActiveUniformType.Sampler2D and <= ActiveUniformType.SamplerCube;
+                var isTexture = type is >= ActiveUniformType.Sampler2D and <= ActiveUniformType.SamplerCube
+                    or ActiveUniformType.Sampler1DArray or ActiveUniformType.Sampler2DArray;
                 var isVector = type is >= ActiveUniformType.FloatVec2 and <= ActiveUniformType.IntVec4;
                 var isScalar = type == ActiveUniformType.Float;
                 var isBoolean = type == ActiveUniformType.Bool;
@@ -385,8 +435,10 @@ namespace ValveResourceFormat.Renderer.Shaders
                         continue;
                     }
 
-                    Default.Textures[name] = name switch
+                    Default.Textures[name] = type switch
                     {
+                        ActiveUniformType.Sampler1DArray or ActiveUniformType.Sampler2DArray => MaterialLoader.GetDefaultTextureArray(),
+                        ActiveUniformType.Sampler3D => MaterialLoader.GetDefaultVolume(),
                         _ when name.Contains("color", StringComparison.OrdinalIgnoreCase) => MaterialLoader.GetErrorTexture(),
                         _ when name.Contains("normal", StringComparison.OrdinalIgnoreCase) => MaterialLoader.GetDefaultNormal(),
                         _ when name.Contains("mask", StringComparison.OrdinalIgnoreCase) => MaterialLoader.GetDefaultMask(),
@@ -429,7 +481,7 @@ namespace ValveResourceFormat.Renderer.Shaders
             }
 
             // Seeded from the source, where a sampler behind a combo the linker dropped still looks used.
-            ReservedTexturesUsed.RemoveWhere(reserved => GL.GetUniformLocation(Program, reserved) == -1);
+            ReservedTexturesUsed.RemoveWhere(reserved => ActiveUniformLocation(reserved) == -1);
         }
 
         /// <summary>Points every reserved texture sampler this program declares at its global texture unit.</summary>
@@ -438,7 +490,7 @@ namespace ValveResourceFormat.Renderer.Shaders
             // Table driven: StoreUniformLocations does not classify array and shadow samplers.
             foreach (var (name, slot) in MaterialLoader.ReservedTextureSlotByName)
             {
-                var uniformLocation = GetUniformLocation(name);
+                var uniformLocation = ActiveUniformLocation(name);
 
                 if (uniformLocation > -1)
                 {
@@ -447,12 +499,10 @@ namespace ValveResourceFormat.Renderer.Shaders
             }
         }
 
-        /// <summary>
-        /// Installs this shader program as part of the current rendering state, along with the constant buffer
-        /// holding its own global uniforms. A <see cref="RenderMaterial"/> rendered afterwards replaces that
-        /// buffer with its own; shaders drawn without a material keep it, and <see cref="SetUniform(string, float)"/>
-        /// writes into it.
-        /// </summary>
+        private int ActiveUniformLocation(string name)
+            => Uniforms.TryGetValue(name, out var uniform) ? uniform.Location : -1;
+
+        /// <summary>Installs this program and the constant buffer holding its own global uniforms.</summary>
         public void Use()
         {
             EnsureLoaded();
@@ -489,13 +539,15 @@ namespace ValveResourceFormat.Renderer.Shaders
         /// <inheritdoc cref="SetUniform(string, float)"/>
         public void SetUniform(string name, Matrix4x4 value) => Default.SetUniform(name, value);
 
-        /// <summary>Enumerates all active non-block uniforms in the program (uniforms belonging to uniform blocks are skipped), populating the internal uniform location cache.</summary>
+        /// <summary>Enumerates active uniforms outside uniform blocks, populating the uniform location cache.</summary>
         /// <returns>A sequence of tuples with each uniform's name, index, type, and array size.</returns>
         public IEnumerable<(string Name, int Index, ActiveUniformType Type, int Size)> GetAllUniformNames()
         {
-            var uniformBlockMemberIndices = new List<int>();
-
+            GL.GetProgram(Program, GetProgramParameterName.ActiveUniforms, out var count);
             GL.GetProgram(Program, GetProgramParameterName.ActiveUniformBlocks, out var uniformBlockCount);
+
+            var isUniformBlockMember = new bool[count];
+            var uniformBlockMemberCount = 0;
 
             for (var i = 0; i < uniformBlockCount; i++)
             {
@@ -503,17 +555,21 @@ namespace ValveResourceFormat.Renderer.Shaders
 
                 var uniformIndices = new int[activeUniformsCount];
                 GL.GetActiveUniformBlock(Program, i, ActiveUniformBlockParameter.UniformBlockActiveUniformIndices, uniformIndices);
-                uniformBlockMemberIndices.AddRange(uniformIndices);
+
+                foreach (var uniformIndex in uniformIndices)
+                {
+                    isUniformBlockMember[uniformIndex] = true;
+                }
+
+                uniformBlockMemberCount += activeUniformsCount;
             }
 
-            GL.GetProgram(Program, GetProgramParameterName.ActiveUniforms, out var count);
-
-            Uniforms.EnsureCapacity(count - uniformBlockMemberIndices.Count);
+            Uniforms.EnsureCapacity(count - uniformBlockMemberCount);
             Uniforms.Clear();
 
             for (var i = 0; i < count; i++)
             {
-                if (uniformBlockMemberIndices.Contains(i))
+                if (isUniformBlockMember[i])
                 {
                     continue;
                 }
@@ -531,11 +587,7 @@ namespace ValveResourceFormat.Renderer.Shaders
         }
 
 #if DEBUG
-        /// <summary>
-        /// Checks the offsets <see cref="GlobalsLayout"/> computed against the ones the driver laid the
-        /// block out at. They are both std140 so they have to agree, but getting this wrong would corrupt every
-        /// material silently (debug builds only).
-        /// </summary>
+        /// <summary>Checks the offsets <see cref="GlobalsLayout"/> computed against the driver's own std140 layout (debug builds only).</summary>
         private void VerifyGlobalsLayout()
         {
             if (GlobalsLayout.Size == 0)
@@ -580,6 +632,9 @@ namespace ValveResourceFormat.Renderer.Shaders
         /// <returns>The uniform location, or -1 if the uniform does not exist in the program.</returns>
         public int GetUniformLocation(string name)
         {
+            // Until it links, every uniform the source declares reads as -1
+            EnsureLoaded();
+
             if (Uniforms.TryGetValue(name, out var locationType))
             {
                 return locationType.Location;
@@ -694,25 +749,8 @@ namespace ValveResourceFormat.Renderer.Shaders
             }
         }
 
-
-        /// <summary>
-        /// Gets this shader built for what a mesh supplies. Only a pass that replaces material shaders needs
-        /// it, since a material shader already carries the combo of the mesh it was loaded for.
-        /// </summary>
+        /// <summary>Gets this shader built for what a mesh supplies, for passes that replace material shaders.</summary>
         public Shader WithSkinning(MeshSkinning skinning) => WithCombo("D_SKINNING", (byte)skinning);
-
-        /// <summary>Sets the <c>uAnimationData</c> uniform used by skinned mesh shaders.</summary>
-        /// <param name="animated">Whether skeletal animation is active.</param>
-        /// <param name="boneOffset">Offset into the bone transform buffer.</param>
-        /// <param name="boneCount">Number of bones influencing this draw call.</param>
-        public void SetBoneAnimationData(bool animated, int boneOffset = 0, int boneCount = 0)
-        {
-            var uniformLocation = GetUniformLocation("uAnimationData");
-            if (uniformLocation > -1)
-            {
-                GL.ProgramUniform3((uint)Program, uniformLocation, animated ? 1u : 0u, (uint)boneOffset, (uint)boneCount);
-            }
-        }
 
         /// <summary>Sets an array of four-component float vector uniforms on this program.</summary>
         /// <param name="name">The uniform array name.</param>
@@ -727,7 +765,7 @@ namespace ValveResourceFormat.Renderer.Shaders
             }
         }
 
-        /// <summary>Sets a 3×4 matrix uniform (converted from a <see cref="Matrix4x4"/> by transposing and dropping the last (M14/M24/M34/M44) column).</summary>
+        /// <summary>Sets a 3x4 matrix uniform (converted from a <see cref="Matrix4x4"/> by transposing and dropping the last (M14/M24/M34/M44) column).</summary>
         public void SetUniform3x4(string name, Matrix4x4 value)
         {
             var uniformLocation = GetUniformLocation(name);
@@ -738,7 +776,7 @@ namespace ValveResourceFormat.Renderer.Shaders
             }
         }
 
-        /// <summary>Sets a 4×4 matrix uniform on this program.</summary>
+        /// <summary>Sets a 4x4 matrix uniform on this program.</summary>
         /// <param name="name">The uniform variable name.</param>
         /// <param name="value">The matrix value.</param>
         /// <param name="transpose">Whether to transpose the matrix before uploading.</param>

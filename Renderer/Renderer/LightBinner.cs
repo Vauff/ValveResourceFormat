@@ -1,21 +1,17 @@
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using OpenTK.Graphics.OpenGL;
-using ValveResourceFormat.Renderer.Buffers;
-using ValveResourceFormat.Renderer.Shaders;
 using ValveResourceFormat.Renderer.World;
 
 namespace ValveResourceFormat.Renderer;
 
 /// <summary>
-/// Per scene owner of the tile and depth bin cull passes: the item layout, the GPU buffers they read and
-/// write, and the constants that tell the shading pass where to look.
+/// Tile and depth bin light culling for one view of a scene.
 /// </summary>
 /// <remarks>
-/// One per <see cref="Scene"/>, because the bit indices it produces are positions in that scene's barn
-/// light and env map arrays. The 3D skybox has its own arrays, so its bits mean nothing against these.
+/// Bit indices are positions in the barn light and env map arrays of that one scene, so masks are not interchangeable between scenes.
 /// </remarks>
-public sealed class LightBinner(Scene scene) : IDisposable
+public sealed class LightBinner(SceneViewState view)
 {
     /// <summary>Screen tile size as a power of two shift. 4 is 16x16 pixels.</summary>
     private const int TileShift = 4;
@@ -36,7 +32,7 @@ public sealed class LightBinner(Scene scene) : IDisposable
     private const float MaxSliceFar = 32768f;
 
     /// <summary>Words one batch's mask spans, which is also the reduce pass's dispatch width.</summary>
-    private const int MaxBatchWords = BarnLightConstants.MAX_BARN_LIGHTS / TiledCullFeeder.ItemsPerMask;
+    private const int MaxBatchWords = BarnLightConstants.MAX_BARN_LIGHT_FACES / TiledCullFeeder.ItemsPerMask;
 
     private readonly TiledCullFeeder Feeder = new();
 
@@ -48,7 +44,6 @@ public sealed class LightBinner(Scene scene) : IDisposable
     private StorageBuffer? CullPlanesGpu;
     private StorageBuffer? VisibleBitsGpu;
     private UniformBuffer<CullParams>? CullParamsGpu;
-    private UniformBuffer<LightCullConstants>? ConstantsGpu;
 
     private ReadbackRing? VisibilityReadback;
 
@@ -56,7 +51,7 @@ public sealed class LightBinner(Scene scene) : IDisposable
     private readonly BarnLightFaceSlot[][] VisibilitySnapshots = new BarnLightFaceSlot[ReadbackRing.Depth][];
     private readonly int[] VisibilitySnapshotCounts = new int[ReadbackRing.Depth];
 
-    private readonly LightCullConstants Constants = new();
+    private LightCullConstants Constants;
 
     private int TileCols;
     private int TileRows;
@@ -68,35 +63,40 @@ public sealed class LightBinner(Scene scene) : IDisposable
     /// so one it missed can be told apart from one it found dark.</summary>
     public int VisibilitySequence { get; private set; }
 
+    private bool visibilityReadbackPending;
+
     /// <summary>Gets the buffer holding this scene's per tile and per depth bin masks.</summary>
     public StorageBuffer? CullBits { get; private set; }
 
-    private bool CanCull => (scene.LightingInfo.LightingData.NumBarnLights > 0 || scene.LightingInfo.EnvMaps.Count > 0)
+    /// <summary>Gets the first word of the projected decal batch's tile region. Valid after <see cref="Update"/>.</summary>
+    public uint DecalTileBase => Feeder.TileBase(TiledCullFeeder.BatchDecals);
+
+    /// <summary>Gets the first word of the projected decal batch's depth bin region.</summary>
+    public uint DecalBinBase => Feeder.BinBase(TiledCullFeeder.BatchDecals);
+
+    /// <summary>Gets the mask words per tile and per depth bin of the projected decal batch.</summary>
+    public uint DecalCullWords => Feeder.Stride(TiledCullFeeder.BatchDecals);
+
+    /// <summary>Gets the projected decal slots the decal pass iterates.</summary>
+    public int DecalSlotCount => Feeder.SlotCount(TiledCullFeeder.BatchDecals);
+
+    private bool CanCull => (view.Scene.LightingInfo.LightingData.NumBarnLights > 0
+            || view.Scene.LightingInfo.EnvMaps.Count > 0
+            || view.Scene.ProbeAtlasVolumes.Count > 0
+            || view.Scene.ProjectedDecals.Count > 0)
         && TileCullBitsShader != null
         && DepthBinCullBitsShader != null;
 
-    /// <summary>Loads the two compute shaders. Call once the GL context exists.</summary>
+    /// <summary>Loads the three compute shaders. Call once the GL context exists.</summary>
     public void LoadShaders()
     {
-        TileCullBitsShader = scene.RendererContext.ShaderLoader.LoadShader("compute_tile_cullbits");
-        DepthBinCullBitsShader = scene.RendererContext.ShaderLoader.LoadShader("compute_depthbin_cullbits");
-        ReduceCullBitsShader = scene.RendererContext.ShaderLoader.LoadShader("reduce_cullbits");
+        TileCullBitsShader = view.Scene.RendererContext.ShaderLoader.LoadShader("compute_tile_cullbits");
+        DepthBinCullBitsShader = view.Scene.RendererContext.ShaderLoader.LoadShader("compute_depthbin_cullbits");
+        ReduceCullBitsShader = view.Scene.RendererContext.ShaderLoader.LoadShader("reduce_cullbits");
     }
 
-    /// <summary>
-    /// Points this pass's pixels at the ones the masks were built for. The viewmodel draws into the same
-    /// target through a different projection, so it cannot take its tile from gl_FragCoord directly.
-    /// </summary>
-    /// <param name="remap">Pixel remap: xy scale, zw bias.</param>
-    public void SetPixelRemap(Vector4 remap)
-    {
-        Constants.LightCullPixelRemap = remap;
-
-        if (ConstantsGpu != null)
-        {
-            ConstantsGpu.Data = Constants;
-        }
-    }
+    /// <summary>Gets the layout of this scene's masks and the view they were built for. Valid after <see cref="Update"/>.</summary>
+    public LightCullConstants CullConstants => Constants;
 
     /// <summary>What this scene's binner produced for the frame, for the render stats display.</summary>
     /// <param name="Active">Whether items were binned, as opposed to every mask being filled with ones.</param>
@@ -128,21 +128,12 @@ public sealed class LightBinner(Scene scene) : IDisposable
         ? (Constants.EnvMapTileBase, Constants.EnvMapCullWords)
         : (Constants.LightTileBase, Constants.LightCullWords);
 
-    /// <summary>Binds this scene's masks and their layout for the shading pass.</summary>
-    public void Bind()
-    {
-        CullBits?.BindBufferBase();
-
-        if (ConstantsGpu != null)
-        {
-            ConstantsGpu.BindBufferBase();
-            ConstantsGpu.Update();
-        }
-    }
+    /// <summary>Binds this scene's masks for the shading pass.</summary>
+    public void Bind() => CullBits?.BindBufferBase();
 
     /// <summary>
-    /// Projects every cull item for this frame and publishes the resulting layout. Must run before the
-    /// view buffer upload preceding <see cref="Dispatch"/>, since the shading pass reads the layout.
+    /// Projects every cull item for this frame and works out the resulting layout. Must run before the
+    /// view buffer upload preceding <see cref="Dispatch"/>, which carries the layout to the shading pass.
     /// </summary>
     /// <param name="viewConstants">View the items are projected against.</param>
     /// <param name="viewportWidth">Viewport width in pixels.</param>
@@ -157,8 +148,8 @@ public sealed class LightBinner(Scene scene) : IDisposable
         var width = Math.Max(viewportWidth, 1);
         var height = Math.Max(viewportHeight, 1);
 
-        TileCols = (width + tileSize - 1) >> TileShift;
-        TileRows = (height + tileSize - 1) >> TileShift;
+        TileCols = MathUtils.DivideRoundUp(width, tileSize);
+        TileRows = MathUtils.DivideRoundUp(height, tileSize);
 
         Feeder.Begin(
             TileCols, TileRows, tileSize,
@@ -170,8 +161,10 @@ public sealed class LightBinner(Scene scene) : IDisposable
 
         if (Active)
         {
-            Feeder.AddBarnLights(scene.LightingInfo.BinnedBarnLightVolumes);
-            Feeder.AddEnvMaps(scene.LightingInfo.EnvMaps);
+            Feeder.AddBarnLights(view.Scene.LightingInfo.BinnedBarnLightVolumes);
+            Feeder.AddEnvMaps(view.Scene.LightingInfo.EnvMaps);
+            Feeder.AddLightProbes(view.Scene.ProbeAtlasVolumes);
+            Feeder.AddDecals(view.Scene.ProjectedDecals.BoxTransforms);
         }
         else
         {
@@ -180,8 +173,10 @@ public sealed class LightBinner(Scene scene) : IDisposable
             // Capped to the shader array: the scene list can hold probes past it, which CalculateEnvironmentMaps
             // logs and never assigns a shader index to, and iterating them would read off the end of the UBO.
             Feeder.AddCounts(
-                scene.LightingInfo.BinnedBarnLightVolumes.Length,
-                Math.Min(scene.LightingInfo.EnvMaps.Count, EnvMapArray.MAX_ENVMAPS));
+                view.Scene.LightingInfo.BinnedBarnLightVolumes.Length,
+                Math.Min(view.Scene.LightingInfo.EnvMaps.Count, EnvMapArray.MAX_ENVMAPS),
+                view.Scene.ProbeAtlasVolumes.Count,
+                view.Scene.ProjectedDecals.Count);
         }
 
         Feeder.End();
@@ -207,13 +202,15 @@ public sealed class LightBinner(Scene scene) : IDisposable
         Constants.EnvMapCullWords = Feeder.Stride(TiledCullFeeder.BatchEnvMaps);
         Constants.EnvMapCount = (uint)Feeder.SlotCount(TiledCullFeeder.BatchEnvMaps);
 
+        Constants.LightProbeTileBase = Feeder.TileBase(TiledCullFeeder.BatchLightProbes);
+        Constants.LightProbeBinBase = Feeder.BinBase(TiledCullFeeder.BatchLightProbes);
+        Constants.LightProbeCullWords = Feeder.Stride(TiledCullFeeder.BatchLightProbes);
+        Constants.LightProbeCount = (uint)Feeder.SlotCount(TiledCullFeeder.BatchLightProbes);
+
         Constants.LightCullCameraPosition = viewConstants.CameraPosition;
         Constants.LightCullCameraDir = viewConstants.CameraDirWs;
 
         Constants.LightCullPixelRemap = ViewConstants.PixelRemapIdentity;
-
-        Debug.Assert(ConstantsGpu is not null);
-        ConstantsGpu.Data = Constants;
     }
 
     /// <summary>
@@ -265,14 +262,21 @@ public sealed class LightBinner(Scene scene) : IDisposable
 
         GL.MemoryBarrier(MemoryBarrierFlags.ShaderStorageBarrierBit);
 
-        SubmitVisibilityReadback();
+        visibilityReadbackPending = true;
     }
 
     /// <summary>Reduces this frame's barn light tile masks to one screen wide mask and queues it for
     /// readback. Skipped while every ring slot is in flight, so a stalled reader queues nothing.</summary>
-    private void SubmitVisibilityReadback()
+    public void SubmitVisibilityReadback()
     {
-        var faces = scene.LightingInfo.BinnedBarnLightFaces;
+        if (!visibilityReadbackPending)
+        {
+            return;
+        }
+
+        visibilityReadbackPending = false;
+
+        var faces = view.Scene.LightingInfo.BinnedBarnLightFaces;
         var words = (int)Constants.LightCullWords;
 
         if (ReduceCullBitsShader == null || faces.Length == 0 || words == 0)
@@ -281,8 +285,7 @@ public sealed class LightBinner(Scene scene) : IDisposable
         }
 
         VisibilityReadback ??= new ReadbackRing(MaxBatchWords);
-        VisibleBitsGpu ??= StorageBuffer.Allocate<uint>(
-            ReservedBufferSlots.BufferSlot2, "VisibleCullBits", MaxBatchWords, BufferUsageHint.DynamicCopy);
+        VisibleBitsGpu ??= StorageBuffer.Allocate<uint>(ReservedBufferSlots.BufferSlot15, "VisibleCullBits", MaxBatchWords, BufferUsage.GpuOnly);
 
         if (VisibilityReadback.InFlight == ReadbackRing.Depth)
         {
@@ -308,7 +311,7 @@ public sealed class LightBinner(Scene scene) : IDisposable
         // The slot order this mask is against only exists this frame, so what each bit meant travels with
         // the copy, per ring slot because three are in flight at once.
         ref var snapshot = ref VisibilitySnapshots[slot];
-        snapshot ??= new BarnLightFaceSlot[BarnLightConstants.MAX_BARN_LIGHTS];
+        snapshot ??= new BarnLightFaceSlot[BarnLightConstants.MAX_BARN_LIGHT_FACES];
 
         faces.CopyTo(snapshot);
         VisibilitySnapshotCounts[slot] = faces.Length;
@@ -340,7 +343,7 @@ public sealed class LightBinner(Scene scene) : IDisposable
 
             while (i < count && ReferenceEquals(snapshot[i].Light, light))
             {
-                if ((words[i >> 5] & (1u << (i & 31))) != 0u)
+                if (MathUtils.GetBit(words, i))
                 {
                     visibleFaces |= 1u << snapshot[i].FaceIndex;
                 }
@@ -359,20 +362,16 @@ public sealed class LightBinner(Scene scene) : IDisposable
     private void EnsureBuffers()
     {
         CullParamsGpu ??= new UniformBuffer<CullParams>(ReservedBufferSlots.CullParams);
-        ConstantsGpu ??= new UniformBuffer<LightCullConstants>(ReservedBufferSlots.LightCull);
 
-        CullItemsGpu ??= StorageBuffer.Allocate<CullItem>(
-            ReservedBufferSlots.BufferSlot2, "CullItems", Feeder.ItemArray.Length, BufferUsageHint.DynamicDraw);
+        CullItemsGpu ??= StorageBuffer.Allocate<CullItem>(ReservedBufferSlots.BufferSlot15, "CullItems", Feeder.ItemArray.Length, BufferUsage.Dynamic);
 
-        CullPlanesGpu ??= StorageBuffer.Allocate<Vector2>(
-            ReservedBufferSlots.BufferSlot3, "CullPlanes", Feeder.PlaneArray.Length, BufferUsageHint.DynamicDraw);
+        CullPlanesGpu ??= StorageBuffer.Allocate<Vector2>(ReservedBufferSlots.BufferSlot11, "CullPlanes", Feeder.PlaneArray.Length, BufferUsage.Dynamic);
 
         if (CullBits == null || CullBitsWords < Feeder.TotalWords)
         {
             CullBits?.Delete();
             CullBitsWords = Feeder.TotalWords;
-            CullBits = StorageBuffer.Allocate<uint>(
-                ReservedBufferSlots.CullBits, nameof(ReservedBufferSlots.CullBits), CullBitsWords, BufferUsageHint.DynamicCopy);
+            CullBits = StorageBuffer.Allocate<uint>(ReservedBufferSlots.CullBits, nameof(ReservedBufferSlots.CullBits), CullBitsWords, BufferUsage.GpuOnly);
 
             // A fresh allocation holds nothing in particular, and every zero bit reads as an item culled.
             // Start visible instead: a pass that never reaches Dispatch - a viewer holding a locked cull
@@ -388,37 +387,35 @@ public sealed class LightBinner(Scene scene) : IDisposable
     /// </summary>
     private void SetOcclusionUniforms(Shader shader)
     {
-        if (!scene.SetOcclusionUniforms(shader))
+        if (!view.SetOcclusionUniforms(shader))
         {
             return;
         }
 
-        Debug.Assert(scene.DepthPyramid != null);
+        Debug.Assert(view.DepthPyramid != null);
 
         // Cull space is pixels, so this is just the pyramid's size over the viewport's. Only this pass
         // needs it, because only this pass starts from a screen rect rather than a world space box.
         shader.SetUniform("g_vCullToPyramidScale", new Vector2(
-            scene.DepthPyramid.Width / MathF.Max(Feeder.ViewportSize.X, 1f),
-            scene.DepthPyramid.Height / MathF.Max(Feeder.ViewportSize.Y, 1f)));
+            view.DepthPyramid.Width / MathF.Max(Feeder.ViewportSize.X, 1f),
+            view.DepthPyramid.Height / MathF.Max(Feeder.ViewportSize.Y, 1f)));
     }
 
-    /// <inheritdoc/>
-    public void Dispose()
+    /// <summary>Deletes the GPU buffers of the cull passes.</summary>
+    public void Delete()
     {
         CullBits?.Delete();
         CullItemsGpu?.Delete();
         CullPlanesGpu?.Delete();
         VisibleBitsGpu?.Delete();
-        CullParamsGpu?.Dispose();
-        ConstantsGpu?.Dispose();
-        VisibilityReadback?.Dispose();
+        CullParamsGpu?.Delete();
+        VisibilityReadback?.Delete();
 
         CullBits = null;
         CullItemsGpu = null;
         CullPlanesGpu = null;
         VisibleBitsGpu = null;
         CullParamsGpu = null;
-        ConstantsGpu = null;
         VisibilityReadback = null;
     }
 }

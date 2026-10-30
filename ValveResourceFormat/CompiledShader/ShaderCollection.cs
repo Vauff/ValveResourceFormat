@@ -1,7 +1,7 @@
 using System.Collections;
 using System.Diagnostics;
 using System.IO;
-using SteamDatabase.ValvePak;
+using ValvePak;
 
 namespace ValveResourceFormat.CompiledShader;
 
@@ -66,15 +66,13 @@ public class ShaderCollection : IEnumerable<VfxProgramData>, IDisposable
             foreach (var vcsEntry in vcsEntries)
             {
                 // vcsEntry.FileName is in the form bloom_dota_pcgl_30_ps (without vcs extension)
-                if (vcsEntry.FileName.AsSpan().StartsWith(vcsCollectionName, StringComparison.InvariantCulture))
+                if (vcsEntry.FileName.AsSpan().StartsWith(vcsCollectionName, StringComparison.Ordinal))
                 {
-                    vrfPackage.ReadEntry(vcsEntry, out var shaderDatabytes);
-
                     var relatedShaderFile = new VfxProgramData();
 
                     try
                     {
-                        relatedShaderFile.Read(vcsEntry.GetFileName(), new MemoryStream(shaderDatabytes));
+                        relatedShaderFile.Read(vcsEntry.GetFileName(), vrfPackage.GetMemoryMappedStreamIfPossible(vcsEntry));
                         shaderCollection.Add(relatedShaderFile);
                         relatedShaderFile = null;
                     }
@@ -90,14 +88,14 @@ public class ShaderCollection : IEnumerable<VfxProgramData>, IDisposable
             // search file-system
             foreach (var vcsFile in Directory.GetFiles(Path.GetDirectoryName(targetFilename)!))
             {
-                if (Path.GetFileName(vcsFile.AsSpan()).StartsWith(vcsCollectionName, StringComparison.InvariantCulture))
+                if (Path.GetFileName(vcsFile.AsSpan()).StartsWith(vcsCollectionName, StringComparison.Ordinal))
                 {
                     VfxProgramData? program = null;
                     Stream? stream = null;
 
                     try
                     {
-                        stream = new FileStream(vcsFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                        stream = new FileStream(vcsFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
                         program = new VfxProgramData();
                         program.Read(Path.GetFileName(vcsFile), stream);
                         shaderCollection.Add(program);

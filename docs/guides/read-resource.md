@@ -1,3 +1,7 @@
+---
+description: Describes the binary layout of compiled Source 2 resource files with a _c suffix, including the header and block index table.
+---
+
 # Valve Resource File
 
 This document describes the binary file format used by Valve's Source 2 engine for compiled resource files (files with `_c` suffix such as `.vmdl_c`, `.vtex_c`, `.vmat_c`, etc.).
@@ -32,7 +36,7 @@ A version number specific to the resource type. Different resource types maintai
 
 ### BlockOffset
 
-The offset in bytes from the **current read position** (after reading `BlockCount`) to the start of the block index table.
+The offset in bytes from the **start of the BlockOffset field itself** (offset `0x08`) to the start of the block index table.
 
 ### BlockCount
 
@@ -40,7 +44,7 @@ The total number of data blocks in this resource. The block index table will con
 
 ## Block Index Table
 
-The block index table begins at offset `0x10 + BlockOffset` (typically at offset 0x10, immediately after the header).
+The block index table begins at offset `0x08 + BlockOffset` (typically at offset 0x10, immediately after the header).
 
 Each entry in the table is exactly **12 bytes** and describes one block:
 

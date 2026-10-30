@@ -4,6 +4,11 @@ using PrimitiveType = OpenTK.Graphics.OpenGL.PrimitiveType;
 
 namespace ValveResourceFormat.Renderer.SceneNodes
 {
+    /// <summary>A solid edge along the sides of a sprite, as wide on the screen whatever the size of the sprite.</summary>
+    /// <param name="Color">The color of the edge, which the sprite is cut out of like its texture.</param>
+    /// <param name="WidthPx">The width of the edge, in pixels.</param>
+    internal readonly record struct SpriteBorder(Vector4 Color, float WidthPx);
+
     class SpriteSceneNode : SceneNode
     {
         [StructLayout(LayoutKind.Sequential)]
@@ -37,71 +42,99 @@ namespace ValveResourceFormat.Renderer.SceneNodes
         private readonly int vao;
         private readonly RenderMaterial material;
         private readonly float spriteSize;
+        private readonly SpriteBorder? border;
 
-        /// <summary>Color multiplier applied to the sprite, in gamma space.</summary>
-        public Vector4 Tint { get; set; } = Vector4.One;
+        public override bool IsPointMarker => true;
 
-        public SpriteSceneNode(Scene scene, RendererContext renderContext, Resource resource, Vector3 position)
+        /// <summary>
+        /// Gets whether the sprite is drawn over everything else, after the opaque scene and without being
+        /// hidden by it, rather than among the opaque nodes.
+        /// </summary>
+        public bool IsDrawnOverScene
+        {
+            get;
+            init
+            {
+                field = value;
+
+                if (value)
+                {
+                    RenderPasses &= ~CustomRenderPasses.DepthOnly;
+                }
+            }
+        }
+
+        public SpriteSceneNode(Scene scene, RendererContext renderContext, Resource resource, Vector3 position, SpriteBorder? border = null)
             : base(scene)
         {
-            material = renderContext.MaterialLoader.LoadMaterial(resource);
+            var shaderArguments = scene.LightingInfo.CreateShaderArguments();
+
+            if (border != null)
+            {
+                shaderArguments["D_BORDER"] = 1;
+            }
+
+            material = renderContext.MaterialLoader.LoadMaterial(resource, shaderArguments);
+            this.border = border;
 
             // Forcefully clamp sprites so they don't render extra pixels on edges
             foreach (var texture in material.Textures.Values)
             {
-                texture.SetWrapMode(TextureWrapMode.ClampToEdge);
+                texture.SetWrapMode(RsTextureAddressMode.Clamp);
             }
 
-            GL.CreateBuffers(1, out int vboHandle);
+            var label = $"{nameof(SpriteSceneNode)}: {System.IO.Path.GetFileName(resource.FileName)}";
+            var vboHandle = GraphicsDevice.CreateBuffer<Vertex>(label, Vertices, BufferUsage.Static);
 
-#if DEBUG
-            var vaoLabel = $"{nameof(SpriteSceneNode)}: {System.IO.Path.GetFileName(resource.FileName)}";
-            GL.ObjectLabel(ObjectLabelIdentifier.Buffer, vboHandle, Math.Min(GLEnvironment.MaxLabelLength, vaoLabel.Length), vaoLabel);
-#endif
-
-            GL.NamedBufferData(vboHandle, Vertices.Length * Vertex.InputLayout.Stride, Vertices, BufferUsageHint.StaticDraw);
-
-            vao = Vertex.InputLayout.CreateVertexArray(nameof(SpriteSceneNode), vboHandle);
+            vao = Vertex.InputLayout.CreateVertexArray(label, vboHandle);
 
             spriteSize = material.FloatParams.GetValueOrDefault("g_flUniformPointSize", 16);
             spriteSize /= 2f; // correct the scale to actually be 16x16
 
-            LocalBoundingBox = new AABB(-Vector3.One * spriteSize, Vector3.One * spriteSize);
+            LocalBoundingBox = new AABB(-Vector3.One, Vector3.One);
             Transform = Matrix4x4.CreateTranslation(position.X, position.Y, position.Z);
+
+            RenderPasses |= CustomRenderPasses.DepthOnly;
+        }
+
+        public override void Update(Scene.UpdateContext context)
+        {
+            Transform = Matrix4x4.CreateScale(spriteSize * PlacementScale)
+                * context.Camera.BillboardMatrix
+                * Matrix4x4.CreateTranslation(Transform.Translation);
         }
 
         public override void Render(Scene.RenderContext context)
         {
-            if (context.RenderPass is not RenderPass.Opaque and not RenderPass.Outline)
+            var drawPass = IsDrawnOverScene ? RenderPass.Translucent : RenderPass.Opaque;
+
+            if (context.RenderPass != drawPass && context.RenderPass is not RenderPass.All and not RenderPass.DepthOnly)
             {
                 return;
             }
 
-            var renderShader = context.ReplacementShader ?? material.Shader;
+            using var overScene = IsDrawnOverScene && context.RenderPass == drawPass
+                ? GraphicsContext.RenderState.Scope(depthTest: false, depthWrite: false)
+                : default;
+
+            var renderShader = context.DepthOnlyShader?.WithAlphaTest(material.IsAlphaTest)
+                ?? context.ReplacementShader?.WithAlphaTest(material.IsAlphaTest)
+                ?? material.Shader;
+
             renderShader.Use();
 
             VertexArray.Bind(vao, renderShader);
 
-            // Create billboarding rotation (always facing camera)
-            if (!Matrix4x4.Decompose(context.Camera.CameraViewMatrix, out _, out var modelViewRotation, out _))
-            {
-                throw new InvalidOperationException("Matrix decompose failed");
-            }
-
-            modelViewRotation = Quaternion.Inverse(modelViewRotation);
-            var billboardMatrix = Matrix4x4.CreateFromQuaternion(modelViewRotation);
-
-            var transform = Matrix4x4.CreateScale(spriteSize)
-                * billboardMatrix
-                * Matrix4x4.CreateTranslation(Transform.Translation);
-            renderShader.SetUniform3x4("transform", transform);
-
-            renderShader.SetBoneAnimationData(false);
-            renderShader.SetUniform1("vTint", Color32.FromVector4Clamped(Tint).PackedValue);
             renderShader.SetUniform1("shaderId", material.Shader.NameHash);
             renderShader.SetUniform1("shaderProgramId", (uint)material.Shader.Program);
 
             material.Render(renderShader);
+
+            if (border is { } edge && renderShader == material.Shader)
+            {
+                renderShader.SetUniform("g_vBorderColor", edge.Color);
+                renderShader.SetUniform("g_flBorderWidthPx", edge.WidthPx);
+            }
 
             GL.DrawArraysInstancedBaseInstance(PrimitiveType.TriangleStrip, 0, 4, 1, Id);
 

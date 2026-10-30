@@ -134,7 +134,7 @@ namespace GUI.Utils
             {
                 var lastLine = control.Lines.Count;
 
-                control.AppendText($"[{line.Time:HH:mm:ss.fff}] [{line.Component}] ", TextStyleTime);
+                control.AppendText(string.Create(CultureInfo.InvariantCulture, $"[{line.Time:HH:mm:ss.fff}] [{line.Component}] "), TextStyleTime);
                 control.AppendText(string.Concat(line.Message, Environment.NewLine), line.Style);
 
                 // Add fold for multi line strings
@@ -182,7 +182,7 @@ namespace GUI.Utils
             control.VisibleChanged += VisibleChanged;
 
             control.AppendText($"- Welcome to Source 2 Viewer v{Program.ProductVersion}{Environment.NewLine}", TextStyleDebug);
-            control.AppendText($"- If you are experiencing an issue, try using latest dev build from https://valveresourceformat.github.io/{Environment.NewLine}{Environment.NewLine}");
+            control.AppendText($"- If you are experiencing an issue, try updating to the latest dev build from the About window{Environment.NewLine}{Environment.NewLine}");
 
             const string CONSOLE = "Console";
 

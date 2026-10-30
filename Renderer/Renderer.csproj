@@ -1,7 +1,6 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>net10.0</TargetFramework>
     <Description>OpenGL-based rendering engine for Source 2 game assets. Supports models, maps, materials, particles, and animations with PBR lighting.</Description>
     <PackageId>ValveResourceFormat.Renderer</PackageId>
     <PackageReleaseNotes>View release notes at https://github.com/ValveResourceFormat/ValveResourceFormat/releases</PackageReleaseNotes>
@@ -16,14 +15,19 @@
 
   <ItemGroup>
     <None Include="README.md" Pack="true" PackagePath="\" />
+    <None Include="..\THIRD_PARTY_NOTICES.txt" Pack="true" PackagePath="\" />
     <None Include="..\Misc\Icons\source2viewer.png" Pack="true" PackagePath="\" />
   </ItemGroup>
 
   <ItemGroup>
+    <Using Include="ValveKeyValue" />
+    <Using Include="ValveResourceFormat.ResourceTypes.ModelAnimation.FrameBone" Alias="Transform" />
     <Using Include="ValveResourceFormat.Utils" />
+    <Using Include="ValveResourceFormat.CompiledShader" />
     <Using Include="ValveResourceFormat.Renderer.Utils" />
     <Using Include="ValveResourceFormat.Renderer.Shaders" />
     <Using Include="ValveResourceFormat.Renderer.Materials" />
+    <Using Include="ValveResourceFormat.Renderer.Buffers" />
   </ItemGroup>
 
   <ItemGroup>
@@ -36,13 +40,15 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.10" />
-    <PackageReference Include="NLayer" Version="2.0.1" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="$(BundledNETCoreAppPackageVersion)" />
+    <PackageReference Include="NLayer" Version="3.0.0" />
     <PackageReference Include="OpenTK.Graphics" Version="4.9.4" />
+    <PackageReference Include="System.Numerics.Tensors" Version="$(BundledNETCoreAppPackageVersion)" />
   </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\ValveResourceFormat\ValveResourceFormat.csproj" />
+    <ProjectReference Include="..\Misc\SourceGenerators\SourceGenerators.csproj" OutputItemType="Analyzer" ReferenceOutputAssembly="false" />
   </ItemGroup>
 
 </Project>

@@ -8,7 +8,6 @@ using System.Windows.Forms;
 using GUI.Utils;
 using NAudio.Wave;
 using NAudio.Wave.SampleProviders;
-using ValveResourceFormat.Renderer.Utils;
 
 // Based on https://github.com/naudio/NAudio.WaveFormRenderer (MIT License - Copyright (c) 2021 NAudio)
 
@@ -19,7 +18,9 @@ namespace GUI.Controls
         private readonly record struct Peak(float Min, float Max);
         private readonly record struct Rgb(byte R, byte G, byte B);
 
-        private readonly WaveOutEvent WaveOut = new();
+        private const int PlayerLatencyMs = 50;
+
+        private WasapiPlayer? Player;
         private readonly WaveStream WaveStream;
         private readonly MemoryStream audioData;
         private readonly SampleChannel? SampleChannel;
@@ -27,6 +28,7 @@ namespace GUI.Controls
 
         private Bitmap? WavePeakBitmap;
 
+        private readonly string ErrorContext;
         private readonly bool AutoPlay;
         private bool Looping;
         private bool WaveformClicked;
@@ -46,8 +48,9 @@ namespace GUI.Controls
         private readonly Image RepeatImage = AppIcons.ImageList.Images[AppIcons.Icons["AudioRepeat"]];
         private readonly Image RepeatImagePressed = AppIcons.ImageList.Images[AppIcons.Icons["AudioRepeatPressed"]];
 
-        public AudioPlaybackPanel(WaveStream inputStream, bool autoPlay, (int start, int end) loopMarkers)
+        public AudioPlaybackPanel(WaveStream inputStream, string errorContext, bool autoPlay, (int start, int end) loopMarkers)
         {
+            ErrorContext = errorContext;
             AutoPlay = autoPlay;
             Dock = DockStyle.Fill;
 
@@ -74,11 +77,10 @@ namespace GUI.Controls
             WaveStream.Position = 0;
             audioData = new MemoryStream((int)WaveStream.Length);
             WaveStream.CopyTo(audioData);
+            WaveStream.Position = 0;
 
             labelCurrentTime.Text = GetCurrentTimeString(WaveStream.CurrentTime);
             volumeSlider.Value = Settings.Config.Volume;
-
-            WaveStream? stream = null;
 
             playPauseButton.Image = PlayImage;
             playPauseButton.Text = "";
@@ -97,16 +99,7 @@ namespace GUI.Controls
 
             try
             {
-                if (WaveStream.WaveFormat.Encoding == WaveFormatEncoding.Adpcm)
-                {
-                    stream = WaveFormatConversionStream.CreatePcmStream(WaveStream);
-                    SampleChannel = new SampleChannel(stream, true);
-                }
-                else
-                {
-                    SampleChannel = new SampleChannel(WaveStream, true);
-                }
-
+                SampleChannel = new SampleChannel(WaveStream, true);
                 SampleChannel.Volume = volumeSlider.Value;
 
                 LoopingProvider = new LoopingSampleProvider(SampleChannel, WaveStream, LoopMarkers.Start, LoopMarkers.End)
@@ -115,18 +108,18 @@ namespace GUI.Controls
                 };
                 LoopingProvider.LoopOccurred += OnLoopOccurred;
 
-                WaveOut.PlaybackStopped += OnPlaybackStopped;
-                WaveOut.Init(LoopingProvider);
-
-                stream = null;
+                // Built on the UI thread so PlaybackStopped is posted back to it
+                Player = new WasapiPlayerBuilder()
+                    .WithSharedMode()
+                    .WithEventSync()
+                    .WithLatency(PlayerLatencyMs)
+                    .Build();
+                Player.PlaybackStopped += OnPlaybackStopped;
+                Player.Init(LoopingProvider.ToWaveProvider());
             }
             catch (Exception driverCreateException)
             {
-                Program.ShowError(driverCreateException);
-            }
-            finally
-            {
-                stream?.Dispose();
+                ErrorReport.ShowError(driverCreateException, ErrorContext);
             }
         }
 
@@ -172,7 +165,7 @@ namespace GUI.Controls
 
             WaveStream.CurrentTime = TimeSpan.FromSeconds(WaveStream.TotalTime.TotalSeconds * progression);
 
-            if (WaveOut.PlaybackState == PlaybackState.Playing)
+            if (Player?.PlaybackState == PlaybackState.Playing)
             {
                 playbackStopwatch.Restart();
                 playbackStartPosition = WaveStream.CurrentTime;
@@ -360,7 +353,7 @@ namespace GUI.Controls
 
         private static Peak GetNextPeak(ISampleProvider provider, float[] readBuffer)
         {
-            var samplesRead = provider.Read(readBuffer, 0, readBuffer.Length);
+            var samplesRead = provider.Read(readBuffer);
 
             if (samplesRead == 0)
             {
@@ -476,9 +469,9 @@ namespace GUI.Controls
 
         private void OnPlayPauseButtonClick(object sender, EventArgs e)
         {
-            if (WaveOut.PlaybackState == PlaybackState.Playing)
+            if (Player?.PlaybackState == PlaybackState.Playing)
             {
-                WaveOut.Pause();
+                Player.Pause();
                 playbackTimer.Enabled = false;
                 playPauseButton.Image = PlayImage;
             }
@@ -490,7 +483,7 @@ namespace GUI.Controls
 
         public void Play()
         {
-            if (WaveOut.PlaybackState == PlaybackState.Playing)
+            if (Player is null || Player.PlaybackState == PlaybackState.Playing)
             {
                 return;
             }
@@ -505,7 +498,7 @@ namespace GUI.Controls
 
             SampleChannel?.Volume = volumeSlider.Value;
 
-            WaveOut.Play();
+            Player.Play();
             playbackTimer.Enabled = true;
             playPauseButton.Image = PauseImage;
             UpdateTime();
@@ -515,7 +508,7 @@ namespace GUI.Controls
         {
             if (e.Exception != null)
             {
-                Program.ShowError(e.Exception);
+                ErrorReport.ShowError(e.Exception, ErrorContext);
             }
 
             if (IsDisposed)
@@ -538,17 +531,16 @@ namespace GUI.Controls
             playbackStartPosition = WaveStream.CurrentTime;
         }
 
-        private void CloseWaveOut()
+        private void ClosePlayer()
         {
             playbackTimer.Enabled = false;
 
             LoopingProvider?.LoopOccurred -= OnLoopOccurred;
 
-            if (WaveOut is not null)
+            if (Player is not null)
             {
-                WaveOut.PlaybackStopped -= OnPlaybackStopped;
-                WaveOut.Stop();
-                WaveOut.Dispose();
+                Player.PlaybackStopped -= OnPlaybackStopped;
+                Player.Dispose();
             }
 
             PlayImage.Dispose();
@@ -575,7 +567,7 @@ namespace GUI.Controls
 
             var currentTime = playbackStartPosition;
 
-            if (WaveOut.PlaybackState == PlaybackState.Playing)
+            if (Player?.PlaybackState == PlaybackState.Playing)
             {
                 var elapsed = playbackStopwatch.Elapsed;
                 currentTime = playbackStartPosition + elapsed;
@@ -621,7 +613,6 @@ namespace GUI.Controls
                 playbackSlider.Value = progression;
             }
         }
-
 
         private void WaveFormPictureBox_MouseUp(object sender, MouseEventArgs e)
         {
@@ -672,13 +663,13 @@ namespace GUI.Controls
 
             public event EventHandler? LoopOccurred;
 
-            public int Read(float[] buffer, int offset, int count)
+            public int Read(Span<float> buffer)
             {
                 var totalRead = 0;
 
-                while (totalRead < count)
+                while (totalRead < buffer.Length)
                 {
-                    var samplesToRead = count - totalRead;
+                    var samplesToRead = buffer.Length - totalRead;
 
                     if (EnableLooping && loopEndFrame > loopStartFrame)
                     {
@@ -696,7 +687,7 @@ namespace GUI.Controls
                         samplesToRead = Math.Min(samplesToRead, samplesUntilLoop);
                     }
 
-                    var samplesRead = source.Read(buffer, offset + totalRead, samplesToRead);
+                    var samplesRead = source.Read(buffer.Slice(totalRead, samplesToRead));
 
                     if (samplesRead == 0)
                     {

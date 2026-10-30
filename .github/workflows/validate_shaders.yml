@@ -16,7 +16,7 @@ on:
       - Renderer/Renderer/ShaderParser.cs
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   validate:
@@ -33,7 +33,7 @@ jobs:
     - name: Setup .NET Core
       uses: actions/setup-dotnet@v6
       with:
-        dotnet-version: 10.0.x
+        global-json-file: global.json
 
     - name: Validate
       run: xvfb-run -a -s "-screen 0 1280x1024x24" dotnet run --project Misc/ShaderValidator

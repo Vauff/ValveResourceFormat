@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using ValveResourceFormat.Renderer.Decals;
 using ValveResourceFormat.Renderer.SceneEnvironment;
 
 namespace ValveResourceFormat.Renderer.Buffers;
@@ -31,14 +32,20 @@ public readonly struct BarnLightCullVolume
 /// </remarks>
 public sealed class TiledCullFeeder
 {
-    /// <summary>Item classes culled together in one dispatch. Batch 2 is reserved for light probe volumes.</summary>
-    public const int BatchCount = 3;
+    /// <summary>Item classes culled together in one dispatch.</summary>
+    public const int BatchCount = 4;
 
     /// <summary>Batch index holding barn light faces.</summary>
     public const int BatchBarnLights = 0;
 
     /// <summary>Batch index holding environment map probes.</summary>
     public const int BatchEnvMaps = 1;
+
+    /// <summary>Batch index holding light probe volumes. Only probe atlas scenes fill it.</summary>
+    public const int BatchLightProbes = 2;
+
+    /// <summary>Batch index holding projected decal boxes.</summary>
+    public const int BatchDecals = 3;
 
     /// <summary>Items per mask. Batches pad up to a whole number of these so no word spans two batches.</summary>
     public const int ItemsPerMask = 32;
@@ -59,11 +66,14 @@ public sealed class TiledCullFeeder
     private const float EnvMapCullExtend = 0.1f;
 
     /// <summary>
-    /// Slots reserved per batch. Must be a multiple of <see cref="ItemsPerMask"/>: <see cref="End"/> pads
+    /// Slots reserved per batch other than barn lights. Must be a multiple of <see cref="ItemsPerMask"/>: <see cref="End"/> pads
     /// each batch out to whole masks, so a stride that is not would run past the item array.
     /// </summary>
     private const int MaxItemsPerBatch = 320; // 10 words
-    private const int MaxItems = BatchCount * MaxItemsPerBatch;
+
+    /// <summary>Slots reserved for the barn light batch, which holds a face per item. Same multiple-of-mask rule as <see cref="MaxItemsPerBatch"/>.</summary>
+    private const int MaxBarnLightItems = BarnLightConstants.MAX_BARN_LIGHT_FACES;
+    private const int MaxItems = MaxBarnLightItems + ((BatchCount - 1) * MaxItemsPerBatch);
 
     private const int TileGroupSizeX = 8;
     private const int TileGroupSizeY = 4;
@@ -160,6 +170,10 @@ public sealed class TiledCullFeeder
     /// <param name="batch">Batch index.</param>
     public int BinnedCount(int batch) => batchBinnedCount[batch];
 
+    /// <summary>First slot of a batch in the item array before <see cref="End"/> packs them together.</summary>
+    private static int FirstSlot(int batch)
+        => batch == BatchBarnLights ? 0 : MaxBarnLightItems + ((batch - 1) * MaxItemsPerBatch);
+
     /// <summary>Whether an item projected to nothing and can never match a tile or a bin.</summary>
     private static bool IsRejected(in CullItem item) => item.DepthMin > item.DepthMax;
 
@@ -182,8 +196,16 @@ public sealed class TiledCullFeeder
         Debug.Assert(EnvMapArray.MAX_ENVMAPS <= MaxItemsPerBatch,
             $"Env map probes must fit the {MaxItemsPerBatch} slot batch stride");
 
-        Debug.Assert(BarnLightConstants.MAX_BARN_LIGHTS <= MaxItemsPerBatch,
-            $"Barn light faces must fit the {MaxItemsPerBatch} slot batch stride");
+        Debug.Assert(MaxBarnLightItems % ItemsPerMask == 0, $"Barn light stride must be a multiple of {ItemsPerMask}");
+
+        Debug.Assert(BarnLightConstants.MAX_BARN_LIGHTS * BarnLightConstants.MAX_FACES_PER_LIGHT <= MaxBarnLightItems,
+            $"Barn light faces must fit the {MaxBarnLightItems} slot barn batch");
+
+        Debug.Assert(LightProbeVolumeArray.MAX_PROBES <= MaxItemsPerBatch,
+            $"Light probe volumes must fit the {MaxItemsPerBatch} slot batch stride");
+
+        Debug.Assert(ProjectedDecalSystem.MaxDecals <= MaxItemsPerBatch,
+            $"Projected decals must fit the {MaxItemsPerBatch} slot batch stride");
 
         this.tileCols = tileCols;
         this.tileRows = tileRows;
@@ -227,14 +249,20 @@ public sealed class TiledCullFeeder
     /// </remarks>
     /// <param name="barnLights">Barn light faces the shading pass will iterate.</param>
     /// <param name="envMaps">Env map probes the shading pass will iterate.</param>
-    public void AddCounts(int barnLights, int envMaps)
+    /// <param name="lightProbes">Light probe volumes the shading pass will iterate.</param>
+    /// <param name="decals">Projected decals the decal pass will iterate.</param>
+    public void AddCounts(int barnLights, int envMaps, int lightProbes, int decals)
     {
-        batchItemCount[BatchBarnLights] = Math.Min(barnLights, MaxItemsPerBatch);
+        batchItemCount[BatchBarnLights] = Math.Min(barnLights, MaxBarnLightItems);
         batchItemCount[BatchEnvMaps] = Math.Min(envMaps, MaxItemsPerBatch);
+        batchItemCount[BatchLightProbes] = Math.Min(lightProbes, MaxItemsPerBatch);
+        batchItemCount[BatchDecals] = Math.Min(decals, MaxItemsPerBatch);
 
         // Nothing was projected, so nothing was rejected either: every slot reaches every tile.
-        batchBinnedCount[BatchBarnLights] = batchItemCount[BatchBarnLights];
-        batchBinnedCount[BatchEnvMaps] = batchItemCount[BatchEnvMaps];
+        for (var batch = 0; batch < BatchCount; batch++)
+        {
+            batchBinnedCount[batch] = batchItemCount[batch];
+        }
     }
 
     /// <summary>
@@ -244,8 +272,8 @@ public sealed class TiledCullFeeder
     /// <param name="volumes">Cull volume per barn light face, in shading pass index order.</param>
     public void AddBarnLights(ReadOnlySpan<BarnLightCullVolume> volumes)
     {
-        var count = Math.Min(volumes.Length, MaxItemsPerBatch);
-        var first = BatchBarnLights * MaxItemsPerBatch;
+        var count = Math.Min(volumes.Length, MaxBarnLightItems);
+        var first = FirstSlot(BatchBarnLights);
         var binned = 0;
 
         Span<Vector3> corners = stackalloc Vector3[8];
@@ -263,7 +291,7 @@ public sealed class TiledCullFeeder
                     1f);
 
                 var world = Vector4.Transform(clip, volume.FrustumToWorld);
-                corners[corner] = new Vector3(world.X, world.Y, world.Z) / world.W;
+                corners[corner] = world.AsVector3() / world.W;
             }
 
             var item = BuildItem(corners);
@@ -279,7 +307,7 @@ public sealed class TiledCullFeeder
                         1f);
 
                     var world = Vector4.Transform(cube, volume.ObbToWorld);
-                    corners[corner] = new Vector3(world.X, world.Y, world.Z);
+                    corners[corner] = world.AsVector3();
                 }
 
                 ApplySecondHull(ref item, corners);
@@ -288,7 +316,7 @@ public sealed class TiledCullFeeder
             if (item.NumPlanes0 != 0u)
             {
                 var sphere = volume.RangeSphere;
-                ApplyRangeConic(ref item, new Vector3(sphere.X, sphere.Y, sphere.Z), sphere.W);
+                ApplyRangeConic(ref item, sphere.AsVector3(), sphere.W);
             }
 
             items[first + i] = item;
@@ -306,7 +334,7 @@ public sealed class TiledCullFeeder
     /// <summary>Adds one item per environment map probe, slotted by <see cref="SceneEnvMap.ShaderIndex"/>.</summary>
     public void AddEnvMaps(List<SceneEnvMap> envMaps)
     {
-        var first = BatchEnvMaps * MaxItemsPerBatch;
+        var first = FirstSlot(BatchEnvMaps);
         var count = 0;
         var binned = 0;
 
@@ -314,8 +342,6 @@ public sealed class TiledCullFeeder
         {
             items[first + i] = RejectAll;
         }
-
-        Span<Vector3> corners = stackalloc Vector3[8];
 
         foreach (var envMap in envMaps)
         {
@@ -326,21 +352,7 @@ public sealed class TiledCullFeeder
                 continue;
             }
 
-            var bounds = envMap.LocalBoundingBox;
-            var boundsMin = bounds.Min - new Vector3(EnvMapCullExtend);
-            var boundsMax = bounds.Max + new Vector3(EnvMapCullExtend);
-
-            for (var corner = 0; corner < 8; corner++)
-            {
-                var local = new Vector3(
-                    (corner & 1) != 0 ? boundsMax.X : boundsMin.X,
-                    (corner & 2) != 0 ? boundsMax.Y : boundsMin.Y,
-                    (corner & 4) != 0 ? boundsMax.Z : boundsMin.Z);
-
-                corners[corner] = Vector3.Transform(local, envMap.Transform);
-            }
-
-            var item = BuildItem(corners);
+            var item = BuildBoxItem(envMap.LocalBoundingBox, envMap.Transform, EnvMapCullExtend);
 
             items[first + index] = item;
             count = Math.Max(count, index + 1);
@@ -356,13 +368,92 @@ public sealed class TiledCullFeeder
     }
 
     /// <summary>
+    /// Adds one item per light probe volume. Item <c>i</c> is volume <c>i</c>, whose shader index is also
+    /// its priority, so the shading pass takes the lowest set bit whose volume contains the fragment.
+    /// </summary>
+    /// <param name="lightProbes">Volumes in shader index order.</param>
+    public void AddLightProbes(IReadOnlyList<SceneLightProbe> lightProbes)
+    {
+        var first = FirstSlot(BatchLightProbes);
+        var count = Math.Min(lightProbes.Count, MaxItemsPerBatch);
+        var binned = 0;
+
+        for (var i = 0; i < count; i++)
+        {
+            var lightProbe = lightProbes[i];
+            Debug.Assert(lightProbe.ShaderIndex == i);
+
+            // The shader's containment test is exact, so the skin only has to cover float error
+            var item = BuildBoxItem(lightProbe.LocalBoundingBox, lightProbe.Transform, EnvMapCullExtend);
+
+            items[first + i] = item;
+
+            if (!IsRejected(item))
+            {
+                binned++;
+            }
+        }
+
+        batchItemCount[BatchLightProbes] = count;
+        batchBinnedCount[BatchLightProbes] = binned;
+    }
+
+    /// <summary>
+    /// Adds one item per projected decal box. Item <c>i</c> is decal <c>i</c>, so the decal pass walks the
+    /// bits in the order the decals were added.
+    /// </summary>
+    /// <param name="boxTransforms">Maps the unit cube centred on the origin onto each decal box.</param>
+    public void AddDecals(ReadOnlySpan<Matrix4x4> boxTransforms)
+    {
+        var first = FirstSlot(BatchDecals);
+        var count = Math.Min(boxTransforms.Length, MaxItemsPerBatch);
+        var binned = 0;
+
+        for (var i = 0; i < count; i++)
+        {
+            var item = BuildBoxItem(UnitCube, boxTransforms[i], 0f);
+
+            items[first + i] = item;
+
+            if (!IsRejected(item))
+            {
+                binned++;
+            }
+        }
+
+        batchItemCount[BatchDecals] = count;
+        batchBinnedCount[BatchDecals] = binned;
+    }
+
+    private static readonly AABB UnitCube = new(new Vector3(-0.5f), new Vector3(0.5f));
+
+    private CullItem BuildBoxItem(AABB localBounds, in Matrix4x4 localToWorld, float extend)
+    {
+        Span<Vector3> corners = stackalloc Vector3[8];
+
+        var boundsMin = localBounds.Min - new Vector3(extend);
+        var boundsMax = localBounds.Max + new Vector3(extend);
+
+        for (var corner = 0; corner < 8; corner++)
+        {
+            var local = new Vector3(
+                (corner & 1) != 0 ? boundsMax.X : boundsMin.X,
+                (corner & 2) != 0 ? boundsMax.Y : boundsMin.Y,
+                (corner & 4) != 0 ? boundsMax.Z : boundsMin.Z);
+
+            corners[corner] = Vector3.Transform(local, localToWorld);
+        }
+
+        return BuildItem(corners);
+    }
+
+    /// <summary>
     /// Lays the batches out back to back in the item and bits buffers, padding each tail so the tile
     /// pass's unconditional load stays in bounds. Call once every batch is added.
     /// </summary>
     public void End()
     {
-        // Fitted here rather than in Begin because it is a property of the items, and they are only
-        // projected in between.
+        // Fitted here, not in Begin, since it depends on items projected in between.
         SliceFar = Math.Clamp(MaxItemViewDepth, minSliceFar, maxSliceFar);
 
         cullParams.DepthBinWidth = SliceFar / depthBins;
@@ -374,8 +465,8 @@ public sealed class TiledCullFeeder
         for (var batch = 0; batch < BatchCount; batch++)
         {
             var count = batchItemCount[batch];
-            var masks = (count + ItemsPerMask - 1) / ItemsPerMask;
-            var source = batch * MaxItemsPerBatch;
+            var masks = MathUtils.DivideRoundUp(count, ItemsPerMask);
+            var source = FirstSlot(batch);
 
             if (source != itemCursor)
             {
@@ -423,8 +514,8 @@ public sealed class TiledCullFeeder
 
     /// <summary>Gets the tile pass dispatch size.</summary>
     public (int X, int Y, int Z) TileDispatch => (
-        (tileCols + TileGroupSizeX - 1) / TileGroupSizeX,
-        (tileRows + TileGroupSizeY - 1) / TileGroupSizeY,
+        MathUtils.DivideRoundUp(tileCols, TileGroupSizeX),
+        MathUtils.DivideRoundUp(tileRows, TileGroupSizeY),
         maskCount);
 
     /// <summary>Gets the depth bin pass dispatch size.</summary>
@@ -440,8 +531,7 @@ public sealed class TiledCullFeeder
         running += cullParams.TileBatches[1].OutputStride;
         cullParams.FirstMaskForBatch2 = running;
         running += cullParams.TileBatches[2].OutputStride;
-
-        cullParams.MaskCount = running;
+        cullParams.FirstMaskForBatch3 = running;
     }
 
     /// <summary>An item nothing matches, for rejected entries that keep their slot and for tail padding.</summary>
@@ -587,7 +677,7 @@ public sealed class TiledCullFeeder
                     continue;
                 }
 
-                var t = (cameraNearPlane - wNear) / (wFar - wNear);
+                var t = MathUtils.Remap(cameraNearPlane, wNear, wFar);
 
                 var crossing = Vector2.Lerp(
                     new Vector2(clip[i].X, clip[i].Y),
@@ -610,9 +700,9 @@ public sealed class TiledCullFeeder
     }
 
     /// <summary>
-    /// Screen bounds of the hull a projection left behind, clamped to the viewport. This is the frustum
-    /// rejection the compute passes no longer do: false for a degenerate or off screen volume, which
-    /// clamping instead would smear across a whole edge row of tiles.
+    /// Screen bounds of the hull a projection left behind, clamped to the viewport. Frustum rejection
+    /// happens here: false for a degenerate or off screen volume, which clamping would smear across a
+    /// whole edge row of tiles.
     /// </summary>
     private bool HullBounds(in Projection projection, out Vector2 boundsMin, out Vector2 boundsMax)
     {
@@ -797,7 +887,7 @@ public sealed class TiledCullFeeder
         return hullCount >= 3 ? hullCount : 0;
 
         static float Cross(Vector2 o, Vector2 a, Vector2 b)
-            => ((a.X - o.X) * (b.Y - o.Y)) - ((a.Y - o.Y) * (b.X - o.X));
+            => Vector2.Cross(a - o, b - o);
     }
 
     /// <summary>
@@ -847,13 +937,13 @@ public sealed class TiledCullFeeder
 
         var dilated = radius + (tileHalfSize * MathF.Sqrt(2f) * (radius / projectedRadius));
 
-        var rowX = new Vector4(projectionToWorld.M11, projectionToWorld.M12, projectionToWorld.M13, projectionToWorld.M14);
-        var rowY = new Vector4(projectionToWorld.M21, projectionToWorld.M22, projectionToWorld.M23, projectionToWorld.M24);
-        var rowZ = new Vector4(projectionToWorld.M31, projectionToWorld.M32, projectionToWorld.M33, projectionToWorld.M34);
-        var rowW = new Vector4(projectionToWorld.M41, projectionToWorld.M42, projectionToWorld.M43, projectionToWorld.M44);
+        var rowX = projectionToWorld.GetRow(0);
+        var rowY = projectionToWorld.GetRow(1);
+        var rowZ = projectionToWorld.GetRow(2);
+        var rowW = projectionToWorld.GetRow(3);
 
         static Vector3 Column(Vector4 axis, Vector4 z)
-            => (new Vector3(z.X, z.Y, z.Z) * axis.W) - (new Vector3(axis.X, axis.Y, axis.Z) * z.W);
+            => (z.AsVector3() * axis.W) - (axis.AsVector3() * z.W);
 
         var r0 = Column(rowX, rowZ);
         var r1 = Column(rowY, rowZ);
@@ -881,8 +971,7 @@ public sealed class TiledCullFeeder
         var e = 2f * sy * (m12 - m11 - m01);
         var f = m00 + m11 + m22 + (2f * m01) - (2f * m02) - (2f * m12);
 
-        var scale = MathF.Max(MathF.Abs(a), MathF.Max(MathF.Abs(b), MathF.Max(MathF.Abs(cc),
-            MathF.Max(MathF.Abs(d), MathF.Max(MathF.Abs(e), MathF.Abs(f))))));
+        var scale = MathF.Max(MathUtils.Max(MathF.Abs(a), MathF.Abs(b), MathF.Abs(cc)), MathUtils.Max(MathF.Abs(d), MathF.Abs(e), MathF.Abs(f)));
 
         if (scale <= 0f || !float.IsFinite(scale))
         {
@@ -929,7 +1018,6 @@ public sealed class TiledCullFeeder
         var pc = NdcToPixel(new Vector2(atCentre.X, atCentre.Y) / atCentre.W);
         var pe = NdcToPixel(new Vector2(atEdge.X, atEdge.Y) / atEdge.W);
 
-        return (pe - pc).Length();
+        return Vector2.Distance(pe, pc);
     }
-
 }

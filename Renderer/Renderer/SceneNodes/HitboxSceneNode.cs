@@ -16,7 +16,6 @@ namespace ValveResourceFormat.Renderer.SceneNodes
             new(1f, 0.5f, 0.25f, 0.14f), //HITGROUP_NECK
         ];
 
-
         /// <summary>
         /// Constructs a node with a single box shape
         /// </summary>
@@ -33,6 +32,19 @@ namespace ValveResourceFormat.Renderer.SceneNodes
         private HitboxSceneNode(Scene scene, Vector3 from, Vector3 to, float radius, Color32 color) : base(scene, from, to, radius, color) { }
 
         protected override bool Shaded => false;
+
+        /// <inheritdoc/>
+        public override void Render(Scene.RenderContext context)
+        {
+            // Drawn through the model and kept out of picking
+            if (context.RenderPass != RenderPass.Translucent || context.ReplacementShader != null)
+            {
+                return;
+            }
+
+            using var _ = GraphicsContext.RenderState.Scope(depthTest: false);
+            base.Render(context);
+        }
 
         private static Color32 GetHitboxGroupColor(int group)
         {

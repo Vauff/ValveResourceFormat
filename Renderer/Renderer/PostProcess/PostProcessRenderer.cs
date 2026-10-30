@@ -1,6 +1,6 @@
 using System.Diagnostics;
 using OpenTK.Graphics.OpenGL;
-using ValveResourceFormat.CompiledShader;
+using ValveResourceFormat.IO;
 using ValveResourceFormat.Renderer.SceneEnvironment;
 using ValveResourceFormat.Renderer.World;
 
@@ -11,6 +11,8 @@ namespace ValveResourceFormat.Renderer.PostProcess
     /// </summary>
     public class PostProcessRenderer
     {
+        private static readonly BloomSettings DefaultBloomSettings = new();
+
         private readonly RendererContext RendererContext;
         private Shader? shaderMsaaResolve;
         private Shader? shaderDepthResolve;
@@ -20,11 +22,22 @@ namespace ValveResourceFormat.Renderer.PostProcess
         private RenderTexture? combinedLut;
         private static readonly string[] LutSamplerNames =
             ["g_tColorCorrection0", "g_tColorCorrection1", "g_tColorCorrection2", "g_tColorCorrection3"];
-        private readonly OutlineRenderer Outline;
 
         /// <summary>Gets or sets the blue noise texture used for dithering in the tonemap pass.</summary>
         public RenderTexture? BlueNoise { get; set; }
         private readonly Random random = new();
+
+        /// <summary>
+        /// Gets or sets whether the dither pattern moves every frame. When off it holds still, so two
+        /// renders of the same scene produce the same pixels.
+        /// </summary>
+        internal bool AnimateDither { get; set; } = true;
+
+        /// <summary>
+        /// Gets or sets whether the frame is only multiplied by <see cref="TonemapScalar"/> and encoded to
+        /// sRGB, without exposure bias, bloom, tonemapping, color correction, gamma or dither.
+        /// </summary>
+        internal bool RawOutput { get; set; }
 
         /// <summary>Gets or sets the scene average luminance used for auto-exposure calculations.</summary>
         public float AverageLuminance { get; set; }
@@ -34,17 +47,17 @@ namespace ValveResourceFormat.Renderer.PostProcess
         public bool Enabled { get; set; } = true;
         /// <summary>Gets or sets a value indicating whether color correction LUT application is active.</summary>
         public bool ColorCorrectionEnabled { get; set; } = true;
-        /// <summary>Gets or sets a value indicating whether any scene objects require outline rendering this frame.</summary>
-        public bool HasOutlineObjects { get; set; }
-
-        /// <summary>Gets or sets the multisampled coverage mask produced by the outline geometry pass.</summary>
-        public RenderTexture? OutlineMask { get; set; }
-
         /// <summary>Gets the per-frame raw exposure scalar history used for temporal smoothing.</summary>
         public List<float> ExposureHistory { get; } = new(10);
 
         /// <summary>Gets or sets a manually overridden exposure value; set to -1 to use auto-exposure.</summary>
         public float CustomExposure { get; set; } = -1;
+
+        /// <summary>
+        /// Gets whether the game tonemaps with its own fixed curve and applies no exposure, so the scene
+        /// is only exposed when <see cref="CustomExposure"/> is set.
+        /// </summary>
+        private bool UsesGameTonemap => RendererContext.FileLoader.GameInfo.Game == Game.Dota;
 
         /// <summary>Gets or sets the display gamma, the game's brightness setting. 2.2 is identity; lower is brighter.</summary>
         public float FullScreenGamma { get; set; } = 2.2f;
@@ -56,20 +69,24 @@ namespace ValveResourceFormat.Renderer.PostProcess
         /// </summary>
         public float ExposureCompensation { get; set; }
 
-        /// <summary>The displayed luminance that auto-exposure places the scene's log-average on.</summary>
+        /// <summary>The pre-tonemap luminance that auto-exposure places the scene's log-average on.</summary>
         private const float MiddleGrey = 0.18f;
 
-        /// <summary>
-        /// Gets the pre-tonemap scene luminance auto-exposure aims for: the value the active tonemap
-        /// curve displays as <see cref="MiddleGrey"/>.
-        /// </summary>
-        public float ExposureTargetLuminance { get; private set; } = MiddleGrey;
+        /// <summary>Gets the pre-tonemap scene luminance auto-exposure aims for.</summary>
+        public static float ExposureTargetLuminance => MiddleGrey;
         /// <summary>Gets the smoothed exposure value applied in the current frame.</summary>
         public float CurrentExposure { get; private set; } = 1.0f;
         /// <summary>Gets the target exposure value that <see cref="CurrentExposure"/> is adapting towards.</summary>
-        public float TargetExposure { get; private set; }
+        public float TargetExposure { get; private set; } = 1.0f;
         /// <summary>Gets or sets the final linear tonemap scalar passed to the post-process shader.</summary>
         public float TonemapScalar { get; set; }
+        /// <summary>
+        /// Gets this frame's effects bloom map, geometry drawn to show only as glow, or null when
+        /// nothing drew into it. It is bloomed even when no post process volume enables bloom, with the
+        /// default settings and without blooming the scene itself.
+        /// </summary>
+        public RenderTexture? EffectsBloom { get; internal set; }
+
         /// <summary>Gets the bloom renderer used for the multi-pass Gaussian bloom effect.</summary>
         public BloomRenderer Bloom { get; private set; }
         /// <summary>Gets the depth-of-field renderer.</summary>
@@ -87,7 +104,6 @@ namespace ValveResourceFormat.Renderer.PostProcess
             RendererContext = rendererContext;
             Bloom = new BloomRenderer(rendererContext, this);
             DOF = new DOFRenderer(rendererContext);
-            Outline = new OutlineRenderer(rendererContext);
         }
 
         /// <summary>
@@ -105,7 +121,6 @@ namespace ValveResourceFormat.Renderer.PostProcess
 
             DOF.MsaaSamples = msaa;
             Bloom.Load();
-            Outline.Load();
         }
 
         /// <summary>
@@ -118,8 +133,8 @@ namespace ValveResourceFormat.Renderer.PostProcess
         {
             Debug.Assert(shaderMsaaResolve != null && shaderDepthResolve != null);
 
-            var groupsX = (destColor.Width + 7) / 8;
-            var groupsY = (destColor.Height + 7) / 8;
+            var groupsX = MathUtils.DivideRoundUp(destColor.Width, 8);
+            var groupsY = MathUtils.DivideRoundUp(destColor.Height, 8);
 
             if (resolveColor)
             {
@@ -174,10 +189,9 @@ namespace ValveResourceFormat.Renderer.PostProcess
             if (combinedLut == null || combinedLut.Width != dimensions)
             {
                 combinedLut?.Delete();
-                combinedLut = new RenderTexture(TextureTarget.Texture3D, dimensions, dimensions, dimensions, 1, "CombinedColorCorrectionLUT");
-                combinedLut.SetWrapMode(TextureWrapMode.ClampToEdge);
+                combinedLut = RenderTexture.Create3D(TextureTarget.Texture3D, dimensions, dimensions, dimensions, ImageFormat.RGBA8888, 1, "CombinedColorCorrectionLUT");
+                combinedLut.SetWrapMode(RsTextureAddressMode.Clamp);
                 combinedLut.SetFiltering(TextureMinFilter.Linear, TextureMagFilter.Linear);
-                GL.TextureStorage3D(combinedLut.Handle, 1, SizedInternalFormat.Rgba8, dimensions, dimensions, dimensions);
             }
 
             var weights = Vector4.Zero;
@@ -203,7 +217,7 @@ namespace ValveResourceFormat.Renderer.PostProcess
 
             GL.BindImageTexture(0, combinedLut.Handle, 0, true, 0, TextureAccess.WriteOnly, SizedInternalFormat.Rgba8);
 
-            var groups = (dimensions + 3) / 4;
+            var groups = MathUtils.DivideRoundUp(dimensions, 4);
             GL.DispatchCompute(groups, groups, groups);
             GL.MemoryBarrier(MemoryBarrierFlags.TextureFetchBarrierBit);
 
@@ -218,7 +232,7 @@ namespace ValveResourceFormat.Renderer.PostProcess
         private void SetPostProcessUniforms(Shader shader, TonemapSettings TonemapSettings)
         {
             // Randomize dither offset every frame
-            var ditherOffset = new Vector2(random.NextSingle(), random.NextSingle());
+            var ditherOffset = AnimateDither ? new Vector2(random.NextSingle(), random.NextSingle()) : new Vector2(0.5f);
 
             // Dither by one 255th of frame color originally. Modified to be twice that, because it looks better.
             shader.SetUniform("g_vBlueNoiseDitherParams", new Vector4(ditherOffset, 1.0f / 256.0f, 2.0f / 255.0f));
@@ -249,7 +263,7 @@ namespace ValveResourceFormat.Renderer.PostProcess
 
             Debug.Assert(BlueNoise != null);
 
-            using var _ = RendererContext.RenderState.Scope(depthTest: false, depthWrite: false);
+            using var _ = GraphicsContext.RenderState.Scope(depthTest: false, depthWrite: false);
 
             using (new GLDebugGroup("MSAA Resolve"))
             {
@@ -266,8 +280,8 @@ namespace ValveResourceFormat.Renderer.PostProcess
                     DOF.SetDofResolveShaderUniforms(msaaResolveShader, camera, colorBufferRead.Depth!);
                 }
 
-                var groupsX = (resolveTarget.Width + 7) / 8;
-                var groupsY = (resolveTarget.Height + 7) / 8;
+                var groupsX = MathUtils.DivideRoundUp(resolveTarget.Width, 8);
+                var groupsY = MathUtils.DivideRoundUp(resolveTarget.Height, 8);
                 GL.DispatchCompute(groupsX, groupsY, 1);
                 GL.MemoryBarrier(MemoryBarrierFlags.ShaderImageAccessBarrierBit | MemoryBarrierFlags.TextureFetchBarrierBit);
             }
@@ -283,11 +297,13 @@ namespace ValveResourceFormat.Renderer.PostProcess
             {
                 colorBufferDraw.Bind(FramebufferTarget.DrawFramebuffer);
 
-                var postProcessShader = State.HasBloom == true ? shaderPostProcessBloom : shaderPostProcess;
+                var runBloom = !RawOutput && (State.HasBloom || EffectsBloom != null);
+                var bloomSettings = State.HasBloom ? State.BloomSettings : DefaultBloomSettings;
+                var postProcessShader = runBloom ? shaderPostProcessBloom : shaderPostProcess;
 
-                if (State.HasBloom)
+                if (runBloom)
                 {
-                    Bloom.Render(resolvedScene);
+                    Bloom.Render(resolvedScene, EffectsBloom, bloomSettings, sceneWeight: State.HasBloom ? 1f : 0f);
                 }
 
                 colorBufferDraw.Bind(FramebufferTarget.DrawFramebuffer);
@@ -301,19 +317,29 @@ namespace ValveResourceFormat.Renderer.PostProcess
                 // Bound here too, in case post processing runs before the scene binds it.
                 postProcessShader.SetTexture((int)ReservedTextureSlots.BlueNoise, "g_tBlueNoise", BlueNoise);
 
-                if (State.HasBloom)
+                if (runBloom)
                 {
                     postProcessShader.SetTexture(4, "g_tBloom", Bloom.AccumulationResult);
-                    // these seem to all be needed at once due to transitions between post process volumes, we don't do that yet
-                    // NormalizedBloomStrengths seems to act as a blending factor "how much of each bloom mode do we have right now"
-                    var bloomStrengths = new Vector3(State.BloomSettings.AddBloomStrength, State.BloomSettings.ScreenBloomStrength, State.BloomSettings.BlurBloomStrength);
-                    var normalizedStrenghts = Vector3.Normalize(bloomStrengths);
-                    postProcessShader.SetUniform("g_vNormalizedBloomStrengths", normalizedStrenghts);
-                    postProcessShader.SetUniform("g_vUnNormalizedBloomStrengths", bloomStrengths);
+                    var bloomStrengths = new Vector3(bloomSettings.AddBloomStrength, bloomSettings.ScreenBloomStrength, bloomSettings.BlurBloomStrength);
+                    var unnormalizedStrengths = Vector3.UnitX;
+                    var normalizedStrengths = Vector3.UnitX;
+
+                    // The strongest mode is scaled to 1, so blended volumes keep the ratio between modes
+                    var maxStrength = bloomStrengths.MaxComponent();
+                    if (maxStrength >= 1e-5f)
+                    {
+                        unnormalizedStrengths = bloomStrengths;
+                        normalizedStrengths = bloomStrengths / maxStrength;
+                    }
+
+                    postProcessShader.SetUniform("g_vNormalizedBloomStrengths", normalizedStrengths);
+                    postProcessShader.SetUniform("g_vUnNormalizedBloomStrengths", unnormalizedStrengths);
+                    postProcessShader.SetUniform("g_bBloomExposed", Bloom.ThresholdsExposedScene);
                 }
-                postProcessShader.SetUniform("g_bFlipY", flipY);
 
                 postProcessShader.SetUniform("g_bPostProcessEnabled", Enabled);
+                postProcessShader.SetUniform("g_bRawOutput", RawOutput);
+                postProcessShader.SetUniform("g_bGameTonemap", UsesGameTonemap);
 
                 postProcessShader.SetUniform("g_flToneMapScalarLinear", TonemapScalar);
                 SetPostProcessUniforms(postProcessShader, State.TonemapSettings);
@@ -325,13 +351,6 @@ namespace ValveResourceFormat.Renderer.PostProcess
 
                 GL.BindVertexArray(RendererContext.MeshBufferCache.EmptyVAO);
                 GL.DrawArrays(PrimitiveType.Triangles, 0, 3);
-            }
-
-            if (HasOutlineObjects)
-            {
-                using var outlineGroup = new GLDebugGroup("Outline Edge");
-                Debug.Assert(OutlineMask != null);
-                Outline.Render(OutlineMask, colorBufferRead.NumSamples, flipY);
             }
         }
 
@@ -351,9 +370,16 @@ namespace ValveResourceFormat.Renderer.PostProcess
                 return;
             }
 
+            if (UsesGameTonemap)
+            {
+                TonemapScalar = exposure;
+                ReportTonemapStats();
+                return;
+            }
+
             exposure = AutoAdjustExposure(exposure, deltaTime);
 
-            exposure *= MathF.Pow(2.0f, State.ExposureSettings.ExposureCompensation + ExposureCompensation);
+            exposure *= MathF.Pow(2.0f, ExposureCompensation);
             TonemapScalar = exposure;
 
             ReportTonemapStats();
@@ -381,13 +407,17 @@ namespace ValveResourceFormat.Renderer.PostProcess
                 return exposure;
             }
 
-            var curveInput = State.TonemapSettings.InvertTonemapping(MiddleGrey);
-            ExposureTargetLuminance = float.IsNaN(curveInput) ? MiddleGrey : curveInput;
+            // A frame that advances no time, such as one drawn while paused, leaves the exposure and its
+            // history as they are, so how many of them were drawn does not change the result
+            if (deltaTime <= 0f)
+            {
+                return CurrentExposure;
+            }
 
-            var rawScalar = ExposureTargetLuminance / AverageLuminance;
+            var rawScalar = MiddleGrey / AverageLuminance;
             if (!float.IsFinite(rawScalar))
             {
-                return exposure;
+                return CurrentExposure;
             }
 
             if (ExposureHistory.Count >= 10)
@@ -400,10 +430,7 @@ namespace ValveResourceFormat.Renderer.PostProcess
             var settings = State.ExposureSettings;
             // CurrentExposure is persistent between frames
 
-            // Sequential min-then-max clamp: authored data contains locked (min == max) and even
-            // inverted ranges
-            var (min, max) = (settings.ExposureMin, settings.ExposureMax);
-            var clampedScalar = MathF.Min(MathF.Max(rawScalar, min), max);
+            var averagedScalar = rawScalar;
             if (ExposureHistory.Count == 10)
             {
                 var weightedSum = 0.0f;
@@ -411,23 +438,26 @@ namespace ValveResourceFormat.Renderer.PostProcess
 
                 for (var i = 0; i < 10; i++)
                 {
-                    var weight = Math.Abs(5 - i) * 0.2f; // might be (5 - Math.Abs(5 - i))
+                    var weight = Math.Abs(5 - i) * 0.2f;
                     weightTotal += weight;
                     weightedSum += weight * ExposureHistory[i];
                 }
 
-                clampedScalar = MathF.Min(MathF.Max(weightedSum * (1.0f / weightTotal), min), max);
+                averagedScalar = weightedSum * (1.0f / weightTotal);
             }
 
-            if (!float.IsFinite(clampedScalar))
+            // Authored data contains locked (min == max) and even inverted ranges; an inverted range
+            // gives the minimum below it and the maximum above it
+            var clampedScalar = averagedScalar < settings.ExposureMin
+                ? settings.ExposureMin
+                : MathF.Min(settings.ExposureMax, averagedScalar);
+
+            // A non-finite average keeps the previous target and still adapts towards it
+            if (float.IsFinite(clampedScalar))
             {
-                return CurrentExposure;
+                // Compensation moves the target, so the exposure adapts to it at the authored speed
+                TargetExposure = clampedScalar * MathF.Pow(2.0f, settings.ExposureCompensation);
             }
-
-            TargetExposure = clampedScalar;
-
-            //if (Unknown > 0.0)
-            //    TargetExposure *= Unknown;
 
             if (settings.ExposureSpeedUp == 0.0)
             {

@@ -1,9 +1,12 @@
+using System.Runtime.InteropServices;
+using ValveResourceFormat.Blocks;
+
 namespace ValveResourceFormat.Renderer
 {
     /// <summary>
     /// Spatial partitioning structure for efficient scene node culling and queries.
     /// </summary>
-    public class Octree
+    public class Octree : ISpatialSet
     {
         private const int OptimalElementCountLarge = 4;
         private const int OptimalElementCountSmall = 32;
@@ -33,6 +36,10 @@ namespace ValveResourceFormat.Renderer
             /// Gets the eight child octree nodes created after subdivision.
             /// </summary>
             public Node[] Children { get; private set; } = [];
+
+            // The vis clusters of everything in this cell and below, from BuildVisClusters. Null without
+            // visibility data, or when something here passes every PVS row.
+            private uint[]? visClusters;
 
             /// <summary>
             /// Splits this node into eight child nodes and redistributes elements.
@@ -236,6 +243,93 @@ namespace ValveResourceFormat.Renderer
 
                 Elements = null;
                 Children = [];
+                visClusters = null;
+            }
+
+            // Returns whether something in this cell or below passes every PVS row, as Scene.IsNodeInPvs tests a node
+            internal bool BuildVisClusters(IWorldVisibility? visibility, in Matrix4x4 worldToVisibility)
+            {
+                visClusters = null;
+
+                var alwaysInPvs = visibility == null;
+
+                foreach (var child in Children)
+                {
+                    alwaysInPvs |= child.BuildVisClusters(visibility, worldToVisibility);
+                }
+
+                if (alwaysInPvs)
+                {
+                    return true;
+                }
+
+                var clusters = new uint[visibility!.ClusterBitfieldWordCount];
+
+                if (HasElements)
+                {
+                    foreach (var element in Elements!)
+                    {
+                        var elementClusters = (element.Flags & ObjectTypeFlags.DisableVisCulling) != 0
+                            ? default
+                            : element.GetVisClusters(visibility, worldToVisibility);
+
+                        if (elementClusters.IsEmpty)
+                        {
+                            return true;
+                        }
+
+                        foreach (var cluster in elementClusters)
+                        {
+                            if (cluster < clusters.Length * 32)
+                            {
+                                MathUtils.SetBit(clusters, cluster);
+                            }
+                        }
+                    }
+                }
+
+                foreach (var child in Children)
+                {
+                    var childClusters = child.visClusters!;
+
+                    for (var i = 0; i < clusters.Length; i++)
+                    {
+                        clusters[i] |= childClusters[i];
+                    }
+                }
+
+                visClusters = clusters;
+                return false;
+            }
+
+            private bool MayBeInPvs(ReadOnlySpan<byte> pvs)
+            {
+                if (visClusters == null)
+                {
+                    return true;
+                }
+
+                // Bit i of the row is bit i of the little endian words
+                var rowWords = MemoryMarshal.Cast<byte, uint>(pvs);
+                var words = Math.Min(rowWords.Length, visClusters.Length);
+
+                for (var i = 0; i < words; i++)
+                {
+                    if ((visClusters[i] & rowWords[i]) != 0)
+                    {
+                        return true;
+                    }
+                }
+
+                for (var b = rowWords.Length * 4; b < pvs.Length && b / 4 < visClusters.Length; b++)
+                {
+                    if (((visClusters[b / 4] >> (b % 4 * 8)) & pvs[b]) != 0)
+                    {
+                        return true;
+                    }
+                }
+
+                return false;
             }
 
             /// <summary>
@@ -273,13 +367,22 @@ namespace ValveResourceFormat.Renderer
             /// </summary>
             /// <param name="frustum">View frustum to test against.</param>
             /// <param name="results">List to populate with visible scene nodes.</param>
-            public void Query(Frustum frustum, List<SceneNode> results)
+            public void Query(Frustum frustum, List<SceneNode> results) => Query(frustum, null, default, results);
+
+            /// <summary>
+            /// Queries scene nodes visible within the specified view frustum, skipping every cell the boxes or the PVS hide.
+            /// </summary>
+            /// <param name="frustum">View frustum to test against.</param>
+            /// <param name="boxes">Visibility boxes that hide whole cells, or <see langword="null"/>.</param>
+            /// <param name="pvs">The PVS row that hides whole cells, empty to hide none.</param>
+            /// <param name="results">List to populate with visible scene nodes.</param>
+            public void Query(Frustum frustum, VisibilityBoxCuller? boxes, ReadOnlySpan<byte> pvs, List<SceneNode> results)
             {
                 if (HasElements)
                 {
                     foreach (var element in Elements!)
                     {
-                        if (frustum.Intersects(element.BoundingBox) || (element.Flags & ObjectTypeFlags.DisableVisCulling) != 0)
+                        if (frustum.Intersects(element.BoundingBox))
                         {
                             results.Add(element);
                         }
@@ -290,9 +393,11 @@ namespace ValveResourceFormat.Renderer
                 {
                     foreach (var child in Children)
                     {
-                        if (frustum.Intersects(child.Region))
+                        // A child holds only what fits inside its region, so a region the boxes hide hides all of it
+                        if (frustum.Intersects(child.Region) && (boxes == null || !boxes.IsCulled(child.Region))
+                            && (pvs.IsEmpty || child.MayBeInPvs(pvs)))
                         {
-                            child.Query(frustum, results);
+                            child.Query(frustum, boxes, pvs, results);
                         }
                     }
                 }
@@ -365,14 +470,35 @@ namespace ValveResourceFormat.Renderer
         /// <summary>
         /// Inserts a scene node into the octree.
         /// </summary>
-        /// <param name="obj">Scene node to insert.</param>
-        /// <exception cref="ArgumentNullException">Thrown if <paramref name="obj"/> is <see langword="null"/>.</exception>
-        public void Insert(SceneNode obj)
+        /// <param name="node">Scene node to insert.</param>
+        /// <exception cref="ArgumentNullException">Thrown if <paramref name="node"/> is <see langword="null"/>.</exception>
+        public void Insert(SceneNode node)
         {
-            ArgumentNullException.ThrowIfNull(obj);
+            ArgumentNullException.ThrowIfNull(node);
 
-            Root.Insert(obj);
+            Root.Insert(node);
         }
+
+        /// <summary>Appends every node whose bounds intersect the frustum.</summary>
+        public void Query(Frustum frustum, List<SceneNode> results) => Root.Query(frustum, results);
+
+        /// <summary>Appends every node whose bounds intersect the frustum, skipping whole cells the boxes or the PVS row hide.</summary>
+        /// <remarks>The row has to belong to the visibility data given to <see cref="BuildVisClusters"/>.</remarks>
+        public void Query(Frustum frustum, VisibilityBoxCuller? boxes, ReadOnlySpan<byte> pvs, List<SceneNode> results)
+            => Root.Query(frustum, boxes, pvs, results);
+
+        /// <summary>Gathers the vis clusters under each cell, so a query can leave out the cells a PVS row hides.</summary>
+        public void BuildVisClusters(IWorldVisibility? visibility, in Matrix4x4 worldToVisibility)
+            => Root.BuildVisClusters(visibility, worldToVisibility);
+
+        /// <summary>Appends every node whose bounds intersect the box.</summary>
+        public void Query(in AABB bounds, List<SceneNode> results) => Root.Query(bounds, results);
+
+        /// <summary>Returns the bounds covering every node in the tree.</summary>
+        public AABB GetBounds() => Root.GetBounds();
+
+        /// <summary>Marks the tree dirty; relocating a node without its old bounds takes a rebuild.</summary>
+        public void Update(SceneNode node) => Dirty = true;
 
         /// <summary>
         /// Removes a scene node from the octree.
@@ -452,16 +578,15 @@ namespace ValveResourceFormat.Renderer
             Root.Clear();
         }
 
-
         /// <summary>
-        /// Clears all nodes and roughly sizes root to the specified bounds.
+        /// Clears all nodes and roughly sizes root to the specified bounds, limited to <paramref name="maxCoord"/> on each axis.
         /// </summary>
-        public void Clear(AABB rootBounds)
+        public void Clear(AABB rootBounds, float maxCoord)
         {
             Clear();
 
-            var min = Vector3.Max(-new Vector3(16384), rootBounds.Min);
-            var max = Vector3.Min(new Vector3(16384), rootBounds.Max);
+            var min = Vector3.Max(-new Vector3(maxCoord), rootBounds.Min);
+            var max = Vector3.Min(new Vector3(maxCoord), rootBounds.Max);
 
             max = new Vector3(max.Length());
             Root = new Node(null, min, max - min);

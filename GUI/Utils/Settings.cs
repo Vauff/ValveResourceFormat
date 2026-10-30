@@ -1,7 +1,6 @@
 using System.IO;
 using ValveKeyValue;
 using ValveResourceFormat.IO;
-using ValveResourceFormat.Renderer.Utils;
 
 namespace GUI.Utils
 {
@@ -10,7 +9,7 @@ namespace GUI.Utils
     /// </summary>
     static class Settings
     {
-        private const int SettingsFileCurrentVersion = 16;
+        private const int SettingsFileCurrentVersion = 18;
         private const int RecentFilesLimit = 20;
 
         /// <summary>
@@ -26,18 +25,33 @@ namespace GUI.Utils
         }
 
         /// <summary>
+        /// The channel that application updates are offered from.
+        /// </summary>
+        public enum UpdateChannel : int
+        {
+            /// <summary>Tagged stable releases.</summary>
+            Stable = 0,
+            /// <summary>Automated builds of the master branch.</summary>
+            Dev = 1,
+        }
+
+        /// <summary>
         /// Holds state related to automatic application update checks.
         /// </summary>
         public class AppUpdateState
         {
             /// <summary>Gets or sets whether to automatically check for updates on startup.</summary>
             public bool CheckAutomatically { get; set; }
-            /// <summary>Gets or sets whether a newer version of the application is available.</summary>
-            public bool UpdateAvailable { get; set; }
-            /// <summary>Gets or sets the timestamp of the last update check.</summary>
-            public string LastCheck { get; set; } = string.Empty;
+            /// <summary>Gets or sets the channel that updates are offered from.</summary>
+            public UpdateChannel Channel { get; set; }
+            /// <summary>Gets or sets when the next automatic update check is due.</summary>
+            public string NextCheck { get; set; } = string.Empty;
             /// <summary>Gets or sets the application version recorded the last time settings were loaded, used to detect version changes and reset update state.</summary>
             public string Version { get; set; } = string.Empty;
+            /// <summary>Gets or sets the latest dev build number seen by the last successful update check, 0 when unknown.</summary>
+            public int LatestDevBuild { get; set; }
+            /// <summary>Gets or sets the latest stable release version seen by the last successful update check, empty when unknown.</summary>
+            public string LatestStableVersion { get; set; } = string.Empty;
         }
 
         /// <summary>
@@ -142,18 +156,22 @@ namespace GUI.Utils
             {
                 Log.Error(nameof(Settings), $"Failed to parse '{SettingsFilePath}', is it corrupted?{Environment.NewLine}{e}");
 
-                try
+                // A run driven by automation keeps settings in memory and leaves the file alone
+                if (!Automation.Automation.IsEnabled)
                 {
-                    var corruptedPath = Path.ChangeExtension(SettingsFilePath, $".corrupted-{DateTimeOffset.Now.ToUnixTimeSeconds()}.txt");
-                    File.Move(SettingsFilePath, corruptedPath);
+                    try
+                    {
+                        var corruptedPath = Path.ChangeExtension(SettingsFilePath, $".corrupted-{DateTimeOffset.Now.ToUnixTimeSeconds()}.txt");
+                        File.Move(SettingsFilePath, corruptedPath);
 
-                    Log.Error(nameof(Settings), $"Corrupted '{Path.GetFileName(SettingsFilePath)}' has been renamed to '{Path.GetFileName(corruptedPath)}'.");
+                        Log.Error(nameof(Settings), $"Corrupted '{Path.GetFileName(SettingsFilePath)}' has been renamed to '{Path.GetFileName(corruptedPath)}'.");
 
-                    Save();
-                }
-                catch
-                {
-                    //
+                        Save();
+                    }
+                    catch
+                    {
+                        //
+                    }
                 }
             }
 
@@ -182,6 +200,7 @@ namespace GUI.Utils
             Config.BookmarkedFiles ??= [];
             Config.RecentFiles ??= new(RecentFilesLimit);
             Config.Update ??= new();
+            Config.Update.LatestStableVersion ??= string.Empty;
 
             if (string.IsNullOrEmpty(Config.OpenDirectory))
             {
@@ -231,6 +250,11 @@ namespace GUI.Utils
             Config.Volume = MathUtils.Saturate(Config.Volume);
             Config.TextViewerFontSize = Math.Clamp(Config.TextViewerFontSize, 8, 24);
             Config.PackageGridSize = Math.Clamp(Config.PackageGridSize, 0, Enum.GetValues<Types.PackageViewer.ThumbnailRenderers.ThumbnailSizes>().Length - 1);
+
+            if (!Enum.IsDefined(Config.Update.Channel))
+            {
+                Config.Update.Channel = UpdateChannel.Stable;
+            }
 
             if (currentVersion < 2) // version 2: added anti aliasing samples
             {
@@ -302,8 +326,10 @@ namespace GUI.Utils
             if (Config.Update.Version != Program.ProductVersion)
             {
                 Config.Update.Version = Program.ProductVersion;
-                Config.Update.UpdateAvailable = false;
-                Config.Update.LastCheck = string.Empty;
+                Config.Update.NextCheck = string.Empty;
+
+                // Installing a build, whether through the updater or by hand, is choosing its channel
+                Config.Update.Channel = Program.BuildChannel;
             }
 
             Config._VERSION_DO_NOT_MODIFY = SettingsFileCurrentVersion;
@@ -311,9 +337,15 @@ namespace GUI.Utils
 
         /// <summary>
         /// Serializes the current <see cref="Config"/> to disk, writing atomically via a temp file.
+        /// A run driven by automation keeps every change in memory instead.
         /// </summary>
         public static void Save()
         {
+            if (Automation.Automation.IsEnabled)
+            {
+                return;
+            }
+
             var tempFile = Path.GetTempFileName();
 
             using (var stream = new FileStream(tempFile, FileMode.Create, FileAccess.Write, FileShare.None))
@@ -326,7 +358,8 @@ namespace GUI.Utils
 
         /// <summary>
         /// Appends <paramref name="path"/> to the end of the recent files list (most recent last),
-        /// removing any duplicate entry, trimming the oldest entries to <see cref="RecentFilesLimit"/>, then saves.
+        /// removing any duplicate entry and trimming the oldest entries to <see cref="RecentFilesLimit"/>.
+        /// The caller is responsible for calling <see cref="Save"/>.
         /// </summary>
         /// <param name="path">The absolute file path to record as recently opened.</param>
         public static void TrackRecentFile(string path)
@@ -338,8 +371,6 @@ namespace GUI.Utils
             {
                 Config.RecentFiles.RemoveRange(0, Config.RecentFiles.Count - RecentFilesLimit);
             }
-
-            Save();
         }
 
         /// <summary>

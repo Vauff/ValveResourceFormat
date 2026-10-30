@@ -5,13 +5,13 @@
 
 in vec3 vPOSITION;
 
-#include "common/ViewConstants.slang"
+#include "common/view_constants.slang"
 
 flat out uint sceneObjectId;
 flat out uint meshletId;
 
 void main(void) {
     gl_Position = g_matWorldToProjection * vec4(vec4(vPOSITION, 1.0) * CalculateSkinTransform(), 1.0);
-    sceneObjectId = gl_BaseInstance + gl_InstanceID;
+    sceneObjectId = g_instanceBuffer[gl_BaseInstance].Identification;
     meshletId = gl_DrawID;
 }

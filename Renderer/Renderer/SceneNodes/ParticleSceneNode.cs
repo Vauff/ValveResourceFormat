@@ -1,8 +1,10 @@
 using Microsoft.Extensions.Logging;
 using ValveKeyValue;
 using ValveResourceFormat.Blocks;
+using ValveResourceFormat.Particles;
+using ValveResourceFormat.Particles.Utils;
 using ValveResourceFormat.Renderer.Particles;
-using ValveResourceFormat.Renderer.Particles.Utils;
+using ValveResourceFormat.Renderer.Particles.Renderers;
 using ValveResourceFormat.ResourceTypes;
 using ValveResourceFormat.Serialization.KeyValues;
 
@@ -15,6 +17,20 @@ namespace ValveResourceFormat.Renderer.SceneNodes
     {
         private readonly ParticleRenderer particleRenderer;
 
+        /// <summary>Gets whether this system samples the resolved opaque depth.</summary>
+        public bool WantsSceneDepth { get; }
+
+        /// <summary>Gets whether this system samples the resolved opaque colour.</summary>
+        public bool WantsSceneColor { get; }
+
+        internal IEnumerable<ParticleFunctionRenderer> Renderers => particleRenderer.EnumerateRenderers();
+
+        /// <summary>Gets the simulation this node draws, with its particles, control points and child systems.</summary>
+        internal ParticleSystemSimulation ParticleSimulation => particleRenderer.Simulation;
+
+        /// <summary>Gets the renderer classes of this system and its children that are not implemented, and so draw nothing.</summary>
+        internal IEnumerable<string> SkippedRendererClasses => particleRenderer.EnumerateSkippedRendererClasses();
+
         /// <summary>
         /// Gets the preview model scene node loaded from particle preview state, if any.
         /// </summary>
@@ -22,13 +38,47 @@ namespace ValveResourceFormat.Renderer.SceneNodes
 
         private string? PreviewModelAttachmentPoint { get; set; }
 
+        private ParticleModelNodeObject? previewModelObject;
+
         /// <summary>Gets or sets a time-scale multiplier applied to the particle simulation each frame.</summary>
         public float FrametimeMultiplier { get; set; } = 1.0f;
+
+        /// <summary>
+        /// Gets or sets whether the effect holds its state instead of advancing. Unlike <see cref="Stop"/>
+        /// it keeps drawing the particles it has, and a <see cref="Restart"/> requested while it is set
+        /// still takes effect. Independent of <see cref="ParticleSystemState.Frozen"/>, which belongs to
+        /// the simulation.
+        /// </summary>
+        public bool IsPaused { get; set; }
+
+        /// <summary>
+        /// Gets or sets the seconds the effect simulates for once it is first drawn, after which it holds
+        /// still and keeps drawing the particles it has, or zero to simulate it for as long as it plays.
+        /// </summary>
+        public float MaxSimulationTime { get; set; }
+
+        // When the effect was first simulated, which a restart forgets
+        private float? simulationStartTime;
 
         /// <summary>
         /// Whether to load preview control point state, and loop playback when finished.
         /// </summary>
         public bool Preview { get; set; }
+
+        /// <summary>
+        /// Whether the system starts over once it has finished. Set for preview playback; off in a
+        /// scene, where an effect that has run out stays gone. Changing it takes effect at the next
+        /// <see cref="Restart"/>.
+        /// </summary>
+        public bool Loop { get; set; }
+
+        /// <summary>
+        /// Which parts of the effect a playback cycle covers. Changing it takes effect at the next
+        /// <see cref="Restart"/>.
+        /// </summary>
+        public ParticlePlaybackMode PlaybackMode { get; set; } = ParticlePlaybackMode.Normal;
+
+        private bool endCapPlayed;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="ParticleSceneNode"/> class.
@@ -37,48 +87,89 @@ namespace ValveResourceFormat.Renderer.SceneNodes
         /// <param name="particleSystem">The particle system resource to simulate and render.</param>
         /// <param name="particleSnapshot">Optional snapshot to provide initial particle data (e.g. from a map entity).</param>
         /// <param name="preview">Whether to load preview control point state, and loop playback when finished.</param>
-        public ParticleSceneNode(Scene scene, ParticleSystem particleSystem, ParticleSnapshot? particleSnapshot = null, bool preview = false)
+        /// <param name="playedByEntity">
+        /// Whether a map entity plays this effect, in which case its control points come from that entity
+        /// rather than from a control point configuration.
+        /// </param>
+        public ParticleSceneNode(Scene scene, ParticleSystem particleSystem, ParticleSnapshot? particleSnapshot = null, bool preview = false, bool playedByEntity = false)
             : base(scene)
         {
-            particleRenderer = new ParticleRenderer(particleSystem, Scene.RendererContext, scene, particleSnapshot)
+            particleRenderer = new ParticleRenderer(particleSystem, scene, particleSnapshot)
             {
                 OwnerNode = this,
             };
-            LocalBoundingBox = particleRenderer.LocalBoundingBox;
-
             RenderPasses = particleRenderer.Passes;
+
+            // Screen-space systems are drawn wherever the camera looks, so the node is never culled
+            if (particleRenderer.DrawsInScreenSpace)
+            {
+                Flags |= ObjectTypeFlags.DisableVisCulling;
+                LocalBoundingBox = new AABB(new Vector3(float.MinValue), new Vector3(float.MaxValue));
+            }
+            else
+            {
+                LocalBoundingBox = particleRenderer.LocalBoundingBox;
+            }
+
+            WantsSceneDepth = particleRenderer.WantsSceneDepth;
+            WantsSceneColor = particleRenderer.WantsSceneColor;
+
+            Simulation = NodeSimulation.Parallel;
+
+            // Stop standard shaders from transforming the vertices again
+            AdditionalFlags |= SceneNodeFlags.PreTransformedVertices;
 
             if (preview)
             {
                 Preview = true;
+                Loop = true;
+                ApplyControlPointDefaults();
                 PreviewModel = CreatePreviewModel(particleSystem);
                 if (PreviewModel != null)
                 {
                     Scene.Add(PreviewModel, true);
                 }
             }
-            else
+            else if (!playedByEntity)
             {
                 ApplyRuntimeControlPointValues(particleSystem);
             }
         }
 
-        // Outside the editor an effect is played under one of its control point configurations, and the
-        // configuration is where several constants its operators depend on actually live - a global scale
-        // control point that has to read 0.5 rather than 0, or a flag switching an effect into its
-        // first-person sizing. Those arrive as a driver's literal offset, so seed the control points that
-        // carry one. Points a driver leaves at zero are skipped: control point 0 is the effect's placement
-        // and comes from the node transform, and the rest we would only be writing their default back.
+        /// <summary>
+        /// Places the control points the effect reads at the defaults the particle editor previews them at,
+        /// such as white for a tint control point. The preview configuration's drivers are applied after
+        /// this and win.
+        /// </summary>
+        private void ApplyControlPointDefaults()
+        {
+            var defaults = new ControlPointDefaults();
+            particleRenderer.Simulation.AddControlPointDefaults(defaults);
+
+            foreach (var renderer in particleRenderer.EnumerateRenderers())
+            {
+                renderer.AddControlPointDefaults(defaults);
+            }
+
+            foreach (var (index, value) in defaults.Values)
+            {
+                GetControlPoint(index).Position = value;
+            }
+        }
+
+        // An effect dispatched by code plays under a control point configuration, which carries constants its
+        // operators depend on as driver offsets. Control point 0 is skipped, it is the effect's placement.
         private void ApplyRuntimeControlPointValues(ParticleSystem particleSystem)
         {
-            var configurations = particleSystem.Data.GetArray("m_controlPointConfigurations");
+            var data = particleSystem.GetUpgradedData();
+            var configurations = data.GetArray("m_controlPointConfigurations");
             if (configurations == null)
             {
                 return;
             }
 
             // Viewmodel effects carry a first-person configuration; everything else plays under "game".
-            var viewModelEffect = particleSystem.Data.GetStringProperty("m_nViewModelEffect") == "INHERITABLE_BOOL_TRUE";
+            var viewModelEffect = data.GetStringProperty("m_nViewModelEffect") == "INHERITABLE_BOOL_TRUE";
             var wantedConfiguration = viewModelEffect ? "fps_view" : "game";
 
             KVObject? chosen = null;
@@ -108,7 +199,7 @@ namespace ValveResourceFormat.Renderer.SceneNodes
 
             foreach (var driver in drivers)
             {
-                var controlPoint = driver.ContainsKey("m_iControlPoint") ? driver.GetInt32Property("m_iControlPoint") : 0;
+                var controlPoint = driver.GetInt32Property("m_iControlPoint");
                 if (controlPoint == 0)
                 {
                     continue;
@@ -125,10 +216,10 @@ namespace ValveResourceFormat.Renderer.SceneNodes
         }
 
         /// <summary>
-        /// Creates particle nodes for the particle systems referenced by a model's keyvalues
-        /// (<c>particles_list</c>) and wires each one to the given model node according to the entry's
-        /// <c>attachment_type</c>. Follow types track the model or attachment point while it animates;
-        /// the other types are placed once at spawn. Entries with an unknown type are skipped.
+        /// Creates particle nodes for the systems in a model's <c>particles_list</c> and attaches each
+        /// per its <c>attachment_type</c>. Custom and world origin are placed once at spawn; the other
+        /// types track the model or its attachment point. Unknown types are skipped. Control point 0
+        /// of each system carries the model, for the model inputs that read it.
         /// </summary>
         /// <param name="scene">The scene the nodes belong to.</param>
         /// <param name="model">The model referencing the particle systems.</param>
@@ -178,6 +269,7 @@ namespace ValveResourceFormat.Renderer.SceneNodes
                         Name = particleName,
                     };
 
+                    particleNode.GetControlPoint(0).ModelObject = new ParticleModelNodeObject(model, modelNode, scene.RendererContext.FileLoader);
                     AttachOnModel(modelNode, particleNode, attachmentType, attachmentPoint, offset);
                     nodes.Add(particleNode);
                 }
@@ -190,26 +282,21 @@ namespace ValveResourceFormat.Renderer.SceneNodes
             return nodes;
         }
 
-        // Maps a ParticleAttachment_t kind onto the model's generic attach primitives (no placement math
-        // of its own): *_follow kinds track the model or a named attachment point, the rest are placed once,
-        // and kinds with no distinct viewer anchor (eyes/overhead/rootbone/center/...) fall back to the model origin.
+        // Custom and world origin are placed once, every other kind tracks the model or its named
+        // attachment point.
         private static void AttachOnModel(ModelSceneNode modelNode, SceneNode node, ParticleAttachment attachType, string attachmentName, Vector3 offset)
         {
             switch (attachType)
             {
+                case ParticleAttachment.PATTACH_POINT:
                 case ParticleAttachment.PATTACH_POINT_FOLLOW:
                     modelNode.AttachNode(node, attachmentName, offset);
-                    break;
-
-                case ParticleAttachment.PATTACH_POINT:
-                    modelNode.PlaceNode(node, attachmentName, offset);
                     break;
 
                 case ParticleAttachment.PATTACH_WORLDORIGIN:
                     node.Transform = Matrix4x4.CreateTranslation(offset);
                     break;
 
-                case ParticleAttachment.PATTACH_ABSORIGIN:
                 case ParticleAttachment.PATTACH_CUSTOMORIGIN:
                     modelNode.PlaceNode(node, string.Empty, offset);
                     break;
@@ -225,11 +312,47 @@ namespace ValveResourceFormat.Renderer.SceneNodes
         /// </summary>
         public void Restart() => pendingRestart = true;
 
+        /// <summary>Whether the system is switched on. A stopped system neither simulates nor draws.</summary>
+        public bool IsPlaying { get; private set; } = true;
+
+        /// <summary>Gets whether every emitter is done and every particle has expired.</summary>
+        public bool IsFinished => !pendingRestart && particleRenderer.IsFinished();
+
+        /// <summary>Switches the system on and replays it from its current transform.</summary>
+        public void Play()
+        {
+            IsPlaying = true;
+            Restart();
+        }
+
+        /// <summary>Switches the system off, dropping whatever it had alive.</summary>
+        public void Stop() => IsPlaying = false;
+
         private bool pendingRestart;
+        private bool isSeeded;
 
         /// <summary>
-        /// Stops emission and plays the system's endcap, which is what the engine does when something
-        /// tells a running effect to end.
+        /// Seeds each placed instance of an effect apart, the same way on every load, from its name and
+        /// where it first runs.
+        /// </summary>
+        private int PlacementSeed()
+        {
+            var position = Transform.Translation;
+
+            return unchecked((int)ValveResourceFormat.Utils.StringToken.Get(particleRenderer.Simulation.Name)
+                ^ ((int)MathF.Round(position.X) * 73856093)
+                ^ ((int)MathF.Round(position.Y) * 19349663)
+                ^ ((int)MathF.Round(position.Z) * 83492791));
+        }
+
+        // Until a restart has run, what is alive is left over from the last time the system played
+        private bool IsDrawable => IsPlaying && !pendingRestart;
+
+        /// <summary>Stops emission and leaves the particles already alive to finish their lives.</summary>
+        public void StopEmission() => particleRenderer.Stop();
+
+        /// <summary>
+        /// Stops emission and plays the endcap, as when something tells a running effect to end.
         /// </summary>
         public void PlayEndCap()
         {
@@ -253,14 +376,69 @@ namespace ValveResourceFormat.Renderer.SceneNodes
         /// <inheritdoc cref="SetTextureOverride(string)"/>
         public void SetTextureOverride(RenderTexture texture) => particleRenderer.SetTextureOverride(texture);
 
+        /// <summary>
+        /// Replaces the material drawn by every renderer in this system and its children that draws with
+        /// one. Call before adding the node to the scene, as the material can change the passes it draws in.
+        /// </summary>
+        public void SetMaterialOverride(RenderMaterial material)
+        {
+            particleRenderer.SetMaterialOverride(material);
+            RenderPasses = particleRenderer.Passes;
+        }
+
         /// <summary>Gets the control point at the given index from the particle renderer.</summary>
         /// <param name="index">The index of the control point to retrieve.</param>
         /// <returns>The control point at the specified index.</returns>
         public ControlPoint GetControlPoint(int index) => particleRenderer.GetControlPoint(index);
 
+        /// <summary>
+        /// Places a control point at a transform, taking its position and full orientation frame the
+        /// same way control point 0 is seeded from this node's transform.
+        /// </summary>
+        /// <param name="index">The index of the control point to place.</param>
+        /// <param name="transform">The world transform the control point takes.</param>
+        public void SetControlPoint(int index, Matrix4x4 transform)
+        {
+            var controlPoint = particleRenderer.GetControlPoint(index);
+            controlPoint.Position = transform.Translation;
+
+            var forward = Vector3.TransformNormal(Vector3.UnitX, transform);
+
+            if (forward.LengthSquared() > ParticleMath.MinimumLengthSquared && Matrix4x4.Decompose(transform, out _, out var rotation, out _))
+            {
+                controlPoint.Orientation = Vector3.Normalize(forward);
+                controlPoint.Rotation = rotation;
+            }
+        }
+
+        /// <summary>
+        /// Places a control point at an entity and keeps it there, so it follows the entity when
+        /// something moves it.
+        /// </summary>
+        /// <param name="index">The index of the control point to place.</param>
+        /// <param name="target">The entity the control point follows.</param>
+        public void BindControlPoint(int index, Entities.BaseEntity target)
+        {
+            controlPointBindings ??= [];
+            controlPointBindings.Add(new ControlPointBinding(index, target));
+            SetControlPoint(index, target.Transform);
+        }
+
+        private List<ControlPointBinding>? controlPointBindings;
+
+        private readonly record struct ControlPointBinding(int Index, Entities.BaseEntity Target);
+
+        private void UpdateBoundControlPoints()
+        {
+            foreach (var binding in controlPointBindings!)
+            {
+                SetControlPoint(binding.Index, binding.Target.Transform);
+            }
+        }
+
         private ModelSceneNode? CreatePreviewModel(ParticleSystem particleSystem)
         {
-            var configurations = particleSystem.Data.GetArray("m_controlPointConfigurations");
+            var configurations = particleSystem.GetUpgradedData().GetArray("m_controlPointConfigurations");
             if (configurations == null)
             {
                 return null;
@@ -325,6 +503,9 @@ namespace ValveResourceFormat.Renderer.SceneNodes
                 Name = previewModelData.Name,
             };
 
+            previewModelObject = new ParticleModelNodeObject(previewModelData, previewModelNode, Scene.RendererContext.FileLoader);
+            GetControlPoint(0).ModelObject = previewModelObject;
+
             var sequenceName = previewState.GetStringProperty("m_sequenceName");
             if (!string.IsNullOrEmpty(sequenceName))
             {
@@ -365,7 +546,7 @@ namespace ValveResourceFormat.Renderer.SceneNodes
 
             foreach (var driver in drivers)
             {
-                var controlPoint = driver.ContainsKey("m_iControlPoint") ? driver.GetInt32Property("m_iControlPoint") : 0;
+                var controlPoint = driver.GetInt32Property("m_iControlPoint");
                 // Deadlock drivers commonly omit m_iAttachType entirely.
                 var attachType = driver.ContainsKey("m_iAttachType")
                     ? driver.GetEnumValue<ParticleAttachment>("m_iAttachType")
@@ -398,6 +579,12 @@ namespace ValveResourceFormat.Renderer.SceneNodes
                     point.Rotation = EntityTransformHelper.EulerAnglesToQuaternion(angleOffset);
                 }
                 point.AttachType = attachType;
+                point.ModelObject = previewModelObject;
+
+                if (controlPoint == 0)
+                {
+                    previewOrigin = point.Position;
+                }
             }
         }
 
@@ -413,67 +600,215 @@ namespace ValveResourceFormat.Renderer.SceneNodes
 
         private Matrix4x4? seededTransform;
 
+        /// <summary>Where the preview configuration places control point 0 relative to the node.</summary>
+        private Vector3 previewOrigin;
+
         /// <inheritdoc/>
         public override void Update(Scene.UpdateContext context)
         {
-            if (!LayerEnabled)
+            // Visible too: a layer toggle re-enabling a sleeping effect must not have it simulate unseen
+            if (!IsPlaying || !LayerEnabled || !Visible)
             {
+                if (context.Phase == Scene.UpdatePhase.Act)
+                {
+                    particleRenderer.Hide();
+                }
+
                 return;
             }
 
-            // Control point 0 is seeded from the node transform (position, full rotation frame, and its
-            // transformed +X as the forward direction) whenever the transform changes from outside, like a
-            // non-follow attachment in game. Between seeds the control point belongs to the simulation:
-            // particle functions may move it, and the node transform reflects it back after each step.
-            // Preview drives the control point separately.
-            if (seededTransform != Transform)
+            switch (context.Phase)
             {
-                var controlPoint = particleRenderer.MainControlPoint;
-                controlPoint.Position = Transform.Translation;
+                case Scene.UpdatePhase.Place:
+                    Place();
+                    break;
 
-                if (!Preview)
-                {
-                    var controlPointForward = Vector3.TransformNormal(Vector3.UnitX, Transform);
-                    if (controlPointForward.LengthSquared() > Epsilon.LengthSquared)
-                    {
-                        controlPoint.Orientation = Vector3.Normalize(controlPointForward);
-                        controlPoint.Rotation = Quaternion.Normalize(Quaternion.CreateFromRotationMatrix(Transform));
-                    }
-                }
+                case Scene.UpdatePhase.Simulate:
+                    Simulate(context);
+                    break;
 
-                seededTransform = Transform;
+                case Scene.UpdatePhase.Act:
+                    Act(context.Camera);
+                    break;
             }
+        }
+
+        /// <summary>Places the effect. The half that reads other nodes: bound control points, the preview attachment.</summary>
+        private void Place()
+        {
+            if (controlPointBindings != null)
+            {
+                UpdateBoundControlPoints();
+            }
+
+            SeedControlPointFromTransform();
 
             if (PreviewModel != null && !string.IsNullOrEmpty(PreviewModelAttachmentPoint))
             {
                 particleRenderer.MainControlPoint.Position = PreviewModel.GetAttachmentTransform(PreviewModelAttachmentPoint).Translation;
             }
+        }
 
+        /// <summary>Seeds control point 0 from the node transform when that has changed from outside,
+        /// keeping any offset the preview configuration gives it. Between seeds the control point belongs
+        /// to the simulation.</summary>
+        private void SeedControlPointFromTransform()
+        {
+            if (seededTransform == Transform)
+            {
+                return;
+            }
+
+            var controlPoint = particleRenderer.MainControlPoint;
+
+            // A screen-space effect is laid out around the origin of the screen-space view, wherever it
+            // was placed, so control point 0 stays at the world origin
+            if (particleRenderer.Simulation.IsScreenSpaceEffect)
+            {
+                controlPoint.Position = Vector3.Zero;
+                controlPoint.Rotation = Quaternion.Identity;
+                seededTransform = Transform;
+                return;
+            }
+
+            controlPoint.Position = Vector3.Transform(previewOrigin, Transform);
+
+            if (!Preview)
+            {
+                var controlPointForward = Vector3.TransformNormal(Vector3.UnitX, Transform);
+                if (controlPointForward.LengthSquared() > ParticleMath.MinimumLengthSquared && Matrix4x4.Decompose(Transform, out _, out var rotation, out _))
+                {
+                    controlPoint.Orientation = Vector3.Normalize(controlPointForward);
+                    controlPoint.Rotation = rotation;
+                }
+            }
+
+            seededTransform = Transform;
+        }
+
+        /// <summary>
+        /// Runs the effect. Touches only its own control points, particles and lights.
+        /// </summary>
+        private void Simulate(Scene.UpdateContext context)
+        {
             var frameTime = context.Timestep * FrametimeMultiplier;
+
+            if (!isSeeded)
+            {
+                isSeeded = true;
+                particleRenderer.Simulation.SeedRandom(PlacementSeed());
+                lastDrawnUptime = context.Uptime;
+            }
+
+            if (drawnSinceSimulate)
+            {
+                drawnSinceSimulate = false;
+                lastDrawnUptime = context.Uptime;
+            }
 
             if (pendingRestart)
             {
                 pendingRestart = false;
-                particleRenderer.Replay();
+                simulationStartTime = null;
+
+                // The node may have moved after Place ran, or while it was disabled and skipped it.
+                SeedControlPointFromTransform();
+
+                endCapPlayed = PlaybackMode == ParticlePlaybackMode.EndCapOnly;
+
+                if (endCapPlayed)
+                {
+                    particleRenderer.PlayEndCapOnly();
+                }
+                else
+                {
+                    particleRenderer.Replay();
+                }
             }
 
-            if (frameTime > 0f)
+            if (IsPaused || IsAsleep(context.Uptime) || HasStoppedSimulating(context.Uptime))
             {
-                particleRenderer.Update(frameTime, context.Uptime);
+                return;
+            }
 
-                if (!Preview)
+            if (frameTime > 0f && (Preview || particleRenderer.IsWithinDrawDistance(context.Camera)))
+            {
+                particleRenderer.SetCameraPosition(context.Camera.Location);
+                particleRenderer.Update(frameTime, context.Uptime);
+                stepped = true;
+
+                if (!Preview && !particleRenderer.Simulation.IsScreenSpaceEffect)
                 {
                     ReflectControlPointTransform();
                 }
 
-                UpdateBounds();
+                if (!particleRenderer.DrawsInScreenSpace)
+                {
+                    UpdateBounds();
+                }
+            }
+
+            // The endcap starts where emission ends, so the particles it decays and freezes are still alive.
+            if (PlaybackMode == ParticlePlaybackMode.NormalWithEndCap
+                && !endCapPlayed
+                && particleRenderer.HasFinishedEmitting())
+            {
+                PlayEndCap();
+                endCapPlayed = true;
             }
 
             // Restart if all emitters are done and all particles expired
-            if (Preview && particleRenderer.IsFinished())
+            if (Loop && particleRenderer.IsFinished())
             {
                 pendingRestart = true;
             }
+        }
+
+        private bool HasStoppedSimulating(float uptime)
+        {
+            if (MaxSimulationTime <= 0f)
+            {
+                return false;
+            }
+
+            simulationStartTime ??= uptime;
+
+            return uptime > simulationStartTime + MaxSimulationTime;
+        }
+
+        /// <summary>Whether <see cref="Simulate"/> stepped, so there is something to finish.</summary>
+        private bool stepped;
+
+        /// <summary>Set when the effect is drawn, and taken by the next <see cref="Simulate"/>.</summary>
+        private bool drawnSinceSimulate;
+
+        private float lastDrawnUptime;
+
+        /// <summary>
+        /// Whether the effect has gone undrawn for long enough to stop simulating. It holds where it is
+        /// until it is drawn again, without catching up. An effect with no particles stays awake, so it
+        /// can start emitting, and so does one playing its end cap.
+        /// </summary>
+        private bool IsAsleep(float uptime)
+        {
+            var simulation = particleRenderer.Simulation;
+
+            if (Preview || endCapPlayed || simulation.Particles.Count == 0)
+            {
+                return false;
+            }
+
+            return uptime - lastDrawnUptime > simulation.NoDrawTimeToGoToSleep;
+        }
+
+        /// <summary>
+        /// Finishes the step, on the particles it left and where reaching past the effect is safe, and
+        /// hides what renderers that do not draw this frame placed in the scene.
+        /// </summary>
+        private void Act(Camera camera)
+        {
+            particleRenderer.Act(camera, stepped);
+            stepped = false;
         }
 
         // The node transform mirrors control point 0 after simulation, so movement applied by particle
@@ -490,9 +825,8 @@ namespace ValveResourceFormat.Renderer.SceneNodes
             seededTransform = reflected;
         }
 
-        // The simulation runs in world space with bounds kept relative to control point 0, so the world
-        // box is exact and set directly; the local box is derived so consumers composing
-        // LocalBoundingBox with Transform still get a box containing the particles.
+        // The simulation runs in world space with bounds relative to control point 0, so the world box is exact.
+        // The local box is derived so consumers composing it with Transform still get a box containing the particles.
         private void UpdateBounds()
         {
             var worldBounds = particleRenderer.LocalBoundingBox.Translate(particleRenderer.MainControlPoint.Position);
@@ -504,10 +838,26 @@ namespace ValveResourceFormat.Renderer.SceneNodes
         }
 
         /// <inheritdoc/>
+        public override void UpdateBuffers(Camera camera)
+        {
+            if (IsDrawable && LayerEnabled)
+            {
+                drawnSinceSimulate = true;
+                particleRenderer.UpdateBuffers(camera);
+            }
+        }
+
+        /// <inheritdoc/>
         public override void Render(Scene.RenderContext context)
         {
-            if (context.ReplacementShader is not null)
+            if (!IsDrawable)
             {
+                return;
+            }
+
+            if (context.ReplacementShader is { } replacement)
+            {
+                RenderReplacement(context, replacement);
                 return;
             }
 
@@ -516,7 +866,47 @@ namespace ValveResourceFormat.Renderer.SceneNodes
                 return;
             }
 
-            particleRenderer.Render(context.Camera, context.RenderPass);
+            particleRenderer.Render(context.Camera, context.RenderPass, context.Layer);
+        }
+
+        /// <summary>Draws with a pass replacement shader, for picking and the selection outline.</summary>
+        private void RenderReplacement(Scene.RenderContext context, Shader replacement)
+        {
+            if (!particleRenderer.CanRenderReplacement
+                || context.Layer != RenderLayer.Scene
+                || context.RenderPass is not (RenderPass.Opaque or RenderPass.Translucent or RenderPass.All))
+            {
+                return;
+            }
+
+            replacement.Use();
+
+            replacement.SetUniform1("meshId", 0u);
+
+            // A tube or a card can turn either face toward the camera.
+            using var _ = GraphicsContext.RenderState.Scope(cullMode: RsCullMode.None);
+
+            particleRenderer.RenderReplacement(replacement, Id, context.RenderPass, context.Camera);
+        }
+
+        /// <inheritdoc/>
+        /// <remarks>The system's depth sort bias is added to the linear distance, which stops at zero.</remarks>
+        public override float GetCameraDistance(Camera camera)
+        {
+            // Translucent particles are blended in sorted order. A moment based order independent blend would
+            // spread out and dim the cores where many glowing sprites overlap, which comes out brighter and
+            // narrower here.
+
+            var distanceSquared = base.GetCameraDistance(camera);
+            var bias = particleRenderer.Simulation.DepthSortBias;
+
+            if (bias == 0f)
+            {
+                return distanceSquared;
+            }
+
+            var biasedDistance = MathF.Max(0f, MathF.Sqrt(distanceSquared) + bias);
+            return biasedDistance * biasedDistance;
         }
 
         /// <inheritdoc/>

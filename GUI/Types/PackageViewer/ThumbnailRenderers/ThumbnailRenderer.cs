@@ -6,11 +6,10 @@ using Microsoft.Extensions.Logging;
 using OpenTK.Graphics.OpenGL;
 using OpenTK.Windowing.Common;
 using OpenTK.Windowing.Desktop;
-using SteamDatabase.ValvePak;
+using ValvePak;
 using ValveResourceFormat;
-using ValveResourceFormat.CompiledShader;
-using ValveResourceFormat.IO;
 using ValveResourceFormat.Renderer;
+using ValveResourceFormat.Renderer.Materials;
 using ValveResourceFormat.Renderer.SceneEnvironment;
 
 namespace GUI.Types.PackageViewer.ThumbnailRenderers;
@@ -60,12 +59,15 @@ internal abstract class ThumbnailRenderer : IDisposable
         NativeWindow = GLViewers.NativeWindowFactory.Create(nativeWindowSettings);
         RendererContext = new RendererContext(context, VrfGuiContext.Logger);
 
-        NativeWindow.MakeCurrent();
+        RendererContext.Device.CreateContext(new GLViewers.GLFWSurface(NativeWindow.Context)).Begin();
 
         GLEnvironment.Initialize(RendererContext.Logger);
-        GLEnvironment.SetDefaultRenderState(RendererContext);
+        GLEnvironment.SetDefaultRenderState();
 
         SceneRenderer = new Renderer(RendererContext);
+
+        // We have few textures here, so prefer streaming them to end
+        RendererContext.TextureStreaming.Mode = TextureStreamingMode.Immediate;
 
         SceneRenderer.Camera.SetFromQAngle(new Vector3(20f, 225f, 0f));
 
@@ -136,7 +138,7 @@ internal abstract class ThumbnailRenderer : IDisposable
 
     public static Resource? LoadResourceFromPackageEntry(VrfGuiContext context, PackageEntry entry)
     {
-        var stream = GameFileLoader.GetPackageEntryStream(context.CurrentPackage!, entry);
+        var stream = context.CurrentPackage!.GetMemoryMappedStreamIfPossible(entry);
 
         if (stream == null)
         {
@@ -168,7 +170,7 @@ internal abstract class ThumbnailRenderer : IDisposable
 
         NativeWindow.MakeCurrent();
 
-        SceneRenderer.Scene.Clear();
+        SceneRenderer.Clear();
 
         var size = (int)thumbnailSize;
 
@@ -231,6 +233,7 @@ internal abstract class ThumbnailRenderer : IDisposable
 
         if (disposing)
         {
+            NativeWindow?.MakeCurrent();
             RendererContext?.Dispose();
             SceneRenderer?.Dispose();
             GLViewers.NativeWindowFactory.Destroy(NativeWindow);

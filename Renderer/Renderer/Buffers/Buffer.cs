@@ -10,7 +10,7 @@ namespace ValveResourceFormat.Renderer.Buffers
         /// <summary>Gets the OpenGL buffer target type.</summary>
         public BufferTarget Target { get; }
         /// <summary>Gets the OpenGL buffer object handle.</summary>
-        public int Handle { get; }
+        public int Handle { get; private set; }
         /// <summary>Gets the shader binding point index.</summary>
         public int BindingPoint { get; }
         /// <summary>Gets the debug name for this buffer.</summary>
@@ -19,25 +19,22 @@ namespace ValveResourceFormat.Renderer.Buffers
         /// <summary>Gets or sets the current size of the buffer in bytes.</summary>
         public virtual int Size { get; set; }
 
+        private readonly BufferRangeTarget bindTarget;
 
         /// <summary>Initializes a new buffer with the given target, binding point, and debug name.</summary>
         protected Buffer(BufferTarget target, int bindingPoint, string name)
         {
             Target = target;
-            GL.CreateBuffers(1, out int handle);
-            Handle = handle;
+            bindTarget = (BufferRangeTarget)target;
+            Handle = GraphicsDevice.CreateBuffer(name);
             BindingPoint = bindingPoint;
             Name = name;
-
-#if DEBUG
-            GL.ObjectLabel(ObjectLabelIdentifier.Buffer, Handle, Name.Length, Name);
-#endif
         }
 
         /// <summary>Binds this buffer to its binding point using <c>glBindBufferBase</c>.</summary>
         public void BindBufferBase()
         {
-            GL.BindBufferBase((BufferRangeTarget)Target, BindingPoint, Handle);
+            GL.BindBufferBase(bindTarget, BindingPoint, Handle);
         }
 
         /// <summary>Binds this buffer to a binding point other than its own. Binding one buffer to several
@@ -45,7 +42,14 @@ namespace ValveResourceFormat.Renderer.Buffers
         /// <param name="bindingPoint">The slot to bind to instead of <see cref="BindingPoint"/>.</param>
         public void BindBufferBase(ReservedBufferSlots bindingPoint)
         {
-            GL.BindBufferBase((BufferRangeTarget)Target, (int)bindingPoint, Handle);
+            GL.BindBufferBase(bindTarget, (int)bindingPoint, Handle);
+        }
+
+        /// <summary>Replaces the buffer object.</summary>
+        protected void RecreateHandle()
+        {
+            GL.DeleteBuffer(Handle);
+            Handle = GraphicsDevice.CreateBuffer(Name);
         }
 
         /// <summary>Deletes the underlying OpenGL buffer object.</summary>

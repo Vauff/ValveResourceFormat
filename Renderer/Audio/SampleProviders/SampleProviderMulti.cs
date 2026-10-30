@@ -1,3 +1,5 @@
+using System.Numerics.Tensors;
+
 namespace ValveResourceFormat.Renderer.Audio.SampleProviders;
 
 /// <summary>
@@ -20,7 +22,7 @@ public class SampleProviderMulti : AudioSampleProvider
         evaluateFadeIn = EvaluateFadeIn;
     }
 
-    /// <summary>Adds a provider to the mix. Idempotent: providers get auto-removed when they run dry and re-added when they resume (e.g. retriggered child events), which must not create duplicates.</summary>
+    /// <summary>Adds a provider to the mix. Idempotent: providers auto-removed when they run dry are re-added when they resume (e.g. retriggered child events).</summary>
     public void AddProvider(IAudioSampleProvider provider)
     {
         lock (providers)
@@ -78,6 +80,18 @@ public class SampleProviderMulti : AudioSampleProvider
     private int fadeInSampleRate;
     private double fadeInElapsedFrames = -1; // < 0 means not fading in / already finished
 
+    // Written by the game thread; the applied value belongs to the mixing thread so each
+    // chunk ramps from where the previous one ended.
+    private volatile float liveVolume = 1f;
+    private float appliedLiveVolume = 1f;
+
+    /// <summary>Gets or sets a 0..1 gain applied live to the whole mix, ramped per chunk. Reset to 1 by <see cref="ResetFades"/>.</summary>
+    public float LiveVolume
+    {
+        get => liveVolume;
+        set => liveVolume = MathUtils.Saturate(value);
+    }
+
     /// <summary>
     /// Starts fading the mix out: subsequent reads ramp the volume down along <paramref name="curve"/>
     /// (or linearly over <paramref name="fallbackSeconds"/> when null) and the mix ends when the fade completes.
@@ -101,7 +115,7 @@ public class SampleProviderMulti : AudioSampleProvider
     /// <summary>
     /// Starts fading the mix in from silence over <paramref name="seconds"/>, eased rather than linear so
     /// a freshly started event (e.g. entering a soundscape with none previously active) doesn't jump
-    /// straight to full volume. Harmless to call more than once; only the first call takes effect.
+    /// straight to full volume. Harmless to call more than once; calls made while fading in are ignored.
     /// </summary>
     public void BeginFadeIn(float seconds, int sampleRate)
     {
@@ -137,13 +151,16 @@ public class SampleProviderMulti : AudioSampleProvider
         var startGain = evaluate(startSeconds);
         var endGain = evaluate(endSeconds);
 
-        // The last sample must land exactly on endGain so consecutive chunks join without a step
-        var lastIndex = Math.Max(count - 1, 1);
+        // The last sample must land exactly on endGain so consecutive chunks join without a step,
+        // so it is scaled directly: the lerp at 1 can round off the end value
+        var lastIndex = count - 1;
 
-        for (var i = 0; i < count; i++)
+        for (var i = 0; i < lastIndex; i++)
         {
-            buffer[offset + i] *= float.Lerp(startGain, endGain, (float)i / lastIndex);
+            buffer[offset + i] *= MathUtils.Lerp(startGain, endGain, (float)i / lastIndex);
         }
+
+        buffer[offset + lastIndex] *= endGain;
 
         elapsedFrames += count / 2.0;
         return endSeconds >= duration;
@@ -156,13 +173,12 @@ public class SampleProviderMulti : AudioSampleProvider
             return Math.Max(fadeCurve.Evaluate((float)seconds), 0f);
         }
 
-        return Math.Clamp(1f - (float)(seconds / fadeDuration), 0f, 1f);
+        return MathUtils.Saturate(1f - (float)(seconds / fadeDuration));
     }
 
     private float EvaluateFadeIn(double seconds)
     {
-        var t = Math.Clamp((float)(seconds / fadeInDuration), 0f, 1f);
-        return t * t * (3f - 2f * t);
+        return MathUtils.Smoothstep(0f, 1f, (float)(seconds / fadeInDuration));
     }
 
     /// <summary>Removes all providers from the mix.</summary>
@@ -185,6 +201,8 @@ public class SampleProviderMulti : AudioSampleProvider
             fadeCurve = null;
             fadeElapsedFrames = -1;
             fadeInElapsedFrames = -1;
+            liveVolume = 1f;
+            appliedLiveVolume = 1f;
         }
     }
 
@@ -207,18 +225,13 @@ public class SampleProviderMulti : AudioSampleProvider
                         var next = node.Next;
 
                         var read = node.Value.Read(readBuffer, 0, count);
-                        var index = offset;
-                        for (var i = 0; i < read; i++)
-                        {
-                            if (i >= maxRead)
-                            {
-                                buffer[index++] = readBuffer[i];
-                            }
-                            else
-                            {
-                                buffer[index++] += readBuffer[i];
-                            }
-                        }
+
+                        // Sum over what earlier providers wrote, copy past it
+                        var overlap = Math.Min(read, maxRead);
+                        var mixed = buffer.AsSpan(offset, overlap);
+                        var incoming = readBuffer.AsSpan(0, overlap);
+                        TensorPrimitives.Add(mixed, incoming, mixed);
+                        readBuffer.AsSpan(overlap, read - overlap).CopyTo(buffer.AsSpan(offset + overlap));
 
                         if (read < count && node.List == providers)
                         {
@@ -247,6 +260,30 @@ public class SampleProviderMulti : AudioSampleProvider
                 // Fade-in finished: stop applying it, unlike the fade-out this never touches providers
                 fadeInElapsedFrames = -1;
             }
+
+            var liveTarget = liveVolume;
+
+            if (maxRead > 0 && appliedLiveVolume != liveTarget)
+            {
+                // The last sample must land exactly on the target so consecutive chunks join without a step,
+                // so it is scaled directly: the lerp at 1 can round off the end value
+                var lastIndex = maxRead - 1;
+
+                for (var i = 0; i < lastIndex; i++)
+                {
+                    buffer[offset + i] *= MathUtils.Lerp(appliedLiveVolume, liveTarget, (float)i / lastIndex);
+                }
+
+                buffer[offset + lastIndex] *= liveTarget;
+            }
+            else if (maxRead > 0 && liveTarget != 1f)
+            {
+                // Steady gain is a plain scale; the ramp is only for the chunk the gain changed in
+                var mixed = buffer.AsSpan(offset, maxRead);
+                TensorPrimitives.Multiply(mixed, liveTarget, mixed);
+            }
+
+            appliedLiveVolume = liveTarget;
         }
 
         if (maxRead < count)

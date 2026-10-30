@@ -29,18 +29,18 @@ namespace ValveResourceFormat.Renderer
         /// <param name="physics">Physics world to trace against.</param>
         /// <param name="input">User input providing the player movement state.</param>
         /// <param name="camera">Camera the debug trace is fired from.</param>
-        public void Render(Rubikon physics, UserInput input, Camera camera)
+        public void Render(PhysicsWorld physics, UserInput input, Camera camera)
         {
             Rebuild(physics, input, camera);
             RenderLines();
         }
 
-        private void Rebuild(Rubikon physics, UserInput input, Camera camera)
+        private void Rebuild(PhysicsWorld physics, UserInput input, Camera camera)
         {
             vertices.Clear();
 
             // Player collision hull while walk-mode movement is driving the camera
-            if (!input.NoClip)
+            if (input.WalkMode)
             {
                 var movement = input.PlayerMovement;
                 var halfExtents = movement.HullHalfExtents;

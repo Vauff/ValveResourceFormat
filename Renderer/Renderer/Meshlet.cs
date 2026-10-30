@@ -7,6 +7,7 @@ namespace ValveResourceFormat.Renderer
     /// <summary>
     /// Small group of triangles on a mesh used for low level culling
     /// </summary>
+    /// <seealso href="https://s2v.app/SchemaExplorer/cs2/modellib/CMeshletDescriptor">CMeshletDescriptor</seealso>
     [StructLayout(LayoutKind.Sequential, Pack = 16)]
     public readonly struct Meshlet
     {
@@ -14,6 +15,7 @@ namespace ValveResourceFormat.Renderer
         /// Packed axis-aligned bounding box stored as two 32-bit values.
         /// Each uint packs three 10-bit normalized components (x/y/z in 0..1023).
         /// </summary>
+        /// <seealso href="https://s2v.app/SchemaExplorer/cs2/mathlib_extended/PackedAABB_t">PackedAABB_t</seealso>
         [StructLayout(LayoutKind.Sequential)]
         public struct MeshletBounds
         {
@@ -31,6 +33,7 @@ namespace ValveResourceFormat.Renderer
         /// <summary>
         /// Quantized cone used for backface/cone culling.
         /// </summary>
+        /// <seealso href="https://s2v.app/SchemaExplorer/cs2/modellib/CDrawCullingData">CDrawCullingData</seealso>
         [StructLayout(LayoutKind.Sequential)]
         public struct MeshletCone
         {
@@ -51,7 +54,6 @@ namespace ValveResourceFormat.Renderer
 
         /// <summary>
         /// Offset (in vertices) into the global vertex/index data for this meshlet.
-        /// Used by the renderer to locate the meshlet's vertex data.
         /// </summary>
         public int VertexOffset { get; init; }
 
@@ -75,7 +77,7 @@ namespace ValveResourceFormat.Renderer
             var packedMax = packedBounds.GetUInt32Property("m_nMax");
 
             var coneData = data.GetSubCollection("m_CullingData");
-            var coneAxis = coneData.GetIntegerArray("m_ConeAxis");
+            var coneAxis = coneData.GetSubCollection("m_ConeAxis");
 
             PackedAABB = new MeshletBounds()
             {
@@ -85,9 +87,9 @@ namespace ValveResourceFormat.Renderer
 
             CullingData = new MeshletCone()
             {
-                ConeAxis0 = (sbyte)coneAxis[0],
-                ConeAxis1 = (sbyte)coneAxis[1],
-                ConeAxis2 = (sbyte)coneAxis[2],
+                ConeAxis0 = (sbyte)coneAxis.GetElement<int>(0),
+                ConeAxis1 = (sbyte)coneAxis.GetElement<int>(1),
+                ConeAxis2 = (sbyte)coneAxis.GetElement<int>(2),
                 ConeCutoff = (sbyte)coneData.GetInt32Property("m_ConeCutoff"),
             };
 

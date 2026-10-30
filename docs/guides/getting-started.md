@@ -1,93 +1,96 @@
-# Getting Started
+---
+description: Download Source 2 Viewer and learn the basics of browsing game files in the Explorer, opening files and VPK links, and exporting assets.
+---
 
-This guide walks you through the basics of using Source 2 Viewer to browse, preview, and export Source 2 game assets.
+# Getting Started
 
 ## Downloading Source 2 Viewer
 
-Download the latest release from [s2v.app](https://s2v.app).
+Download the latest release from [s2v.app](https://s2v.app). It needs no installation.
 
-Source 2 Viewer is portable and requires no installation. Just run the executable directly.
+Games update their files often, and the release can fall behind. If a file fails to open, switch to the [latest dev build](./reporting-issues.md#getting-the-latest-dev-build), which has the newest fixes. You can also download it from [s2v.app/dev](https://s2v.app/dev/).
 
-- **Source 2 Viewer** (GUI) is Windows-only. It can be run on Linux/macOS using Wine.
-- **Source2Viewer-CLI** (command-line) is cross-platform. Download for your target platform is available in the changelog section.
+- **Source 2 Viewer** (GUI) is Windows-only, and runs on Linux and macOS with Wine.
+- **Source2Viewer-CLI** (command-line) runs on Windows, Linux and macOS.
 
 ## Using the Explorer
 
-The **Explorer** tab is the main way to browse game files. It opens by default on launch (this can be disabled in settings) and is accessible from the top bar. It automatically discovers all installed Steam games and their VPK archives, including workshop content. Click a game to expand it and browse its files.
+The **Explorer** tab lists your installed Steam games that have VPK packages, with those packages and their workshop items. Expand a game and double-click a package to open it. See [Finding Game Files](./finding-files.md) for which package holds what.
 
-The Explorer also shows:
+Right-click a package or file and choose **Add to Bookmarks** to keep it at the top of the Explorer. Recently opened files are listed there too.
 
-- **Recent files** at the top, so you can quickly reopen files you've worked with before
-- **Bookmarks** for files you've saved for later. Right-click any file and select bookmark to add it
+![Explorer listing the detected Steam games, with Deadlock expanded and its game/citadel/pak01_dir.vpk selected](./images/getting-started-game-explorer.webp)
 
-![Explorer showing detected Steam games](./images/getting-started-game-explorer.png)
+Files opened from a game folder load the textures, materials and other files they use from that game. For files outside of a game folder, see [Game Search Paths](./game-search-paths.md).
 
-## Opening Files Manually
+## Opening Files
 
-There are several ways to open files:
+- **File > Open** (<kbd>Ctrl</kbd>+<kbd>O</kbd>) opens a `.vpk` or a single Source 2 file, such as a `.vmdl_c`.
+- You can also drag files onto the window.
 
-- Use **File → Open** (<kbd>Ctrl</kbd>+<kbd>O</kbd>) to browse for any `.vpk` file or individual Source 2 files (`.vmdl_c`, `.vtex_c`, etc.)
-- Drag and drop files or folders directly onto the window
+### VPK Links
+
+A `vpk:` link opens a file inside a package:
+
+```
+vpk:steam:730/game/csgo/maps/de_dust2.vpk:maps/de_dust2.vmap_c
+```
+
+Right-click a file and choose **Copy URL** to get its link. `steam:730/` stands for the install folder of the Steam app 730, so the link works on any computer with the game. After **Register .vpk file association** in settings, clicking a `vpk:` link opens it in Source 2 Viewer.
 
 ## Searching
 
-Press <kbd>Ctrl</kbd>+<kbd>F</kbd> to open the search dialog. It supports several search modes:
+Press <kbd>Ctrl</kbd>+<kbd>F</kbd> in a package tab to search the package by file name, path or contents. See [Searching a Package](./finding-files.md#searching-a-package).
 
-- File Name (Partial Match)
-- File Name (Exact Match)
-- File Full Path
-- Regex
-- File Contents (Case Sensitive)
-- File Contents Hex Bytes
+![Search dialog with ak47 typed in and File name selected](./images/getting-started-search.webp)
 
-Results are shown in a list with file name, size, and type columns.
+## Previewing Files
 
-## Previewing Assets
+Double-click a file to open it in a new tab. Models, maps, textures, sounds, materials and particles each get their own viewer, and other files open as text, or in a hex view if they are binary. The keys of each viewer are listed in the bar at the bottom of the window.
 
-Double-click any file to open it in a new tab. Different file types get specialized viewers:
-
-- **Models** (`.vmdl_c`) → 3D viewer with orbit, pan, zoom
-- **Textures** (`.vtex_c`) → Image viewer with channel isolation (RGB, Alpha)
-- **Sounds** (`.vsnd_c`) → Audio player with waveform
-- **Maps** (`.vmap_c`) → 3D map viewer
-- **Materials** (`.vmat_c`) → Material parameter viewer
-- Other formats → Text/hex viewer
-
-A preview mode can be enabled in settings. When active, selecting a file in the tree will automatically display it instead of showing the file list.
-
-Relevant keyboard shortcuts are shown at the bottom of each viewer.
+A file that uses other files, such as a model and its materials, lists them in its **References** tab. See [References](./finding-files.md#references).
 
 ## Exporting Files
 
-Right-click a file to access two export modes:
+Right-click a file to export it:
 
-- **Export as is** saves the raw compiled file without any conversion. Use this when you need the original Source 2 format.
-- **Decompile & export** converts files to standard editable formats. The output format can be chosen in the save dialog:
-    - Models → glTF (.gltf/.glb) or decompiled .vmdl
-    - Maps → glTF or decompiled .vmap (for Hammer Editor)
-    - Textures → PNG, JPG, or EXR (for HDR textures)
-    - Sounds → WAV or MP3
-    - Materials → .vmat
-    - Physics (`.vphys_c`) and navigation meshes (`.nav`) → glTF
-    - Other resources → Their decompiled text format
+![Context menu on the AK-47 model with Decompile & export highlighted](./images/getting-started-export-menu.webp)
 
-::: tip
-"Decompile & export" is what most people want. It produces files you can directly open in Blender, image editors, audio players, or Hammer Editor.
-:::
+- **Export as is** saves the compiled file unchanged.
 
-## Batch Operations
+    ![Save dialog for Export as is, with the file name weapon_rif_ak47.vmdl_c and All files as the type](./images/getting-started-export-as-is-save.webp)
 
-- **Select multiple files:** Hold <kbd>Ctrl</kbd> and click to select individual files, or hold <kbd>Shift</kbd> to select a range
-- **Export entire folders:** Right-click a folder and choose an export option to export everything inside it
+- **Decompile & export** converts it to a format you can edit:
+    - Models and maps: glTF for Blender, or `.vmdl` and `.vmap` for the Workshop Tools
+    - Textures: PNG, or EXR for HDR textures, with the texture's `.vtex` if it has one of its own
+    - Sounds: WAV or MP3, with a `.vsnd` of their settings
+    - Materials: `.vmat`
+    - Other files: their text format
 
-::: tip
-For large batch exports, consider using the [command-line utility](./command-line.md) which supports multi-threaded extraction.
-:::
+Pick the format in **Save as type**. For a model, **glTF** or **glTF Binary** gives a file you can open in Blender. For a map, a warning about what decompiled maps lack comes first.
 
-## Issues
+![Save dialog for the AK-47 model with the Save as type list open, offering vmdl, glTF and glTF Binary](./images/getting-started-export-save-dialog.webp)
 
-If you have questions or want to chat, join the Discord server.
+A window shows the progress and tells you when the export is done.
 
-If you want to report a bug or request a feature, please test the [dev version](https://s2v.app/dev/) first as it may already be fixed. When filing an issue on GitHub, follow the issue template.
+![Export window showing Export completed](./images/getting-started-export-progress.webp)
 
-Source 2 Viewer keeps its settings in `%LocalAppData%/Source2Viewer/settings.vdf`.
+## Exporting Folders
+
+Select several files with <kbd>Ctrl</kbd> or <kbd>Shift</kbd>, or right-click a folder, to export them together.
+
+![Context menu on the ak47 folder with Decompile & export highlighted](./images/getting-started-folder-export-menu.webp)
+
+**Decompile & export** first asks for the format of each file type. Pick `gltf` or `glb` for `vmdl_c` to get models for Blender, or `* Do not export *` to skip a type. If the selection contains a map, every type except the map starts as `* Do not export *`.
+
+![Select output file types window listing vtex_c as image, vmat_c as vmat and vmdl_c as vmdl](./images/getting-started-folder-export-types.webp)
+
+Then choose the folder to export to. The files keep their folders from the package.
+
+![Folder picker for choosing which folder to extract files to](./images/getting-started-folder-picker.webp)
+
+For large exports, the [command-line utility](./command-line.md) is faster.
+
+## Help
+
+Ask questions on [Discord](https://discord.gg/s9QQ7Wg7r4), and report bugs as described in [Reporting Issues](./reporting-issues.md).

@@ -5,9 +5,9 @@ using System.IO.Hashing;
 using System.Linq;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Threading;
 using OpenTK.Graphics.OpenGL;
 using SkiaSharp;
-using ValveResourceFormat.CompiledShader;
 using ValveResourceFormat.ResourceTypes;
 using VrfMaterial = ValveResourceFormat.ResourceTypes.Material;
 
@@ -16,46 +16,29 @@ namespace ValveResourceFormat.Renderer.Materials
     /// <summary>
     /// Loads and caches materials and textures from Source 2 resources.
     /// </summary>
-    public class MaterialLoader
+    public partial class MaterialLoader
     {
         private readonly Dictionary<ulong, RenderMaterial> Materials = [];
         private readonly List<RenderMaterial> OwnedMaterials = [];
 
         private readonly Dictionary<string, RenderTexture> Textures = [];
         private readonly Dictionary<string, RenderTexture> TexturesSrgb = [];
-        private readonly Dictionary<(int AddressU, int AddressV, bool AnisotropicFiltering), int> Samplers = [];
+        private readonly Dictionary<(RsTextureAddressMode AddressU, RsTextureAddressMode AddressV, bool Mipmaps, bool AnisotropicFiltering), int> Samplers = [];
         private readonly RendererContext RendererContext;
         private RenderTexture? ErrorTexture;
+        private RenderMaterial? ErrorMaterial;
         private RenderTexture? DefaultNormal;
         private RenderTexture? DefaultMask;
         private RenderTexture? DefaultColor;
         private RenderTexture? DefaultVolume;
+        private RenderTexture? DefaultBlackVolume;
+        private RenderTexture? DefaultCubeArray;
+        private RenderTexture? DefaultTextureArray;
         /// <summary>Gets or sets the maximum anisotropy level applied to newly loaded textures when anisotropic filtering is enabled.</summary>
         public static float MaxTextureMaxAnisotropy { get; set; }
 
         /// <summary>Gets the number of materials currently held in the cache.</summary>
         public int MaterialCount => Materials.Count;
-
-        /// <summary>
-        /// Maps a material texture parameter name to the shader uniforms it can feed, in preference order.
-        /// The first candidate the shader declares and that is not already bound wins.
-        /// </summary>
-        private static readonly Dictionary<string, string[]> TextureAliases = new(StringComparer.Ordinal)
-        {
-            ["g_tColor1"] = ["g_tColor"],
-            ["g_tColor2"] = ["g_tColor", "g_tLayer2Color"],
-            ["g_tColorA"] = ["g_tColor"],
-            ["g_tColorB"] = ["g_tLayer2Color", "g_tColor"],
-            ["g_tColorC"] = ["g_tColor"],
-            ["g_tGlassDust"] = ["g_tColor"],
-            ["g_tNormalA"] = ["g_tNormal"],
-            ["g_tNormalB"] = ["g_tLayer2NormalRoughness"],
-            ["g_tNormalRoughness"] = ["g_tNormal"],
-            ["g_tNormalRoughness1"] = ["g_tNormal"],
-            ["g_tNormalRoughness2"] = ["g_tLayer2NormalRoughness"],
-            ["g_tLayer1NormalRoughness"] = ["g_tNormal"],
-            ["g_tLayer1AmbientOcclusion"] = ["g_tAmbientOcclusion"],
-        };
 
         /// <summary>Initializes a new instance of the <see cref="MaterialLoader"/> class.</summary>
         /// <param name="rendererContext">The renderer context used for file loading and shader access.</param>
@@ -77,6 +60,7 @@ namespace ValveResourceFormat.Renderer.Materials
             }
 
             OwnedMaterials.Clear();
+            ErrorMaterial = null;
             Materials.Clear();
 
             foreach (var item in Textures)
@@ -99,6 +83,8 @@ namespace ValveResourceFormat.Renderer.Materials
             }
 
             Samplers.Clear();
+
+            RendererContext.TextureStreaming.CancelAllStreaming();
         }
 
         /// <summary>Returns a cached <see cref="RenderMaterial"/> for the given resource path and shader arguments, loading and caching it on first access.</summary>
@@ -113,7 +99,7 @@ namespace ValveResourceFormat.Renderer.Materials
             }
 
             Span<byte> valueSpan = stackalloc byte[1];
-            var hash = new XxHash3(StringToken.MURMUR2SEED);
+            var hash = new XxHash3();
             hash.Append(MemoryMarshal.AsBytes(name.AsSpan()));
 
             if (shaderArguments != null)
@@ -144,7 +130,7 @@ namespace ValveResourceFormat.Renderer.Materials
             return mat;
         }
 
-        /// <summary>Creates a <see cref="RenderMaterial"/> from an already-loaded resource, binding textures and resolving aliases.</summary>
+        /// <summary>Creates a <see cref="RenderMaterial"/> from an already-loaded resource, binding each texture its shader declares under the same name.</summary>
         /// <param name="resource">The material resource, or <see langword="null"/> to return the error material.</param>
         /// <param name="shaderArguments">Optional static combo overrides to pass to the shader.</param>
         public RenderMaterial LoadMaterial(Resource? resource, Dictionary<string, byte>? shaderArguments = null)
@@ -166,82 +152,92 @@ namespace ValveResourceFormat.Renderer.Materials
 
             foreach (var (textureName, texturePath) in mat.Material.TextureParams)
             {
-                TryBindTexture(mat, textureName, texturePath);
-            }
-
-            foreach (var (textureName, texturePath) in mat.Material.TextureParams)
-            {
-                if (mat.Textures.ContainsKey(textureName)
-                || !TextureAliases.TryGetValue(textureName, out var aliases))
+                if (!mat.Shader.UniformNames.Contains(textureName))
                 {
                     continue;
                 }
 
-                foreach (var alias in aliases)
-                {
-                    if (mat.Textures.ContainsKey(alias))
-                    {
-                        continue;
-                    }
-
-                    if (TryBindTexture(mat, alias, texturePath))
-                    {
-                        break;
-                    }
-                }
-            }
-
-            bool TryBindTexture(RenderMaterial mat, string name, string path)
-            {
-                if (mat.Shader.UniformNames.Contains(name))
-                {
-                    var srgbRead = mat.Shader.SrgbUniforms.Contains(name);
-                    mat.Textures[name] = GetTexture(path, srgbRead, anisotropicFiltering: true);
-                    return true;
-                }
-
-                return false;
+                var srgbRead = mat.Shader.SrgbUniforms.Contains(textureName);
+                mat.Textures[textureName] = GetTexture(texturePath, srgbRead, anisotropicFiltering: true, streaming: true);
             }
 
             return mat;
         }
 
-
         /// <summary>Returns a cached <see cref="RenderTexture"/> for the given path, loading it on first access.</summary>
         /// <param name="name">The compiled texture resource path.</param>
         /// <param name="srgbRead">Whether to interpret the texture data in sRGB color space.</param>
         /// <param name="anisotropicFiltering">Whether to apply anisotropic filtering when <see cref="MaxTextureMaxAnisotropy"/> is sufficient.</param>
-        public RenderTexture GetTexture(string name, bool srgbRead = false, bool anisotropicFiltering = false)
+        /// <param name="streaming">Whether mips may arrive over later frames.</param>
+        public RenderTexture GetTexture(string name, bool srgbRead = false, bool anisotropicFiltering = false, bool streaming = false)
         {
             // TODO: Create texture view for srgb textures
             var cache = srgbRead ? TexturesSrgb : Textures;
 
             if (cache.TryGetValue(name, out var tex))
             {
+                // A non-streaming caller needs the texture complete, even when a material started it streaming
+                if (!streaming)
+                {
+                    RendererContext.TextureStreaming.FinishStreaming(tex);
+                }
+
                 return tex;
             }
 
-            tex = LoadTexture(name, srgbRead);
+            tex = LoadTexture(name, srgbRead, async: streaming);
             cache.Add(name, tex);
 
             if (anisotropicFiltering && MaxTextureMaxAnisotropy >= 4)
             {
-                GL.TextureParameter(tex.Handle, (TextureParameterName)ExtTextureFilterAnisotropic.TextureMaxAnisotropyExt, MaxTextureMaxAnisotropy);
+                tex.SetMaxAnisotropy(MaxTextureMaxAnisotropy);
             }
 
             return tex;
         }
 
         /// <summary>
+        /// Drops a texture from the cache and deletes it, for one whose contents were copied into another, such as a
+        /// light probe volume packed into an atlas. A texture the cache does not hold is left alone.
+        /// </summary>
+        /// <param name="texture">The texture, as <see cref="GetTexture"/> returned it.</param>
+        /// <returns>Whether the cache held the texture.</returns>
+        public bool EvictTexture(RenderTexture texture)
+        {
+            ArgumentNullException.ThrowIfNull(texture);
+
+            var evicted = false;
+
+            foreach (var cache in (Dictionary<string, RenderTexture>[])[Textures, TexturesSrgb])
+            {
+                foreach (var (name, cached) in cache)
+                {
+                    if (ReferenceEquals(cached, texture))
+                    {
+                        cache.Remove(name);
+                        evicted = true;
+                    }
+                }
+            }
+
+            if (evicted)
+            {
+                texture.Delete();
+            }
+
+            return evicted;
+        }
+
+        /// <summary>
         /// Gets a sampler object for the supplied texture address modes, creating and caching one per <see cref="MaterialLoader" />.
         /// </summary>
-        public int GetOrCreateSampler(int addressModeU, int addressModeV, bool mipmaps = true, bool anisotropicFiltering = true)
+        public int GetOrCreateSampler(RsTextureAddressMode addressModeU, RsTextureAddressMode addressModeV, bool mipmaps = true, bool anisotropicFiltering = true)
         {
-            var key = (addressModeU, addressModeV, anisotropicFiltering);
+            var key = (addressModeU, addressModeV, mipmaps, anisotropicFiltering);
 
-            if (key == (0, 0, true))
+            if (key == (RsTextureAddressMode.Wrap, RsTextureAddressMode.Wrap, true, true))
             {
-                return 0; // default sampler state with repeat wrap mode
+                return 0; // the default sampler state already wraps
             }
 
             if (Samplers.TryGetValue(key, out var sampler))
@@ -249,37 +245,21 @@ namespace ValveResourceFormat.Renderer.Materials
                 return sampler;
             }
 
-            GL.CreateSamplers(1, out sampler);
+            var newSampler = new Sampler($"Sampler{addressModeU}{addressModeV}");
 
-#if DEBUG
-            var samplerLabel = $"Sampler{addressModeU}{addressModeV}";
-            GL.ObjectLabel(ObjectLabelIdentifier.Sampler, sampler, samplerLabel.Length, samplerLabel);
-#endif
-
-            GL.SamplerParameter(sampler, SamplerParameterName.TextureWrapS, (int)MapAddressMode(addressModeU));
-            GL.SamplerParameter(sampler, SamplerParameterName.TextureWrapT, (int)MapAddressMode(addressModeV));
-            GL.SamplerParameter(sampler, SamplerParameterName.TextureMinFilter, (int)(mipmaps ? TextureMinFilter.LinearMipmapLinear : TextureMinFilter.Linear));
-            GL.SamplerParameter(sampler, SamplerParameterName.TextureMagFilter, (int)TextureMagFilter.Linear);
+            newSampler.SetWrapMode(addressModeU, addressModeV);
+            newSampler.SetFiltering(mipmaps ? TextureMinFilter.LinearMipmapLinear : TextureMinFilter.Linear, TextureMagFilter.Linear);
 
             if (anisotropicFiltering && MaxTextureMaxAnisotropy >= 4)
             {
-                GL.SamplerParameter(sampler, (SamplerParameterName)ExtTextureFilterAnisotropic.TextureMaxAnisotropyExt, MaxTextureMaxAnisotropy);
+                newSampler.SetMaxAnisotropy(MaxTextureMaxAnisotropy);
             }
 
-            Samplers[key] = sampler;
-            return sampler;
+            Samplers[key] = newSampler.Handle;
+            return newSampler.Handle;
         }
 
-        private static TextureWrapMode MapAddressMode(int mode) => mode switch
-        {
-            0 => TextureWrapMode.Repeat,
-            1 => TextureWrapMode.MirroredRepeat,
-            2 => TextureWrapMode.ClampToEdge,
-            3 => TextureWrapMode.ClampToBorder,
-            _ => TextureWrapMode.Repeat,
-        };
-
-        private RenderTexture LoadTexture(string name, bool srgbRead = false)
+        private RenderTexture LoadTexture(string name, bool srgbRead = false, bool async = false)
         {
             var textureResource = RendererContext.FileLoader.LoadFileCompiled(name);
 
@@ -288,19 +268,19 @@ namespace ValveResourceFormat.Renderer.Materials
                 return GetErrorTexture();
             }
 
-            return LoadTexture(textureResource, srgbRead);
+            return LoadTexture(textureResource, srgbRead, async);
         }
 
 #pragma warning disable CA1822 // Mark members as static
         /// <summary>Uploads a texture resource to the GPU and returns the resulting <see cref="RenderTexture"/>.</summary>
         /// <param name="textureResource">The loaded texture resource.</param>
         /// <param name="srgbRead">Whether to use the sRGB internal format when available.</param>
-        /// <param name="isViewerRequest">When <see langword="true"/>, skips mip-level capping and keeps the resource alive after upload.</param>
-        public RenderTexture LoadTexture(Resource textureResource, bool srgbRead = false, bool isViewerRequest = false)
+        /// <param name="async">When <see langword="true"/>, mip data is loaded on background jobs and hooked up later by <see cref="TextureStreamingHelper.Timeslice"/>, smallest mips first.</param>
+        public RenderTexture LoadTexture(Resource textureResource, bool srgbRead = false, bool async = false)
 #pragma warning restore CA1822 // Mark members as static
         {
-            var data = (Texture?)textureResource.DataBlock;
-            Debug.Assert(data != null);
+            var data = (Texture?)textureResource.DataBlock
+                ?? throw new ArgumentException($"{textureResource.FileName} has no data block, it was never read", nameof(textureResource));
 
             if (data.IsRawAnyImage)
             {
@@ -310,17 +290,17 @@ namespace ValveResourceFormat.Renderer.Materials
 
             var target = TextureTarget.Texture2D;
             var is3d = false;
-            var clampModeS = (data.Flags & VTexFlags.SUGGEST_CLAMPS) != 0 ? TextureWrapMode.ClampToBorder : TextureWrapMode.Repeat;
-            var clampModeT = (data.Flags & VTexFlags.SUGGEST_CLAMPT) != 0 ? TextureWrapMode.ClampToBorder : TextureWrapMode.Repeat;
-            var clampModeU = (data.Flags & VTexFlags.SUGGEST_CLAMPU) != 0 ? TextureWrapMode.ClampToBorder : TextureWrapMode.Repeat;
+            var clampModeS = (data.Flags & VTexFlags.SUGGEST_CLAMPS) != 0 ? RsTextureAddressMode.Border : RsTextureAddressMode.Wrap;
+            var clampModeT = (data.Flags & VTexFlags.SUGGEST_CLAMPT) != 0 ? RsTextureAddressMode.Border : RsTextureAddressMode.Wrap;
+            var clampModeU = (data.Flags & VTexFlags.SUGGEST_CLAMPU) != 0 ? RsTextureAddressMode.Border : RsTextureAddressMode.Wrap;
 
             if ((data.Flags & VTexFlags.CUBE_TEXTURE) != 0)
             {
                 is3d = true;
                 target = (data.Flags & VTexFlags.TEXTURE_ARRAY) != 0 ? TextureTarget.TextureCubeMapArray : TextureTarget.TextureCubeMap;
-                clampModeS = TextureWrapMode.ClampToEdge;
-                clampModeT = TextureWrapMode.ClampToEdge;
-                clampModeU = TextureWrapMode.ClampToEdge;
+                clampModeS = RsTextureAddressMode.Clamp;
+                clampModeT = RsTextureAddressMode.Clamp;
+                clampModeU = RsTextureAddressMode.Clamp;
             }
             else if ((data.Flags & (VTexFlags.TEXTURE_ARRAY | VTexFlags.VOLUME_TEXTURE)) != 0)
             {
@@ -328,7 +308,8 @@ namespace ValveResourceFormat.Renderer.Materials
                 target = (data.Flags & VTexFlags.VOLUME_TEXTURE) != 0 ? TextureTarget.Texture3D : TextureTarget.Texture2DArray;
             }
 
-            var tex = new RenderTexture(target, data, System.IO.Path.GetFileName(textureResource.FileName) ?? "UnnamedTexture");
+            var textureName = System.IO.Path.GetFileName(textureResource.FileName) ?? "UnnamedTexture";
+            var tex = new RenderTexture(target, data, textureName);
             var format = GetTextureFormat(data.Format);
             var srgb = srgbRead && format.HasSrgbVariant();
 
@@ -354,7 +335,7 @@ namespace ValveResourceFormat.Renderer.Materials
             var texWidth = data.Width;
             var texHeight = data.Height;
 
-            if (!isViewerRequest && !is3d && data.NumMipLevels > 1)
+            if (!is3d && data.NumMipLevels > 1)
             {
                 var maxUserTextureSize = RendererContext.MaxTextureSize;
 
@@ -367,13 +348,75 @@ namespace ValveResourceFormat.Renderer.Materials
                 }
             }
 
-            if (is3d && target != TextureTarget.TextureCubeMap)
+            var chainLevels = data.NumMipLevels - minMipLevelAllowed;
+
+            var streamable = async && RendererContext.TextureStreaming.Mode != TextureStreamingMode.Synchronous
+                && !rgba8UncompressedFallback && chainLevels > 1;
+
+            // Streamed textures are born holding only their smallest mip and grow as data arrives,
+            // so VRAM is committed by the upload pump instead of all at once during the load phase
+            if (streamable)
             {
-                GL.TextureStorage3D(tex.Handle, data.NumMipLevels - minMipLevelAllowed, sizedInternalFormat, texWidth, texHeight, texDepth);
+                var (smallestWidth, smallestHeight, smallestDepth) = GetChainLevelSize(target, texWidth, texHeight, texDepth, chainLevels - 1);
+
+                CreateStorageForTarget(tex.Handle, target, levels: 1, sizedInternalFormat, smallestWidth, smallestHeight, smallestDepth);
             }
             else
             {
-                GL.TextureStorage2D(tex.Handle, data.NumMipLevels - minMipLevelAllowed, sizedInternalFormat, texWidth, texHeight);
+                CreateStorageForTarget(tex.Handle, target, chainLevels, sizedInternalFormat, texWidth, texHeight, texDepth);
+            }
+
+            tex.SetFiltering(TextureMinFilter.LinearMipmapLinear, TextureMagFilter.Linear);
+            tex.SetWrapMode(clampModeS, clampModeT, clampModeU);
+
+            if (streamable)
+            {
+                var stream = new StreamedTexture
+                {
+                    Streaming = RendererContext.TextureStreaming,
+                    Name = textureName,
+                    Texture = tex,
+                    Data = data,
+                    Format = format,
+                    SizedInternalFormat = sizedInternalFormat,
+                    Is3D = is3d,
+                    MinMipLevelAllowed = minMipLevelAllowed,
+                    AllocWidth = texWidth,
+                    AllocHeight = texHeight,
+                    AllocDepth = texDepth,
+                    ResidentChainLevel = chainLevels - 1,
+                    Mips = new PlannedMip[chainLevels - 1],
+                };
+
+                var planned = 0;
+
+                foreach (var mipData in data.GetEveryMipLevelMetrics())
+                {
+                    if (mipData.Level < minMipLevelAllowed)
+                    {
+                        continue;
+                    }
+
+                    var chainLevel = (int)mipData.Level - minMipLevelAllowed;
+                    var mip = new PlannedMip(chainLevel, mipData.Width, mipData.Height, mipData.Depth, mipData.BufferSize);
+
+                    if (chainLevel == chainLevels - 1)
+                    {
+                        // The smallest mip loads synchronously, so the texture is complete and safely
+                        // sampleable from its very first draw
+                        TextureStreamingHelper.LoadAndHookUpMip(stream, mip);
+                        continue;
+                    }
+
+                    // The metrics enumerate smallest first, which is the order the chain reads in
+                    stream.Mips[planned++] = mip;
+                }
+
+                Debug.Assert(planned == stream.Mips.Length);
+
+                RendererContext.TextureStreaming.BeginStreaming(stream);
+
+                return tex;
             }
 
             var buffer = ArrayPool<byte>.Shared.Rent(data.GetBiggestBufferSize());
@@ -383,6 +426,8 @@ namespace ValveResourceFormat.Renderer.Materials
             {
                 decodedBuffer = ArrayPool<byte>.Shared.Rent(data.Width * data.Height * data.Depth * 4);
             }
+
+            Monitor.Enter(data); // reader lock
 
             try
             {
@@ -423,6 +468,8 @@ namespace ValveResourceFormat.Renderer.Materials
             }
             finally
             {
+                Monitor.Exit(data);
+
                 ArrayPool<byte>.Shared.Return(buffer);
 
                 if (decodedBuffer != null)
@@ -431,20 +478,46 @@ namespace ValveResourceFormat.Renderer.Materials
                 }
             }
 
-            if (!isViewerRequest)
-            {
-                // Dispose texture otherwise we run out of memory
-                // TODO: This might conflict when opening multiple files due to shit caching
-                textureResource.Dispose();
-            }
-
-            tex.SetFiltering(TextureMinFilter.LinearMipmapLinear, TextureMagFilter.Linear);
-
-            GL.TextureParameter(tex.Handle, TextureParameterName.TextureWrapS, (int)clampModeS);
-            GL.TextureParameter(tex.Handle, TextureParameterName.TextureWrapT, (int)clampModeT);
-            GL.TextureParameter(tex.Handle, TextureParameterName.TextureWrapR, (int)clampModeU);
-
             return tex;
+        }
+
+        /// <summary>Dimensions of one chain level for any texture target: width always halves per level,
+        /// height is spatial except for 1D arrays where it carries the layer count, and depth halves only
+        /// for volumes; for array and cube targets it carries the layer (times face) count.</summary>
+        internal static (int Width, int Height, int Depth) GetChainLevelSize(TextureTarget target, int width, int height, int depth, int chainLevel)
+        {
+            var levelWidth = MathUtils.MipLevelSize(width, chainLevel);
+
+            var levelHeight = target is TextureTarget.Texture1D or TextureTarget.Texture1DArray
+                ? height
+                : MathUtils.MipLevelSize(height, chainLevel);
+
+            var levelDepth = target is TextureTarget.Texture3D
+                ? MathUtils.MipLevelSize(depth, chainLevel)
+                : depth;
+
+            return (levelWidth, levelHeight, levelDepth);
+        }
+
+        /// <summary>Allocates immutable storage on a texture object, dispatching to the storage call the target requires.</summary>
+        internal static void CreateStorageForTarget(int handle, TextureTarget target, int levels, SizedInternalFormat format, int width, int height, int depth)
+        {
+            switch (target)
+            {
+                case TextureTarget.Texture1D:
+                    GL.TextureStorage1D(handle, levels, format, width);
+                    break;
+
+                case TextureTarget.Texture1DArray:
+                case TextureTarget.Texture2D:
+                case TextureTarget.TextureCubeMap:
+                    GL.TextureStorage2D(handle, levels, format, width, height);
+                    break;
+
+                default:
+                    GL.TextureStorage3D(handle, levels, format, width, height, depth);
+                    break;
+            }
         }
 
         /// <summary>
@@ -471,6 +544,8 @@ namespace ValveResourceFormat.Renderer.Materials
             VTexFormat.DXT5            => ImageFormat.DXT5,
             VTexFormat.ETC2            => ImageFormat.R8G8B8_ETC2,
             VTexFormat.ETC2_EAC        => ImageFormat.R8G8B8A8_ETC2_EAC,
+            VTexFormat.R11_EAC         => ImageFormat.R11_EAC,
+            VTexFormat.RG11_EAC        => ImageFormat.RG11_EAC,
 
             VTexFormat.R16             => ImageFormat.R16,
             VTexFormat.RG1616          => ImageFormat.RG1616,
@@ -487,10 +562,9 @@ namespace ValveResourceFormat.Renderer.Materials
             VTexFormat.RGBA8888        => ImageFormat.RGBA8888,
             VTexFormat.BGRA8888        => ImageFormat.BGRA8888,
             VTexFormat.I8              => ImageFormat.I8,
+            VTexFormat.R8_UNORM        => ImageFormat.R8_UNORM,
 
             //VTexFormat.IA88
-            //VTexFormat.R11_EAC
-            //VTexFormat.RG11_EAC
             //VTexFormat.RGB323232F
 #pragma warning restore format
 
@@ -538,12 +612,17 @@ namespace ValveResourceFormat.Renderer.Materials
 
         private RenderMaterial GetErrorMaterial()
         {
-            var errorMat = new RenderMaterial(RendererContext.ShaderLoader.LoadShader("error"));
-            OwnedMaterials.Add(errorMat);
-            return errorMat;
+            if (ErrorMaterial != null)
+            {
+                return ErrorMaterial;
+            }
+
+            ErrorMaterial = new RenderMaterial(RendererContext.ShaderLoader.LoadShader("error"));
+            OwnedMaterials.Add(ErrorMaterial);
+            return ErrorMaterial;
         }
 
-        /// <summary>Returns a lazily created 4×4 checkerboard error texture used as a fallback for missing textures.</summary>
+        /// <summary>Returns a lazily created 4x4 checkerboard error texture used as a fallback for missing textures.</summary>
         public RenderTexture GetErrorTexture()
         {
             if (ErrorTexture == null)
@@ -568,34 +647,68 @@ namespace ValveResourceFormat.Renderer.Materials
         }
 
         private static RenderTexture CreateSolidTexture(byte r, byte g, byte b) => GenerateColorTexture(1, 1, [r, g, b]);
-        /// <summary>Returns a lazily created 1×1 flat normal map texture (127, 127, 255).</summary>
-        public RenderTexture GetDefaultNormal() => DefaultNormal ??= CreateSolidTexture(127, 127, 255);
+        /// <summary>Returns a lazily created 1x1 flat normal map texture (127, 127, 255, 127), flat in both the RG and the AG layouts.</summary>
+        public RenderTexture GetDefaultNormal() => DefaultNormal ??= GenerateColorTexture(1, 1, [127, 127, 255, 127]);
 
-        /// <summary>Returns a lazily created 1×1 solid white mask texture.</summary>
+        /// <summary>Returns a lazily created 1x1 solid white mask texture.</summary>
         public RenderTexture GetDefaultMask() => DefaultMask ??= CreateSolidTexture(255, 255, 255);
 
-        /// <summary>Returns a lazily created 1×1 solid white colour texture, a neutral fallback albedo.</summary>
+        /// <summary>Returns a lazily created 1x1 solid white colour texture, a neutral fallback albedo.</summary>
         public RenderTexture GetDefaultColor() => DefaultColor ??= CreateSolidTexture(255, 255, 255);
 
         /// <summary>
-        /// Returns a lazily created 1×1×1 white volume texture.
+        /// Returns a lazily created 1x1 single layer white array texture.
         /// </summary>
-        public RenderTexture GetDefaultVolume()
+        public RenderTexture GetDefaultTextureArray()
         {
-            if (DefaultVolume == null)
+            if (DefaultTextureArray == null)
             {
-                DefaultVolume = new RenderTexture(TextureTarget.Texture3D, 1, 1, 1, 1, "DefaultVolume");
-                DefaultVolume.SetFiltering(TextureMinFilter.Nearest, TextureMagFilter.Nearest);
-                DefaultVolume.SetWrapMode(TextureWrapMode.ClampToEdge);
-
-                GL.TextureStorage3D(DefaultVolume.Handle, 1, SizedInternalFormat.Rgba8, 1, 1, 1);
-                GL.TextureSubImage3D(DefaultVolume.Handle, 0, 0, 0, 0, 1, 1, 1, PixelFormat.Rgb, PixelType.UnsignedByte, WhiteTexel);
+                DefaultTextureArray = RenderTexture.Create3D(TextureTarget.Texture2DArray, 1, 1, 1, ImageFormat.RGBA8888, 1, "DefaultTextureArray");
+                DefaultTextureArray.SetFiltering(TextureMinFilter.Nearest, TextureMagFilter.Nearest);
+                DefaultTextureArray.SetWrapMode(RsTextureAddressMode.Clamp);
+                GL.TextureSubImage3D(DefaultTextureArray.Handle, 0, 0, 0, 0, 1, 1, 1, PixelFormat.Rgb, PixelType.UnsignedByte, WhiteTexel);
             }
 
-            return DefaultVolume;
+            return DefaultTextureArray;
+        }
+
+        /// <summary>
+        /// Returns a lazily created 1x1x1 white volume texture.
+        /// </summary>
+        public RenderTexture GetDefaultVolume() => DefaultVolume ??= CreateSolidVolume("DefaultVolume", WhiteTexel);
+
+        /// <summary>
+        /// Returns a lazily created 1x1x1 black volume texture.
+        /// </summary>
+        public RenderTexture GetDefaultBlackVolume() => DefaultBlackVolume ??= CreateSolidVolume("DefaultBlackVolume", BlackTexel);
+
+        /// <summary>
+        /// Returns a lazily created 1x1 black cube map array with a single cube.
+        /// </summary>
+        public RenderTexture GetDefaultCubeArray()
+        {
+            if (DefaultCubeArray == null)
+            {
+                DefaultCubeArray = RenderTexture.Create3D(TextureTarget.TextureCubeMapArray, 1, 1, 6, ImageFormat.RGBA8888, 1, "DefaultCubeArray");
+                DefaultCubeArray.SetFiltering(TextureMinFilter.Nearest, TextureMagFilter.Nearest);
+                GL.ClearTexImage(DefaultCubeArray.Handle, 0, PixelFormat.Rgba, PixelType.UnsignedByte, IntPtr.Zero);
+            }
+
+            return DefaultCubeArray;
+        }
+
+        private static RenderTexture CreateSolidVolume(string label, byte[] texel)
+        {
+            var volume = RenderTexture.Create3D(TextureTarget.Texture3D, 1, 1, 1, ImageFormat.RGBA8888, 1, label);
+            volume.SetFiltering(TextureMinFilter.Nearest, TextureMagFilter.Nearest);
+            volume.SetWrapMode(RsTextureAddressMode.Clamp);
+            GL.TextureSubImage3D(volume.Handle, 0, 0, 0, 0, 1, 1, 1, PixelFormat.Rgb, PixelType.UnsignedByte, texel);
+
+            return volume;
         }
 
         private static readonly byte[] WhiteTexel = [255, 255, 255];
+        private static readonly byte[] BlackTexel = [0, 0, 0];
 
         /// <summary>Returns the readback format appropriate for exporting a rendered image: 8-bit BGRA, or 32-bit float RGBA for HDR.</summary>
         /// <param name="hdr">Whether to use the HDR (32-bit float) format.</param>
@@ -638,32 +751,50 @@ namespace ValveResourceFormat.Renderer.Materials
         }
 
         /// <summary>
-        /// Builds a one-dimensional colour ramp from a list of gradient stops.
+        /// Builds a one-dimensional opaque colour ramp, 64 texels wide, from a list of gradient stops.
         /// </summary>
-        /// <param name="stops">Gradient stops, each a position in 0-1 and its colour. Need not be sorted.</param>
-        public static RenderTexture GenerateGradientTexture(ReadOnlySpan<(float Position, Color32 Color)> stops)
+        /// <param name="stops">Gradient stops, each a position and its colour. Need not be sorted; positions are clamped to 0-1.</param>
+        /// <param name="clamp">Whether the ramp holds its end colours outside 0-1 rather than repeating.</param>
+        public static RenderTexture GenerateGradientTexture(ReadOnlySpan<(float Position, Color32 Color)> stops, bool clamp)
         {
-            const int Width = 256;
+            const int Width = 64;
+            const int MaxInsertionSortStops = 32;
+
+            var sorted = new (float Position, Color32 Color)[stops.Length];
+
+            for (var i = 0; i < stops.Length; i++)
+            {
+                sorted[i] = (Math.Clamp(stops[i].Position, 0f, 1f), stops[i].Color);
+            }
+
+            // Both orderings are stable, so stops sharing a position keep their authored order. How a list
+            // longer than the insertion sort limit is ordered is not established; it is kept stable too.
+            if (sorted.Length <= MaxInsertionSortStops)
+            {
+                InsertionSort(sorted);
+            }
+            else
+            {
+                sorted = [.. sorted.OrderBy(static stop => stop.Position)];
+            }
 
             var texels = new byte[Width * 4];
 
             for (var x = 0; x < Width; x++)
             {
-                var position = x / (Width - 1f);
-                var color = SampleGradient(stops, position);
+                // Texel x samples x / 64, so the ramp never reaches its position of 1
+                var color = SampleGradient(sorted, x / (float)Width);
 
                 texels[(x * 4) + 0] = color.R;
                 texels[(x * 4) + 1] = color.G;
                 texels[(x * 4) + 2] = color.B;
-                texels[(x * 4) + 3] = color.A;
+                texels[(x * 4) + 3] = 255;
             }
 
             var texture = new RenderTexture(TextureTarget.Texture2D, Width, 1, 1, 1, "GeneratedGradient");
 
-            // Clamped and filtered: the ramp is addressed by a luminance, so the ends have to hold rather
-            // than wrap, and the steps between stops should not be visible.
             texture.SetFiltering(TextureMinFilter.Linear, TextureMagFilter.Linear);
-            texture.SetWrapMode(TextureWrapMode.ClampToEdge);
+            texture.SetWrapMode(clamp ? RsTextureAddressMode.Clamp : RsTextureAddressMode.Wrap);
 
             // sRGB storage, so a sample lands in linear space like every other layer's texture.
             GL.TextureStorage2D(texture.Handle, 1, SizedInternalFormat.Srgb8Alpha8, Width, 1);
@@ -672,54 +803,93 @@ namespace ValveResourceFormat.Renderer.Materials
             return texture;
         }
 
-        private static Color32 SampleGradient(ReadOnlySpan<(float Position, Color32 Color)> stops, float position)
+        private static void InsertionSort((float Position, Color32 Color)[] stops)
+        {
+            for (var i = 1; i < stops.Length; i++)
+            {
+                var stop = stops[i];
+                var j = i - 1;
+
+                while (j >= 0 && stops[j].Position > stop.Position)
+                {
+                    stops[j + 1] = stops[j];
+                    j--;
+                }
+
+                stops[j + 1] = stop;
+            }
+        }
+
+        /// <summary>
+        /// The colour of sorted gradient stops at a position: the first stop's colour before it, the last
+        /// stop's after it, and otherwise each channel interpolated between the two bracketing stops and
+        /// truncated. Without stops the ramp is white.
+        /// </summary>
+        private static Color32 SampleGradient((float Position, Color32 Color)[] stops, float position)
         {
             if (stops.Length == 0)
             {
                 return new Color32(255, 255, 255);
             }
 
-            // Stops are authored in order, but nothing guarantees it, so pick the bracketing pair by value
-            // rather than by index.
-            var lower = stops[0];
-            var upper = stops[0];
-            var hasLower = false;
-            var hasUpper = false;
+            // A bisection that ends at the first stop sitting exactly on the position, and otherwise at the
+            // last stop below it, or -1 when the position precedes every stop. With repeated positions the
+            // stop it lands on is whichever the bisection reaches first.
+            var low = -1;
+            var first = 0;
+            var last = stops.Length - 1;
 
-            foreach (var stop in stops)
+            while (first <= last)
             {
-                if (stop.Position <= position && (!hasLower || stop.Position >= lower.Position))
+                var middle = (first + last) >> 1;
+                var stopPosition = stops[middle].Position;
+
+                if (stopPosition == position)
                 {
-                    lower = stop;
-                    hasLower = true;
+                    low = middle;
+                    break;
                 }
 
-                if (stop.Position >= position && (!hasUpper || stop.Position <= upper.Position))
+                if (stopPosition < position)
                 {
-                    upper = stop;
-                    hasUpper = true;
+                    low = middle;
+                    first = middle + 1;
+                }
+                else
+                {
+                    last = middle - 1;
                 }
             }
 
-            if (!hasLower)
+            if (low == -1)
             {
-                return upper.Color;
+                return stops[0].Color;
             }
 
-            if (!hasUpper)
+            if (low == stops.Length - 1)
+            {
+                return stops[low].Color;
+            }
+
+            var lower = stops[low];
+            var upper = stops[low + 1];
+            var span = upper.Position - lower.Position;
+
+            if (span < 1e-5f)
             {
                 return lower.Color;
             }
 
-            var span = upper.Position - lower.Position;
-            var t = span > 0f ? (position - lower.Position) / span : 0f;
+            var fraction = (position - lower.Position) / span;
 
             return new Color32(
-                (byte)float.Round(float.Lerp(lower.Color.R, upper.Color.R, t)),
-                (byte)float.Round(float.Lerp(lower.Color.G, upper.Color.G, t)),
-                (byte)float.Round(float.Lerp(lower.Color.B, upper.Color.B, t)),
-                (byte)float.Round(float.Lerp(lower.Color.A, upper.Color.A, t)));
+                InterpolateChannel(lower.Color.R, upper.Color.R, fraction),
+                InterpolateChannel(lower.Color.G, upper.Color.G, fraction),
+                InterpolateChannel(lower.Color.B, upper.Color.B, fraction));
         }
+
+        private static byte InterpolateChannel(byte lower, byte upper, float fraction)
+            => (byte)(int)(((upper - lower) * fraction) + lower);
 
         private static RenderTexture GenerateColorTexture(int width, int height, byte[] color)
         {
@@ -729,13 +899,16 @@ namespace ValveResourceFormat.Renderer.Materials
 
             var texture = new RenderTexture(TextureTarget.Texture2D, width, height, 1, levels, width > 1 ? "ErrorTexture" : "ColorTexture");
             texture.SetFiltering(TextureMinFilter.Nearest, TextureMagFilter.Nearest);
-            texture.SetWrapMode(TextureWrapMode.Repeat);
+            texture.SetWrapMode(RsTextureAddressMode.Wrap);
 
             var color32 = new Color32(color[0], color[1], color[2]);
             texture.Reflectivity = color32.ToLinearColor();
 
+            // Three bytes per pixel leave alpha at 1
+            var pixelFormat = color.Length == width * height * 4 ? PixelFormat.Rgba : PixelFormat.Rgb;
+
             GL.TextureStorage2D(texture.Handle, levels, SizedInternalFormat.Rgba8, width, height);
-            GL.TextureSubImage2D(texture.Handle, 0, 0, 0, width, height, PixelFormat.Rgb, PixelType.UnsignedByte, color);
+            GL.TextureSubImage2D(texture.Handle, 0, 0, 0, width, height, pixelFormat, PixelType.UnsignedByte, color);
 
             if (levels > 1)
             {

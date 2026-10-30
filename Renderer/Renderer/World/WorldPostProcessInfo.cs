@@ -18,8 +18,13 @@ namespace ValveResourceFormat.Renderer.World
         /// <summary>Gets the non-master post-process volumes, applied while the camera is inside them.</summary>
         public List<ScenePostProcessVolume> PostProcessVolumes { get; } = [];
 
-        /// <summary>Gets or sets the master post-process volume: the unbound volume that is the base state everywhere.</summary>
-        public ScenePostProcessVolume? MasterPostProcessVolume { get; set; }
+        /// <summary>
+        /// Gets the master post-process volume: the unbound volume that is the base state everywhere. The
+        /// first enabled one of the volumes marked master.
+        /// </summary>
+        public ScenePostProcessVolume? MasterPostProcessVolume => masterVolumes.Find(static volume => volume.IsEnabled);
+
+        private readonly List<ScenePostProcessVolume> masterVolumes = [];
 
         /// <summary>
         /// env_tonemap_controller is a legacy entity (S1) that still has functionality, so we want to account for it.
@@ -29,6 +34,39 @@ namespace ValveResourceFormat.Renderer.World
         /// </summary>
         public SceneTonemapController? MasterTonemapController { get; set; }
 
+        private bool isTonemapControllerMarkedMaster;
+
+        /// <summary>Gets or sets the exposure that applies where no volume or tonemap controller sets one.</summary>
+        public ExposureSettings DefaultExposureSettings { get; set; } = new();
+
+        /// <summary>
+        /// Registers an <c>env_tonemap_controller</c>. The last one marked master becomes
+        /// <see cref="MasterTonemapController"/>, or the first one registered when none is.
+        /// </summary>
+        /// <param name="controller">The controller to register.</param>
+        /// <param name="isMaster">Whether the entity is marked master.</param>
+        public void AddTonemapController(SceneTonemapController controller, bool isMaster)
+        {
+            if (isMaster)
+            {
+                MasterTonemapController = controller;
+                isTonemapControllerMarkedMaster = true;
+            }
+            else if (!isTonemapControllerMarkedMaster)
+            {
+                MasterTonemapController ??= controller;
+            }
+        }
+
+        /// <summary>Forgets every registered volume and tonemap controller, for the entities that register them to spawn again.</summary>
+        internal void Clear()
+        {
+            PostProcessVolumes.Clear();
+            masterVolumes.Clear();
+            MasterTonemapController = null;
+            isTonemapControllerMarkedMaster = false;
+        }
+
         /// <summary>Gets the post-processing state computed for the current frame.</summary>
         public PostProcessState CurrentState { get; private set; } = new();
 
@@ -36,22 +74,17 @@ namespace ValveResourceFormat.Renderer.World
         public List<WeightedLut> ActiveLuts { get; } = [];
 
         /// <summary>
-        /// Registers a post-process volume. Only the first master volume is retained; the rest apply by
-        /// camera containment.
+        /// Registers a post-process volume, disabled ones included so they can be enabled later. Only the
+        /// first enabled master volume applies; the rest apply by camera containment.
         /// </summary>
         /// <param name="postProcess">The post-process volume to register.</param>
         public void AddPostProcessVolume(ScenePostProcessVolume postProcess)
         {
-            if (postProcess.StartDisabled)
-            {
-                return;
-            }
+            ArgumentNullException.ThrowIfNull(postProcess);
 
             if (postProcess.IsMaster)
             {
-                // If there are multiple master volumes, S2 only takes the first one
-                MasterPostProcessVolume ??= postProcess;
-                // if it's marked as master but not the first master volume, it's entirely ignored
+                masterVolumes.Add(postProcess);
             }
             else
             {
@@ -61,29 +94,32 @@ namespace ValveResourceFormat.Renderer.World
 
         /// <summary>
         /// Recalculates <see cref="CurrentState"/>: the master volume is the base, and every non-master
-        /// volume containing the camera crossfades on top of it over its fade time.
+        /// volume containing the viewer crossfades on top of it over its fade time.
         /// </summary>
-        /// <param name="camera">The active camera, tested against each volume's collider.</param>
+        /// <param name="position">The viewer position tested against each volume's collider: the player's feet, or the camera when flying free.</param>
         /// <param name="deltaTime">Elapsed time in seconds since the last frame, driving the crossfades.</param>
-        public void UpdatePostProcessing(Camera camera, float deltaTime)
+        public void UpdatePostProcessing(Vector3 position, float deltaTime)
         {
             var newState = PostProcessState.Default;
+            newState.ExposureSettings = DefaultExposureSettings;
             ActiveLuts.Clear();
 
-            if (MasterPostProcessVolume != null)
+            if (MasterPostProcessVolume is { } master)
             {
-                ApplyVolume(ref newState, MasterPostProcessVolume, 1f);
+                ApplyVolume(ref newState, master, 1f);
             }
 
             foreach (var volume in PostProcessVolumes)
             {
-                var inside = volume.Collider != null
-                    && volume.Collider.ContainsPoint(camera.Location);
+                // A disabled volume fades out like one the viewer left
+                var inside = volume.IsEnabled
+                    && volume.Collider != null
+                    && volume.Collider.ContainsPoint(position);
 
                 var targetWeight = inside ? 1f : 0f;
                 var fadeStep = volume.FadeTime > 0f ? deltaTime / volume.FadeTime : 1f;
 
-                volume.Weight = float.Clamp(volume.Weight + float.Clamp(targetWeight - volume.Weight, -fadeStep, fadeStep), 0f, 1f);
+                volume.Weight = MathUtils.Approach(volume.Weight, targetWeight, fadeStep);
 
                 if (volume.Weight > MinWeight)
                 {

@@ -15,17 +15,20 @@ public class VfxRenderStateInfo
     /// <summary>Gets the shader file ID.</summary>
     public int ShaderFileId { get; }
 
-    /// <summary>Gets the source pointer.</summary>
-    public int SourcePointer { get; }
+    /// <summary>
+    /// Gets the byte offset of the shader file within the uncompressed static combo data,
+    /// relative to the shader file count field. It is -1 in version 71 and resource files.
+    /// </summary>
+    public int ShaderFileOffset { get; }
 
     /// <summary>
     /// Initializes a new instance of the <see cref="VfxRenderStateInfo"/> class.
     /// </summary>
-    public VfxRenderStateInfo(long comboId, int shaderId, int sourcePointer)
+    public VfxRenderStateInfo(long comboId, int shaderFileId, int shaderFileOffset)
     {
         DynamicComboId = comboId;
-        ShaderFileId = shaderId;
-        SourcePointer = sourcePointer;
+        ShaderFileId = shaderFileId;
+        ShaderFileOffset = shaderFileOffset;
     }
 
     /// <summary>
@@ -35,7 +38,7 @@ public class VfxRenderStateInfo
     {
         DynamicComboId = datareader.ReadInt64();
         ShaderFileId = datareader.ReadInt32();
-        SourcePointer = datareader.ReadInt32();
+        ShaderFileOffset = datareader.ReadInt32();
     }
 }
 
@@ -73,17 +76,19 @@ public class VfxRenderStateInfoPixelShader : VfxRenderStateInfo
     /// <summary>
     /// Initializes a new instance of the <see cref="VfxRenderStateInfoPixelShader"/> class.
     /// </summary>
-    public VfxRenderStateInfoPixelShader(long comboId, int shaderId, int sourcePointer, KVObject renderState, int vcsVersion)
-        : base(comboId, shaderId, sourcePointer)
+    public VfxRenderStateInfoPixelShader(long comboId, int shaderFileId, int shaderFileOffset, KVObject renderState, int vcsVersion)
+        : base(comboId, shaderFileId, shaderFileOffset)
     {
         if (renderState is null)
         {
             return;
         }
 
-        if (renderState.ContainsKey("rasterizerStateDesc"))
+        var rasterizerStateDesc = renderState.GetArray<int>("rasterizerStateDesc");
+
+        if (rasterizerStateDesc != null)
         {
-            RasterizerStateDesc = new RsRasterizerStateDesc(renderState.GetArray<int>("rasterizerStateDesc"));
+            RasterizerStateDesc = new RsRasterizerStateDesc(rasterizerStateDesc);
         }
 
         if (renderState.ContainsKey("depthStencilStateDesc"))
@@ -92,9 +97,11 @@ public class VfxRenderStateInfoPixelShader : VfxRenderStateInfo
         }
 
         // PSRS only has blendStateDesc
-        if (renderState.ContainsKey("blendStateDesc"))
+        var blendStateDesc = renderState.GetArray<int>("blendStateDesc");
+
+        if (blendStateDesc != null)
         {
-            BlendStateDesc = new RsBlendStateDesc(renderState.GetArray<int>("blendStateDesc"));
+            BlendStateDesc = new RsBlendStateDesc(blendStateDesc);
         }
     }
 

@@ -1,2 +1,3 @@
 #version 460
-#include "picking.vert.slang"
+
+#include "depth_only.vert.slang"

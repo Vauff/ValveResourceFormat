@@ -1,83 +1,482 @@
 using System.Globalization;
+using System.Numerics;
+using System.Runtime.CompilerServices;
 using System.Text;
-using Sledge.Formats.GameData;
-using Sledge.Formats.GameData.Objects;
+using ValveKeyValue;
 using ValveResourceFormat.IO;
-using VrfFgdParser;
+using ValveResourceFormat.IO.Fgd;
+using ValveResourceFormat.Serialization.KeyValues;
 
-var pathsToCheck = args ?? [];
-
-if (pathsToCheck.Length < 1)
+if (GameFolderLocator.SteamPath == null)
 {
-    Console.Error.WriteLine("Usage: ./program [path to Steam to find .fgd files in]");
-
-    if (GameFolderLocator.SteamPath == null)
-    {
-        return 1;
-    }
-
-    Console.Error.WriteLine($"No path specified, searching Steam libraries.");
-
-    pathsToCheck = [.. GameFolderLocator.FindAllSteamGames().Select(static x => x.SteamPath).ToHashSet()];
+    Console.Error.WriteLine("Steam was not found.");
+    return 1;
 }
 
-var allEntities = new SortedDictionary<string, EntityInfo>();
-var allProperties = new HashSet<string>();
-var baseEntities = new Dictionary<string, EntityInfo>();
-var entityMaterials = new Dictionary<string, string>();
+var installedGames = GameFolderLocator.FindAllSteamGames();
 
-foreach (var arg in pathsToCheck)
+// Apps that share a folder are the one with the lowest app id, as the renderer finds them
+var games = installedGames
+    .Where(static game => Directory.Exists(game.GamePath))
+    .GroupBy(static game => game.GamePath, StringComparer.OrdinalIgnoreCase)
+    .Select(static folder => folder.MinBy(static game => game.AppID))
+    .ToList();
+
+var allProperties = new HashSet<string>();
+
+HashSet<string> editorModelClasses =
+[
+    "info_player_counterterrorist",
+    "info_player_terrorist",
+    "info_deathmatch_spawn",
+    "info_armsrace_counterterrorist",
+    "info_armsrace_terrorist",
+    "info_enemy_terrorist_spawn",
+    "info_hostage_spawn",
+    "point_scale_reference_human",
+    "team_select",
+    "end_of_match",
+    "terrorist_team_intro",
+    "terrorist_team_intro_variant2",
+    "counterterrorist_team_intro",
+    "counterterrorist_team_intro_variant2",
+    "terrorist_wingman_intro",
+    "counterterrorist_wingman_intro",
+    "terrorist_rush_intro",
+    "counterterrorist_rush_intro",
+    "info_player_start_dota",
+    "info_player_start_goodguys",
+    "info_player_start_badguys",
+    "info_roquelaire_perch",
+    "func_nav_gen_proj",
+];
+
+// The table the library embeds is written over, and the games not installed here keep the classes it has of them
+var classesPath = Path.GetFullPath(Path.Join(Path.GetDirectoryName(GetSourcePath()), "..", "..", "ValveResourceFormat", "IO", "Fgd", "entity_classes.kv3"));
+var previous = File.Exists(classesPath) ? KVDocumentExtensions.ParseKV3(classesPath).Root : new KVObject();
+var previousDefinitions = (previous.GetArray("classes") ?? []).ToDictionary(static data => data.GetStringProperty("id", data.GetStringProperty("name")), StringComparer.Ordinal);
+var previousTables = (previous.GetArray("games") ?? []).ToDictionary(static table => table.GetInt32Property("app_id"));
+
+// Every version of each class by its name, with the games that declare it so, under a key of its own until
+// every game is read and the ids it is written under are known
+var definitions = new Dictionary<string, List<(string Text, string Key, KVObject Data, SortedSet<int> AppIds)>>(StringComparer.Ordinal);
+var gameTables = new List<KVObject>();
+
+var installed = games.ToDictionary(static game => game.AppID);
+var appIds = installed.Keys.Union(previousTables.Keys).Order();
+
+foreach (var appId in appIds)
 {
-    if (!Directory.Exists(arg))
+    var table = installed.TryGetValue(appId, out var game) ? ParseGame(game) : null;
+
+    // A game whose tools are not installed here keeps what was found of it before
+    if (table == null && previousTables.TryGetValue(appId, out var previousTable))
     {
-        Console.Error.WriteLine($"'{arg}' does not exist.");
-        continue;
+        Console.WriteLine($"Keeping the classes of {appId}, which is not installed with its FGD files");
+        table = KeepTable(previousTable);
     }
 
-    Console.WriteLine($"Searching {arg}");
-
-    foreach (var file in Directory.EnumerateFiles(arg, "*.fgd", SearchOption.AllDirectories))
+    if (table != null)
     {
-        ParseFile(file);
+        gameTables.Add(table);
     }
 }
 
 Console.WriteLine();
 
-WriteEntities();
+WriteClasses();
 WriteProperties();
-WriteMaterials();
 
 return 0;
 
-static string ConstructColor(List<string> values)
+// The classes of an installed game, or null where none of its gameinfo files names FGD files that are there
+KVObject? ParseGame(GameFolderLocator.SteamLibraryGameInfo game)
 {
-    var color = string.Empty;
+    Console.WriteLine($"Searching {game.AppID} {game.AppName} ({game.GamePath})");
 
-    if (values.All(x => x == "255"))
-    {
-        return "Color32.White";
-    }
+    // The folder is walked once for both, as most of the time goes to walking it
+    var files = Directory.EnumerateFiles(game.GamePath, "*", SearchOption.AllDirectories)
+        .Where(static path => path.EndsWith(".fgd", StringComparison.OrdinalIgnoreCase) || Path.GetFileName(path).Equals("gameinfo.gi", StringComparison.OrdinalIgnoreCase))
+        .ToList();
 
-    if (values.Count == 3)
+    foreach (var file in files.Where(static path => path.EndsWith(".fgd", StringComparison.OrdinalIgnoreCase)))
     {
-        color = $"new Color32({values[0]}, {values[1]}, {values[2]})";
-    }
-    else if (values.Count == 4)
-    {
-        color = $"new Color32({values[0]}, {values[1]}, {values[2]}, {values[3]})";
-    }
-    else
-    {
-        throw new InvalidDataException();
+        ParseFile(file);
     }
 
-    return color;
+    // The classes every game shares are read as part of each game, with what the game changes of them, and an
+    // addon is made with the classes of its game
+    var gameInfos = files
+        .Where(static path => path.EndsWith("gameinfo.gi", StringComparison.OrdinalIgnoreCase)
+            && Path.GetFileName(Path.GetDirectoryName(path)) != "core"
+            && !Path.GetDirectoryName(Path.GetDirectoryName(path))!.EndsWith("_addons", StringComparison.OrdinalIgnoreCase))
+        .Order(StringComparer.Ordinal);
+
+    foreach (var gameInfo in gameInfos)
+    {
+        if (ParseGameClasses(game, gameInfo) is { } table)
+        {
+            return table;
+        }
+    }
+
+    return null;
 }
 
+// The classes of one game as Hammer builds them
+KVObject? ParseGameClasses(GameFolderLocator.SteamLibraryGameInfo game, string gameInfo)
+{
+    if (LoadFgd(gameInfo) is not { } fgd)
+    {
+        return null;
+    }
+
+    // Of the classes a class is based on, only the ones an entity can be required to be placed under are read
+    var requiredParentClasses = fgd.Classes
+        .Select(static gameClass => GetText(gameClass.Metadata, "required_parent_class"))
+        .OfType<string>()
+        .Where(static name => name.Length > 0)
+        .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+    var classIds = KVObject.Array();
+
+    foreach (var gameClass in fgd.Classes)
+    {
+        if (ConvertClass(gameClass, requiredParentClasses) is { } data)
+        {
+            FixValveShit(data);
+            classIds.Add(AddDefinition(gameClass.Name, data, game.AppID));
+        }
+    }
+
+    Console.WriteLine($"Found {classIds.Count} classes in {Path.GetDirectoryName(gameInfo)}");
+
+    var table = new KVObject { { "app_id", game.AppID } };
+
+    if (fgd.GridNav is var (edgeSize, offsetX, offsetY, pickHeight))
+    {
+        table.Add("gridnav", new KVObject
+        {
+            { "edge_size", edgeSize },
+            { "offset_x", offsetX },
+            { "offset_y", offsetY },
+            { "pick_height", pickHeight },
+        });
+    }
+
+    table.Add("classes", classIds);
+    return table;
+}
+
+// The classes of the FGD files the Hammer block of a gameinfo names, opened through the folders and packages the
+// game mounts, or null where it names none that are there
+static FgdFile? LoadFgd(string gameInfo)
+{
+    KVObject gameInfoData;
+
+    using (var stream = File.OpenRead(gameInfo))
+    {
+        gameInfoData = KVSerializer.Create(KVSerializationFormat.KeyValues1Text).Deserialize(stream);
+    }
+
+    if (!gameInfoData.TryGetValue("Hammer", out var hammer) || hammer == null)
+    {
+        return null;
+    }
+
+    using var fileLoader = new GameFileLoader(null, gameInfo);
+
+    // A game can name files it does not ship, which are not worth a warning
+    var fgd = new FgdFile(file => fileLoader.FindFile(file, logNotFound: false) switch
+    {
+        { PathOnDisk: { } path } => File.OpenRead(path),
+        { Package: { } package, PackageEntry: { } entry } => package.GetMemoryMappedStreamIfPossible(entry),
+        _ => null,
+    });
+
+    return fgd.LoadGameFiles(hammer) ? fgd : null;
+}
+
+// The table of a game as it was written before, with its classes added again among the ones written now
+KVObject KeepTable(KVObject previousTable)
+{
+    var appId = previousTable.GetInt32Property("app_id");
+    var table = new KVObject();
+
+    foreach (var (name, value) in previousTable)
+    {
+        table.Add(name, name == "classes"
+            ? KVObject.Array((previousTable.GetArray("classes") ?? []).Select(id => new KVObject(KeepDefinition((string)id, appId))))
+            : value);
+    }
+
+    return table;
+}
+
+// A class as it was written before, under the id it is given among the classes written now
+string KeepDefinition(string previousId, int appId)
+{
+    var previousData = previousDefinitions.GetValueOrDefault(previousId)
+        ?? throw new InvalidDataException($"'{classesPath}' names class '{previousId}', which it does not declare.");
+
+    // It is written as it would be by a game that is installed, which gives it its id last
+    var data = new KVObject();
+
+    foreach (var (name, value) in previousData)
+    {
+        if (name != "id")
+        {
+            data.Add(name, value);
+        }
+    }
+
+    FixValveShit(data);
+    return AddDefinition(data.GetStringProperty("name"), data, appId);
+}
+
+// The key of the version of a class a game declares, which is shared by every game that declares it alike
+string AddDefinition(string name, KVObject data, int appId)
+{
+    var text = data.ToKV3String();
+
+    if (!definitions.TryGetValue(name, out var versions))
+    {
+        versions = [];
+        definitions.Add(name, versions);
+    }
+
+    foreach (var version in versions)
+    {
+        if (version.Text == text)
+        {
+            version.AppIds.Add(appId);
+            return version.Key;
+        }
+    }
+
+    // Class names never have this character, so a key is never the name of a class
+    var key = string.Create(CultureInfo.InvariantCulture, $"{name}#{versions.Count}");
+
+    versions.Add((text, key, data, [appId]));
+    return key;
+}
+
+// What an entity of a class is in the editor, where it is not the most common, a point; null for a class only
+// other classes are based on
+static string? GetKind(FgdClass gameClass) => gameClass.Type switch
+{
+    FgdClassType.PointClass or FgdClassType.NpcClass or FgdClassType.FilterClass or FgdClassType.MoveClass
+        or FgdClassType.KeyFrameClass or FgdClassType.NavLinkClass or FgdClassType.ChoreoAnchorClass => "point",
+    FgdClassType.SolidClass => "solid",
+    FgdClassType.PathClass => "path",
+    FgdClassType.PathNodeClass => "path_node",
+    FgdClassType.CableClass => "cable",
+    _ => null,
+};
+
+// Every class a class is based on, directly or through others
+static IEnumerable<FgdClass> GetAllBaseClasses(FgdClass gameClass)
+    => gameClass.BaseClasses.SelectMany(static baseClass => GetAllBaseClasses(baseClass).Prepend(baseClass));
+
+// A class as the renderer reads it, which is only what an entity of it is drawn with, or null for a class only
+// other classes are based on
+static KVObject? ConvertClass(FgdClass gameClass, HashSet<string> requiredParentClasses)
+{
+    if (GetKind(gameClass) is not { } kind)
+    {
+        return null;
+    }
+
+    var data = new KVObject { { "name", gameClass.Name } };
+
+    if (kind != "point")
+    {
+        data.Add("kind", kind);
+    }
+
+    if (gameClass.HasSize)
+    {
+        data.Add("mins", ToArray(gameClass.Mins));
+        data.Add("maxs", ToArray(gameClass.Maxs));
+    }
+
+    var helpers = KVObject.Array();
+
+    foreach (var helper in gameClass.Helpers)
+    {
+        helpers.Add(ConvertHelper(helper.Name, helper.Arguments, helper.Metadata));
+    }
+
+    foreach (var variable in gameClass.Variables)
+    {
+        // A key of one of these types is drawn by a helper of its own, which is given its name
+        var helperName = variable.DeclaredType switch
+        {
+            FgdVariableType.VecLine => "vecline",
+            FgdVariableType.Axis => "axis",
+            FgdVariableType.LocalAxis => "localaxis",
+            _ => null,
+        };
+
+        if (helperName != null)
+        {
+            // A key without a name gives the helper none
+            helpers.Add(ConvertHelper(helperName, variable.Name.Length > 0 ? [variable.Name] : [], null));
+        }
+    }
+
+    if (helpers.Count > 0)
+    {
+        data.Add("helpers", helpers);
+    }
+
+    if (GetText(gameClass.Metadata, "required_parent_class") is { Length: > 0 } requiredParentClass)
+    {
+        data.Add("required_parent_class", requiredParentClass);
+    }
+
+    if (GetText(gameClass.Metadata, "auto_apply_material") is { Length: > 0 } autoApplyMaterial)
+    {
+        data.Add("auto_apply_material", autoApplyMaterial);
+    }
+
+    // The keys that name the animation the model plays, the one that matters most first, and of keys that matter
+    // as much the one declared first
+    var previewAnimationKeys = gameClass.Variables
+        .Where(static variable => variable.Name.Length > 0 && variable.Metadata.GetBooleanProperty("is_preview_animation"))
+        .OrderByDescending(static variable => variable.Metadata.GetInt32Property("preview_animation_priority"))
+        .Select(static variable => new KVObject(variable.Name))
+        .ToList();
+
+    if (previewAnimationKeys.Count > 0)
+    {
+        data.Add("preview_animation_keys", KVObject.Array(previewAnimationKeys));
+    }
+
+    var baseClasses = GetAllBaseClasses(gameClass)
+        .Select(static baseClass => baseClass.Name)
+        .Where(requiredParentClasses.Contains)
+        .Distinct(StringComparer.OrdinalIgnoreCase)
+        .Select(static name => new KVObject(name))
+        .ToList();
+
+    if (baseClasses.Count > 0)
+    {
+        data.Add("base_classes", KVObject.Array(baseClasses));
+    }
+
+    return data;
+}
+
+void FixValveShit(KVObject data)
+{
+    if (!editorModelClasses.Contains(data.GetStringProperty("name")) || data.GetArray("helpers") is not { } helpers)
+    {
+        return;
+    }
+
+    foreach (var helper in helpers)
+    {
+        if (helper.GetStringProperty("name") is "model" or "studio")
+        {
+            helper["name"] = new KVObject("editormodel");
+        }
+    }
+}
+
+static KVObject ConvertHelper(string name, IReadOnlyList<string> arguments, KVObject? metadata)
+{
+    var helper = new KVObject { { "name", name } };
+
+    if (arguments.Count > 0)
+    {
+        helper.Add("arguments", KVObject.Array(arguments.Select(static argument => new KVObject(argument))));
+    }
+
+    if (metadata != null)
+    {
+        helper.Add("metadata", metadata);
+    }
+
+    return helper;
+}
+
+static KVObject ToArray(Vector3 vector) => KVObject.Array([vector.X, vector.Y, vector.Z]);
+
+// The classes of every game, written as the table the renderer shows entities with
+void WriteClasses()
+{
+    Console.WriteLine($"Found {definitions.Count} classes in {gameTables.Count} games");
+
+    // A class every game declares alike is written once under its name. Where games declare it differently, each
+    // version is written under its name and the first game that declares it so, and no version is the plain one.
+    var ids = new Dictionary<string, string>(StringComparer.Ordinal);
+
+    foreach (var (name, versions) in definitions)
+    {
+        foreach (var version in versions)
+        {
+            ids.Add(version.Key, versions.Count == 1 ? name : string.Create(CultureInfo.InvariantCulture, $"{name}:{version.AppIds.Min}"));
+        }
+    }
+
+    if (ids.Values.Distinct(StringComparer.Ordinal).Count() != ids.Count)
+    {
+        throw new InvalidOperationException("Two versions of a class were given the same id.");
+    }
+
+    KVObject MapClassIds(KVObject table)
+    {
+        var mapped = new KVObject();
+
+        foreach (var (name, value) in table)
+        {
+            mapped.Add(name, name == "classes" ? KVObject.Array(table.GetArray("classes").Select(key => new KVObject(ids[(string)key]))) : value);
+        }
+
+        return mapped;
+    }
+
+    var classes = definitions
+        .SelectMany(static versions => versions.Value)
+        .Select(version =>
+        {
+            var id = ids[version.Key];
+
+            if (id != version.Data.GetStringProperty("name"))
+            {
+                version.Data.Add("id", id);
+            }
+
+            return (Id: id, version.Data);
+        })
+        .OrderBy(static version => version.Id, StringComparer.Ordinal)
+        .Select(static version => version.Data);
+
+    var root = new KVObject
+    {
+        { "games", KVObject.Array(gameTables.Select(MapClassIds)) },
+        { "classes", KVObject.Array(classes) },
+    };
+
+    // The comment goes after the header, which has to be the first line
+    var text = root.ToKV3String();
+    var headerEnd = text.IndexOf('\n', StringComparison.Ordinal) + 1;
+
+    File.WriteAllText(classesPath, string.Concat(text.AsSpan(0, headerEnd), "// <auto-generated/>\n// Use Misc/VrfFgdParser project\n", text.AsSpan(headerEnd)));
+}
+
+static string GetSourcePath([CallerFilePath] string path = "") => path;
+
+// A key of a block of keys as text, or null when it is not there
+static string? GetText(KVObject? keys, string key)
+    => keys != null && keys.ContainsKey(key) ? keys[key].ToString(CultureInfo.InvariantCulture) : null;
+
+// The property names and trigger materials of every Source 2 game, whichever game declares them
 void ParseFile(string file)
 {
-    var isSource2 = File.Exists(Path.Join(Path.GetDirectoryName(file), "gameinfo.gi"));
+    var directory = Path.GetDirectoryName(file)!;
+    var isSource2 = File.Exists(Path.Join(directory, "gameinfo.gi"));
 
     Console.WriteLine();
     Console.ForegroundColor = isSource2 ? ConsoleColor.Green : ConsoleColor.Blue;
@@ -88,281 +487,27 @@ void ParseFile(string file)
 
     if (!isSource2)
     {
-        // We don't want icons from non-Source 2 games.
         return;
     }
 
-    GameDefinition fgd;
+    // Each file is read on its own, opening what it includes through the game it is in
+    using var fileLoader = new GameFileLoader(null, file);
+    var fgd = new FgdFile(fileLoader.GetFileStream);
 
-    try
-    {
-        using var stream = File.OpenRead(file);
-        using var reader = new StreamReader(stream);
+    fgd.Load(file);
 
-        var fgdFormatter = new FgdFormat(new FgdFileResolver(file));
-        fgd = fgdFormatter.Read(reader);
-    }
-    catch (Exception e)
+    foreach (var error in fgd.Errors)
     {
-        Console.WriteLine(e);
-        return;
+        Console.WriteLine($"{Path.GetFileName(error.FileName)}({error.Line}): {error.Message}");
     }
 
-    foreach (var _class in fgd.Classes)
+    foreach (var gameClass in fgd.Classes)
     {
-        foreach (var property in _class.Properties)
+        foreach (var variable in gameClass.Variables)
         {
-            allProperties.Add(property.Name.ToLowerInvariant());
-        }
-
-        foreach (var behaviour in _class.Behaviours)
-        {
-            string? value = null;
-
-            if (behaviour.Name == "iconsprite" && behaviour.Values.Count > 0)
-            {
-                value = behaviour.Values[0];
-
-                if (!value.StartsWith("materials/", StringComparison.Ordinal))
-                {
-                    value = "materials/" + value;
-                }
-
-                if (value.EndsWith(".vmt", StringComparison.Ordinal))
-                {
-                    value = value[..^4] + ".vmat";
-                }
-
-                if (!value.EndsWith(".vmat", StringComparison.Ordinal))
-                {
-                    value += ".vmat";
-                }
-            }
-
-            if (behaviour.Name == "iconsprite" && behaviour.Values.Count == 0) // TODO: Hack, needs library support
-            {
-                foreach (var dict in _class.Dictionaries)
-                {
-                    if (dict.Name != "iconsprite")
-                    {
-                        continue;
-                    }
-
-                    foreach (var dictValue in dict)
-                    {
-                        if (dictValue.Key == "image")
-                        {
-                            value = (string)dictValue.Value.Value;
-                        }
-                    }
-                }
-            }
-
-            foreach (var dict in _class.Dictionaries)
-            {
-                if (dict.Name == "metadata" && dict.TryGetValue("auto_apply_material", out var autoApplyMaterial))
-                {
-                    var material = (string)autoApplyMaterial.Value;
-
-                    if (material != "materials/tools/toolstrigger.vmat")
-                    {
-                        entityMaterials[_class.Name] = material;
-                    }
-                }
-            }
-
-            // "studio()" is the entity's real in-game model. "editormodel()"/"model()" are Hammer-only
-            // visualization aids that don't represent the entity's actual appearance.
-            var isStudioValue = false;
-
-            if ((behaviour.Name == "studio" || behaviour.Name == "editormodel" || behaviour.Name == "model") && behaviour.Values.Count > 0)
-            {
-                value = behaviour.Values[0];
-
-                if (value is not "editormodel" and not "static")
-                {
-                    if (value.EndsWith(".mdl", StringComparison.Ordinal))
-                    {
-                        value = value[..^4] + ".vmdl";
-                    }
-
-                    if (!value.EndsWith(".vmdl", StringComparison.Ordinal))
-                    {
-                        value += ".vmdl";
-                    }
-
-                    isStudioValue = behaviour.Name == "studio";
-                }
-                else
-                {
-                    value = null;
-                }
-            }
-
-            if (value == null && _class.ClassType != ClassType.BaseClass)
-            {
-                foreach (var baseClass in _class.BaseClasses)
-                {
-                    if (baseEntities.TryGetValue(baseClass, out var values) && values.Icons.Count > 0)
-                    {
-                        value = values.Icons.First(); // TODO: more than one
-                        isStudioValue = values.IsStudio;
-                        Console.WriteLine($"Found {_class.Name} base icon from {baseClass}");
-                        break;
-                    }
-                }
-            }
-
-            if (value != null)
-            {
-                IDictionary<string, EntityInfo> icons = _class.ClassType == ClassType.BaseClass ? baseEntities : allEntities;
-
-                if (icons.TryGetValue(_class.Name, out var existingIcons))
-                {
-                    existingIcons.Icons.Add(value);
-                    existingIcons.IsStudio |= isStudioValue;
-                }
-                else
-                {
-                    icons[_class.Name] = new();
-                    icons[_class.Name].Icons.Add(value);
-                    icons[_class.Name].IsStudio = isStudioValue;
-                }
-            }
-
-            // Color
-            {
-                string? color = null;
-
-                if (behaviour.Name == "color" && behaviour.Values.Count >= 3)
-                {
-                    color = ConstructColor(behaviour.Values);
-                }
-
-                if (color == null && _class.ClassType != ClassType.BaseClass)
-                {
-                    foreach (var baseClass in _class.BaseClasses)
-                    {
-                        if (allEntities.TryGetValue(baseClass, out var colorEntity) && colorEntity.Color != null)
-                        {
-                            color = colorEntity.Color;
-                            Console.WriteLine($"Found {_class.Name} base color from {baseClass}");
-                            break;
-                        }
-                    }
-                }
-
-                if (color != null)
-                {
-                    IDictionary<string, EntityInfo> colors = _class.ClassType == ClassType.BaseClass ? baseEntities : allEntities;
-
-                    if (!colors.TryGetValue(_class.Name, out var colorValue))
-                    {
-                        colorValue = new();
-                        colors[_class.Name] = colorValue;
-                    }
-
-                    colorValue.Color ??= color;
-                }
-            }
-
-            // Line - TODO: Look up from base class?
-            {
-                if (behaviour.Name == "line" && behaviour.Values.Count > 3)
-                {
-                    var color = ConstructColor([.. behaviour.Values.Take(3)]);
-                    var line = string.Empty;
-
-                    if (behaviour.Values.Count == 5)
-                    {
-                        line = $"new HammerEntity.Line({color}, \"{behaviour.Values[3]}\", \"{behaviour.Values[4]}\")";
-                    }
-                    else if (behaviour.Values.Count == 7)
-                    {
-                        line = $"new HammerEntity.Line({color}, \"{behaviour.Values[3]}\", \"{behaviour.Values[4]}\", \"{behaviour.Values[5]}\", \"{behaviour.Values[6]}\")";
-                    }
-
-                    IDictionary<string, EntityInfo> entity = _class.ClassType == ClassType.BaseClass ? baseEntities : allEntities;
-
-                    if (!entity.TryGetValue(_class.Name, out var lineValue))
-                    {
-                        lineValue = new();
-                        entity[_class.Name] = lineValue;
-                    }
-
-                    lineValue.Lines.Add(line);
-                }
-            }
+            allProperties.Add(variable.Name.ToLowerInvariant());
         }
     }
-}
-
-void WriteEntities()
-{
-    Console.WriteLine($"Found {allEntities.Count} entities");
-
-    var str = new StringBuilder();
-
-    foreach (var icon in allEntities)
-    {
-        var icons = icon.Value.Icons.ToList();
-        icons.Sort((a, b) =>
-        {
-            var aContains = a.Contains(icon.Key, StringComparison.Ordinal) ? 1 : 0;
-            var bContains = b.Contains(icon.Key, StringComparison.Ordinal) ? 1 : 0;
-            var aMdl = a.EndsWith(".vmdl", StringComparison.Ordinal) ? 1 : 0;
-            var bMdl = b.EndsWith(".vmdl", StringComparison.Ordinal) ? 1 : 0;
-
-            Console.WriteLine($"{a} <=> {b}");
-
-            if (aContains != bContains)
-            {
-                return bContains - aContains;
-            }
-
-            if (aMdl != bMdl)
-            {
-                return bMdl - aMdl;
-            }
-
-            return string.CompareOrdinal(a, b);
-        });
-
-        var fields = new List<string>();
-
-        if (icon.Value.IsStudio)
-        {
-            fields.Add("Studio = true");
-        }
-
-        if (icons.Count > 0)
-        {
-            var iconsStr = string.Join(@""", """, icons);
-            fields.Add($"Icons = [\"{iconsStr}\"]");
-        }
-
-        if (icon.Value.Color != null)
-        {
-            fields.Add($"Color = {icon.Value.Color}");
-        }
-
-        if (icon.Value.Lines.Count > 0)
-        {
-            var linesStr = string.Join(", ", icon.Value.Lines);
-            fields.Add($"Lines = [{linesStr}]");
-        }
-
-        str.Append("            ");
-        str.Append('"');
-        str.Append(icon.Key);
-        str.Append('"');
-        str.Append(" => new() { ");
-        str.Append(string.Join(", ", fields));
-        str.Append(" },");
-        str.AppendLine();
-    }
-
-    File.WriteAllText("entities.txt", str.ToString());
 }
 
 void WriteProperties()
@@ -381,26 +526,4 @@ void WriteProperties()
     }
 
     File.WriteAllText("properties.txt", propertiesString.ToString());
-}
-
-void WriteMaterials()
-{
-    Console.WriteLine($"Found {entityMaterials.Count} entity materials");
-
-    var str = new StringBuilder();
-
-    foreach (var (name, material) in entityMaterials.OrderBy(x => x.Key))
-    {
-        str.AppendLine(CultureInfo.InvariantCulture, $"\"{name}\" => \"{material}\"");
-    }
-
-    File.WriteAllText("entity_materials.txt", str.ToString());
-}
-
-class EntityInfo
-{
-    public HashSet<string> Icons = [];
-    public bool IsStudio;
-    public string? Color;
-    public HashSet<string> Lines = [];
 }

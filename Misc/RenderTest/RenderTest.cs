@@ -4,14 +4,14 @@ using OpenTK.Graphics.OpenGL;
 using OpenTK.Windowing.Common;
 using OpenTK.Windowing.Desktop;
 using OpenTK.Windowing.GraphicsLibraryFramework;
-using SteamDatabase.ValvePak;
+using ValvePak;
 using ValveResourceFormat;
 using ValveResourceFormat.CompiledShader;
 using ValveResourceFormat.IO;
 using ValveResourceFormat.Renderer;
 using ValveResourceFormat.Renderer.Input;
-using ValveResourceFormat.Renderer.Utils;
 using ValveResourceFormat.Renderer.World;
+using ValveResourceFormat.Utils;
 using Vector2 = System.Numerics.Vector2;
 using Vector3 = System.Numerics.Vector3;
 
@@ -80,8 +80,7 @@ internal class RenderTestWindow : GameWindow
         }
 
 #pragma warning disable CA2000 // Dispose objects before losing scope
-        var vpk = new Package();
-        vpk.Read(mapVpk);
+        var vpk = Package.Open(mapVpk);
         var fileLoader = new GameFileLoader(vpk, mapVpk);
 #pragma warning restore CA2000 // Dispose objects before losing scope
 
@@ -92,8 +91,10 @@ internal class RenderTestWindow : GameWindow
     {
         base.OnLoad();
 
+        rendererContext.Device.CreateContext().Begin();
+
         GLEnvironment.Initialize(rendererContext.Logger);
-        GLEnvironment.SetDefaultRenderState(rendererContext);
+        GLEnvironment.SetDefaultRenderState();
 
         SceneRenderer = new Renderer(rendererContext);
         Input = new UserInput(SceneRenderer);
@@ -104,6 +105,7 @@ internal class RenderTestWindow : GameWindow
 
         // Lock cursor for mouse look
         CursorState = CursorState.Grabbed;
+        RawMouseInput = GLFW.RawMouseMotionSupported();
         isCursorLocked = true;
     }
 
@@ -292,14 +294,13 @@ internal class RenderTestWindow : GameWindow
         }
 
         var mapPath = vmaps[0].GetFullPath();
-        var loadedMap = WorldLoader.LoadMap(mapPath, scene);
-
-        SceneRenderer.SkyboxScene = loadedMap.SkyboxScene;
-        SceneRenderer.Skybox2D = loadedMap.Skybox2D;
+        WorldLoader.LoadMap(mapPath, scene, SceneRenderer.EntitySystem);
 
         // Initialize scene (creates lighting buffers, octrees, etc.)
-        SceneRenderer.Scene.Initialize();
-        SceneRenderer.SkyboxScene?.Initialize();
+        foreach (var initializing in SceneRenderer.Scenes)
+        {
+            initializing.Initialize();
+        }
 
         // Set initial camera position
         if (scene.AllNodes.Any())

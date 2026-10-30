@@ -1,4 +1,5 @@
 using System.IO;
+using ValveResourceFormat.Utils;
 
 namespace ValveResourceFormat.CompiledShader;
 
@@ -9,27 +10,27 @@ namespace ValveResourceFormat.CompiledShader;
 public class VfxShaderFileDXBC : VfxShaderFile
 {
     /// <inheritdoc/>
-    public override string BlockName => "DXBC";
+    public override string SourceType => "DXBC";
 
     /// <summary>
     /// Initializes a new instance from a binary reader.
     /// </summary>
-    public VfxShaderFileDXBC(BinaryReader datareader, int sourceId, VfxStaticComboData parent)
-        : base(datareader, sourceId, parent)
+    public VfxShaderFileDXBC(BinaryReader datareader, int shaderFileId, VfxStaticComboData parent)
+        : base(datareader, shaderFileId, parent)
     {
         if (Size > 0)
         {
             Bytecode = datareader.ReadBytes(Size);
         }
 
-        HashMD5 = new Guid(datareader.ReadBytes(16));
+        HashMD5 = datareader.ReadGuid();
     }
 
     /// <summary>
     /// Initializes a new instance with explicit size and hash.
     /// </summary>
-    public VfxShaderFileDXBC(BinaryReader datareader, int sourceId, int size, Guid hash, VfxStaticComboData parent)
-        : base(sourceId, parent)
+    public VfxShaderFileDXBC(BinaryReader datareader, int shaderFileId, int size, Guid hash, VfxStaticComboData parent)
+        : base(shaderFileId, parent)
     {
         Size = size;
         Bytecode = datareader.ReadBytes(size);
@@ -42,6 +43,6 @@ public class VfxShaderFileDXBC : VfxShaderFile
     /// </remarks>
     public override string GetDecompiledFile()
     {
-        return $"Shader hash: {new Guid(Bytecode.AsSpan(4, 16)).ToString()}\n\nDXBC decompilation is currently not supported.";
+        return $"Shader hash: {new Guid(Bytecode.AsSpan(4, 16))}\n\nDXBC decompilation is currently not supported.";
     }
 }

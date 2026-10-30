@@ -3,12 +3,17 @@ namespace ValveResourceFormat.ResourceTypes.ModelFlex.FlexOps
     /// <summary>
     /// Flex operation that performs N-way blending between values.
     /// </summary>
-    public class FlexOpNWay : FlexOp
+    internal class FlexOpNWay : FlexOp
     {
+        private readonly int ValueController;
+
         /// <summary>
         /// Initializes a new instance of the <see cref="FlexOpNWay"/> class.
         /// </summary>
-        public FlexOpNWay(float data) : base(data) { }
+        public FlexOpNWay(float data) : base(data)
+        {
+            ValueController = (int)MathF.Round(data);
+        }
 
         /// <inheritdoc/>
         /// <remarks>
@@ -16,16 +21,15 @@ namespace ValveResourceFormat.ResourceTypes.ModelFlex.FlexOps
         /// </remarks>
         public override void Run(in FlexRuleContext context)
         {
-            var tController = BitConverter.SingleToInt32Bits(context.Stack.Pop());
-            var valueController = (int)MathF.Round(Data);
+            var tController = context.PopIndex();
 
-            var tCurrent = context.ControllerValues[tController];
-            var value = context.ControllerValues[valueController];
+            var tCurrent = context.GetControllerValue(tController);
+            var value = context.GetControllerValue(ValueController);
 
-            var t4 = context.Stack.Pop();
-            var t3 = context.Stack.Pop();
-            var t2 = context.Stack.Pop();
-            var t1 = context.Stack.Pop();
+            var t4 = context.Pop();
+            var t3 = context.Pop();
+            var t2 = context.Pop();
+            var t1 = context.Pop();
 
             float outValue;
             if (tCurrent < t1)
@@ -34,7 +38,7 @@ namespace ValveResourceFormat.ResourceTypes.ModelFlex.FlexOps
             }
             else if (tCurrent < t2)
             {
-                outValue = float.Lerp(0, value, (tCurrent - t1) / (t2 - t1));
+                outValue = MathUtils.RemapRange(tCurrent, t1, t2, 0f, value);
             }
             else if (tCurrent < t3)
             {
@@ -42,7 +46,7 @@ namespace ValveResourceFormat.ResourceTypes.ModelFlex.FlexOps
             }
             else if (tCurrent < t4)
             {
-                outValue = float.Lerp(value, 0, (tCurrent - t3) / (t4 - t3));
+                outValue = MathUtils.RemapRange(tCurrent, t3, t4, value, 0f);
             }
             else
             {

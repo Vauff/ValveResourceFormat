@@ -1,8 +1,11 @@
 using System.Buffers;
 using System.Collections;
+using System.Collections.ObjectModel;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using ValveResourceFormat.Compression;
+using ValveResourceFormat.Particles;
 using ValveResourceFormat.Serialization.KeyValues;
 
 namespace ValveResourceFormat.Blocks
@@ -23,7 +26,19 @@ namespace ValveResourceFormat.Blocks
         /// <summary>
         /// Gets the particle attribute data by name and type.
         /// </summary>
-        public IReadOnlyDictionary<(string Name, string Type), IEnumerable> AttributeData { get; private set; } = new Dictionary<(string Name, string Type), IEnumerable>();
+        public IReadOnlyDictionary<(string Name, string Type), IEnumerable> AttributeData { get; private set; } = ReadOnlyDictionary<(string Name, string Type), IEnumerable>.Empty;
+
+        /// <summary>
+        /// Changes whenever the rows of a runtime snapshot are rewritten in place, so readers that keep
+        /// a cursor can tell a rewritten snapshot from the one they last saw.
+        /// </summary>
+        internal int Serial { get; private set; }
+
+        internal void SetParticleCount(uint count)
+        {
+            NumParticles = count;
+            Serial++;
+        }
 
         /// <summary>
         /// Builds a snapshot in memory (not backed by a resource file), e.g. from a map entity's path
@@ -71,6 +86,7 @@ namespace ValveResourceFormat.Blocks
             ParticleField.ManualAnimationFrame => "manual_animation_frame",
             ParticleField.ShaderExtraData1 => "shader_extra_data_1",
             ParticleField.ShaderExtraData2 => "shader_extra_data_2",
+            ParticleField.RopeSegmentId => "rope_segment_id",
             _ => null,
         };
 
@@ -105,7 +121,7 @@ namespace ValveResourceFormat.Blocks
             try
             {
                 BlockCompress.FastDecompress(info, reader, decompressed.AsSpan(0, info.Size));
-                using var decompressedStream = new MemoryStream(decompressed);
+                using var decompressedStream = new MemoryStream(decompressed, 0, info.Size);
                 using var innerReader = new BinaryReader(decompressedStream);
 
                 // Get DATA block to know how to read SNAP data
@@ -144,35 +160,13 @@ namespace ValveResourceFormat.Blocks
 
         private static IEnumerable ReadArrayOfType(BinaryReader reader, long count, string type)
         {
-            if (type == "float3" || type == "vector")
+            return type switch
             {
-                var array = new Vector3[count];
-                for (var i = 0; i < count; i++)
-                {
-                    array[i] = new Vector3(reader.ReadSingle(), reader.ReadSingle(), reader.ReadSingle());
-                }
-                return array;
-            }
-            else if (type == "float")
-            {
-                var array = new float[count];
-                for (var i = 0; i < count; i++)
-                {
-                    array[i] = reader.ReadSingle();
-                }
-                return array;
-            }
-            else if (type == "int")
-            {
-                var array = new int[count];
-                for (var i = 0; i < count; i++)
-                {
-                    array[i] = reader.ReadInt32();
-                }
-                return array;
-            }
-
-            throw new UnexpectedMagicException("Unsupported SNAP array type.", type, nameof(type));
+                "float3" or "vector" => reader.ReadArray<Vector3>(count),
+                "float" => reader.ReadArray<float>(count),
+                "int" => reader.ReadArray<int>(count),
+                _ => throw new UnexpectedMagicException("Unsupported SNAP array type.", type, nameof(type)),
+            };
         }
 
         private static string[] ReadStringArray(BinaryReader reader, long count, string[] stringList)
@@ -216,7 +210,7 @@ namespace ValveResourceFormat.Blocks
             /// </remarks>
             public override string ToString()
                 => string.Join(' ', Enumerable.Range(0, 4)
-                    .Select(i => $"({JointNames[i]}: {Weights[i]})"));
+                    .Select(i => string.Create(CultureInfo.InvariantCulture, $"({JointNames[i]}: {Weights[i]})")));
         }
 
         private static SkinningData[] ReadSkinningData(BinaryReader reader, long count, string[] stringList)

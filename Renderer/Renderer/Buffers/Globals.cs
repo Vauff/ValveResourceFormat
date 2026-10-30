@@ -17,7 +17,12 @@ public sealed class Globals : Buffer
 
     /// <summary>Initializes a new constant buffer bound to <see cref="ReservedBufferSlots.Globals"/>.</summary>
     /// <param name="name">Debug name, normally the shader or material this buffer belongs to.</param>
-    public Globals(string name) : base(BufferTarget.UniformBuffer, (int)ReservedBufferSlots.Globals, name)
+    public Globals(string name) : this(name, (int)ReservedBufferSlots.Globals)
+    {
+    }
+
+    /// <summary>Initializes a new constant buffer with a given binding point.</summary>
+    public Globals(string name, int bindingPoint) : base(BufferTarget.UniformBuffer, bindingPoint, name)
     {
     }
 
@@ -29,6 +34,7 @@ public sealed class Globals : Buffer
     public void BeginFill(GlobalsLayout layout)
     {
         var allocate = Size != layout.Size;
+        var hadStorage = Size != 0;
 
         if (allocate)
         {
@@ -42,7 +48,15 @@ public sealed class Globals : Buffer
 
         if (allocate)
         {
-            GL.NamedBufferData(Handle, Size, bytes, BufferUsageHint.DynamicDraw);
+            if (hadStorage)
+            {
+                RecreateHandle();
+            }
+
+            if (Size > 0)
+            {
+                GL.NamedBufferStorage(Handle, Size, bytes, BufferStorageFlags.DynamicStorageBit);
+            }
 
             dirtyStart = int.MaxValue;
             dirtyEnd = 0;

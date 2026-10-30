@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Diagnostics.Tracing;
+using System.Globalization;
 using System.Threading;
 
 namespace ValveResourceFormat.Renderer;
@@ -25,9 +26,8 @@ public class AllocStats
         private const int GCAllocationTickEventId = 10;
         private const EventKeywords GCKeyword = (EventKeywords)0x1;
 
-        // System.Buffers.ArrayPoolEventSource event ids. Subscribed at Informational level only:
-        // the Verbose per-rent/return events box their payloads in the dispatch, which at one rent
-        // per frame becomes the dominant allocation in the very report this display produces.
+        // System.Buffers.ArrayPoolEventSource ids. Informational only: Verbose per-rent/return
+        // events box payloads, which at one rent per frame would be the overlay's top allocation.
         private const int BufferAllocatedEventId = 2;
         private const int BufferTrimmedEventId = 4;
         private const int BufferDroppedEventId = 6;
@@ -243,7 +243,6 @@ public class AllocStats
     // Rolling one second window, published on rollover so the numbers are readable.
     private long windowStart;
     private long windowTotalBytes;
-    private int windowFrames;
     private long windowMaxFrameBytes;
     private readonly int[] windowStartCollections = new int[GC.MaxGeneration + 1];
 
@@ -326,7 +325,6 @@ public class AllocStats
         lastFrameTotalBytes = GC.GetTotalAllocatedBytes(precise: false) - frameStartTotalBytes;
 
         windowTotalBytes += lastFrameTotalBytes;
-        windowFrames++;
         windowMaxFrameBytes = Math.Max(windowMaxFrameBytes, lastFrameTotalBytes);
 
         var elapsed = Stopwatch.GetElapsedTime(windowStart).TotalSeconds;
@@ -348,7 +346,6 @@ public class AllocStats
     {
         windowStart = Stopwatch.GetTimestamp();
         windowTotalBytes = 0;
-        windowFrames = 0;
         windowMaxFrameBytes = 0;
 
         for (var gen = 0; gen <= GC.MaxGeneration; gen++)
@@ -364,9 +361,9 @@ public class AllocStats
         {
             < 0 => destination.TryWrite($"0 B", out charsWritten), // a GC can shrink GetTotalMemory between snapshots
             < 1024 => destination.TryWrite($"{bytes} B", out charsWritten),
-            < 1024 * 1024 => destination.TryWrite($"{bytes / 1024.0:0.0} KB", out charsWritten),
-            < 1024 * 1024 * 1024 => destination.TryWrite($"{bytes / (1024.0 * 1024.0):0.0} MB", out charsWritten),
-            _ => destination.TryWrite($"{bytes / (1024.0 * 1024.0 * 1024.0):0.00} GB", out charsWritten),
+            < 1024 * 1024 => destination.TryWrite(CultureInfo.InvariantCulture, $"{bytes / 1024.0:0.0} KB", out charsWritten),
+            < 1024 * 1024 * 1024 => destination.TryWrite(CultureInfo.InvariantCulture, $"{bytes / (1024.0 * 1024.0):0.0} MB", out charsWritten),
+            _ => destination.TryWrite(CultureInfo.InvariantCulture, $"{bytes / (1024.0 * 1024.0 * 1024.0):0.00} GB", out charsWritten),
         };
 
         public string ToString(string? format, IFormatProvider? formatProvider) => ToString();
@@ -375,9 +372,9 @@ public class AllocStats
         {
             < 0 => "0 B",
             < 1024 => $"{bytes} B",
-            < 1024 * 1024 => $"{bytes / 1024.0:0.0} KB",
-            < 1024 * 1024 * 1024 => $"{bytes / (1024.0 * 1024.0):0.0} MB",
-            _ => $"{bytes / (1024.0 * 1024.0 * 1024.0):0.00} GB",
+            < 1024 * 1024 => string.Create(CultureInfo.InvariantCulture, $"{bytes / 1024.0:0.0} KB"),
+            < 1024 * 1024 * 1024 => string.Create(CultureInfo.InvariantCulture, $"{bytes / (1024.0 * 1024.0):0.0} MB"),
+            _ => string.Create(CultureInfo.InvariantCulture, $"{bytes / (1024.0 * 1024.0 * 1024.0):0.00} GB"),
         };
     }
 
@@ -470,12 +467,10 @@ public class AllocStats
 
         AddLine(displayText.Format($"Heap:     {new ByteSize(GC.GetTotalMemory(forceFullCollection: false)),10} used, {new ByteSize(info.HeapSizeBytes),10} heap, {new ByteSize(info.FragmentedBytes),10} fragmented, {new ByteSize(info.TotalCommittedBytes),10} committed"), valueColor);
 
-
         // Climbing finalization counts are GL handle wrappers (or other disposables) nobody disposed.
         AddLine(
             displayText.Format($"Objects:     {info.PinnedObjectsCount:N0} pinned, {info.FinalizationPendingCount:N0} awaiting finalization"),
             info.FinalizationPendingCount > 100 ? new Color32(255, 255, 0) : valueColor);
-
 
         var windowCollections = 0;
 

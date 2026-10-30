@@ -33,6 +33,18 @@ public class ThemedToolStripMenuItem : ToolStripMenuItem
         }
     }
 
+    /// <summary>Renders the item on the theme's attention background.</summary>
+    [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+    public bool Highlighted
+    {
+        get;
+        set
+        {
+            field = value;
+            Invalidate();
+        }
+    }
+
     [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
     public override Image? Image
     {
@@ -46,7 +58,7 @@ public class ThemedToolStripMenuItem : ToolStripMenuItem
     [Description("Will override the image from the designer"), Category("Appearance")]
     public string SVGImageResourceName
     {
-        get => field;
+        get;
         set
         {
             field = value;

@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Runtime.InteropServices;
 
 namespace ValveResourceFormat.ResourceTypes.ModelAnimation
@@ -9,7 +10,6 @@ namespace ValveResourceFormat.ResourceTypes.ModelAnimation
         public Half Y { get; set; } = y;
         public Half Z { get; set; } = z;
 
-
         public static implicit operator Half3(Vector3 v) => new((Half)v.X, (Half)v.Y, (Half)v.Z);
         public static implicit operator Vector3(Half3 v) => new((float)v.X, (float)v.Y, (float)v.Z);
 
@@ -17,7 +17,7 @@ namespace ValveResourceFormat.ResourceTypes.ModelAnimation
         /// <remarks>
         /// Returns the vector components formatted as "&lt;X Y Z&gt;" with 3 decimal places.
         /// </remarks>
-        public readonly override string ToString() => $"<{X:0.000} {Y:0.000} {Z:0.000}>";
+        public override readonly string ToString() => string.Create(CultureInfo.InvariantCulture, $"<{X:0.000} {Y:0.000} {Z:0.000}>");
     }
 
     internal class SegmentHelpers
@@ -28,7 +28,7 @@ namespace ValveResourceFormat.ResourceTypes.ModelAnimation
         /// Read and decode encoded quaternion.
         /// </summary>
         /// <param name="bytes">The byte stream.</param>
-        /// <returns>Quaternion.</returns>
+        /// <returns>The decoded rotation.</returns>
         public static Quaternion ReadQuaternion(ReadOnlySpan<byte> bytes)
         {
             // Values

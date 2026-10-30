@@ -1,4 +1,5 @@
 using System.IO;
+using System.Linq;
 using ValveKeyValue;
 using ValveResourceFormat.ResourceTypes.RubikonPhysics.Shapes;
 using ValveResourceFormat.Serialization.KeyValues;
@@ -11,6 +12,9 @@ namespace ValveResourceFormat.ResourceTypes.RubikonPhysics
     /// <seealso href="https://s2v.app/SchemaExplorer/cs2/physicslib/RnShapeDesc_t">RnShapeDesc_t</seealso>
     public class ShapeDescriptor<T> where T : struct
     {
+        private static readonly string TypeName = typeof(T).Name;
+        private static readonly string ShapeMemberName = "m_" + TypeName;
+
         /// <summary>
         /// Gets or sets the collision attribute index.
         /// </summary>
@@ -23,6 +27,10 @@ namespace ValveResourceFormat.ResourceTypes.RubikonPhysics
         /// Gets or sets the user-friendly name.
         /// </summary>
         public string? UserFriendlyName { get; set; }
+        /// <summary>
+        /// Gets or sets the hit group this shape belongs to for location based damage.
+        /// </summary>
+        public string? HitGroupName { get; set; }
 
         /// <summary>
         /// Gets or sets the shape.
@@ -44,9 +52,9 @@ namespace ValveResourceFormat.ResourceTypes.RubikonPhysics
             CollisionAttributeIndex = data.GetInt32Property("m_nCollisionAttributeIndex");
             SurfacePropertyIndex = data.GetInt32Property("m_nSurfacePropertyIndex");
             UserFriendlyName = data.GetStringProperty("m_UserFriendlyName");
+            HitGroupName = data.GetStringProperty("m_sHitGroupName");
 
-            var memberName = typeof(T).Name;
-            var shapeData = data.GetSubCollection("m_" + memberName) ?? throw new InvalidDataException("Member name is not correct for shape type: " + memberName);
+            var shapeData = data.GetSubCollection(ShapeMemberName) ?? throw new InvalidDataException("Member name is not correct for shape type: " + TypeName);
             Shape = DeserializeShape(shapeData);
         }
 
@@ -97,5 +105,38 @@ namespace ValveResourceFormat.ResourceTypes.RubikonPhysics
     {
         /// <inheritdoc/>
         public override Shapes.Mesh DeserializeShape(KVObject data) => new(data);
+    }
+
+    /// <summary>
+    /// Descriptor for compound shapes.
+    /// </summary>
+    /// <seealso href="https://s2v.app/SchemaExplorer/cs2/physicslib/RnCompoundDesc_t">RnCompoundDesc_t</seealso>
+    public class CompoundDescriptor : ShapeDescriptor<Compound>
+    {
+        private SphereDescriptor[]? sphereDescriptors;
+        private CapsuleDescriptor[]? capsuleDescriptors;
+        private HullDescriptor[]? hullDescriptors;
+        private MeshDescriptor[]? meshDescriptors;
+
+        /// <inheritdoc/>
+        public override Compound DeserializeShape(KVObject data) => new(data);
+
+        // Fabricated descriptors
+        internal SphereDescriptor[] SphereDescriptors => sphereDescriptors ??= WrapChildren<SphereDescriptor, Sphere>(Shape.Spheres);
+        internal CapsuleDescriptor[] CapsuleDescriptors => capsuleDescriptors ??= WrapChildren<CapsuleDescriptor, Capsule>(Shape.Capsules);
+        internal HullDescriptor[] HullDescriptors => hullDescriptors ??= WrapChildren<HullDescriptor, Hull>(Shape.Hulls);
+        internal MeshDescriptor[] MeshDescriptors => meshDescriptors ??= WrapChildren<MeshDescriptor, Shapes.Mesh>(Shape.Meshes);
+
+        private TDescriptor[] WrapChildren<TDescriptor, TShape>(TShape[] children)
+            where TDescriptor : ShapeDescriptor<TShape>, new()
+            where TShape : struct
+            => [.. children.Select(child => new TDescriptor
+            {
+                CollisionAttributeIndex = CollisionAttributeIndex,
+                SurfacePropertyIndex = SurfacePropertyIndex,
+                UserFriendlyName = UserFriendlyName,
+                HitGroupName = HitGroupName,
+                Shape = child,
+            })];
     }
 }

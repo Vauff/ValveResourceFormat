@@ -1,11 +1,12 @@
 using System.Diagnostics;
 using System.Drawing;
-using System.Linq;
+using System.IO;
 using System.Windows.Forms;
 using GUI.Controls;
 using GUI.Utils;
-using ValveKeyValue;
 using ValveResourceFormat.Blocks;
+using ValveResourceFormat.Particles;
+using ValveResourceFormat.Particles.Upgrade;
 using ValveResourceFormat.Renderer;
 using ValveResourceFormat.Renderer.Particles;
 using ValveResourceFormat.Renderer.SceneNodes;
@@ -19,14 +20,35 @@ namespace GUI.Types.GLViewers
     /// </summary>
     class GLParticleViewer : GLSceneViewer
     {
-        private readonly ParticleSystem particleSystem;
+        private static readonly Color UnsupportedColor = Color.FromArgb(224, 80, 80);
+        private static readonly Color RemovedColor = Color.FromArgb(140, 140, 140);
+        private static readonly Color LinkColorDark = Color.FromArgb(99, 161, 255);
+        private static readonly Color LinkColorLight = Color.FromArgb(0, 102, 204);
+        private static readonly Color DisabledLinkColorDark = Color.FromArgb(122, 138, 160);
+        private static readonly Color DisabledLinkColorLight = Color.FromArgb(112, 128, 148);
+
+        // Order matches the CS2 particle editor (PET): pre-emission first, then emit/init/operate,
+        // forces, constraints, and renderers last.
+        internal static readonly (string Title, string ListName, Func<string, bool> IsSupported)[] FunctionGroups =
+        [
+            ("Pre-Emission Operators", "m_PreEmissionOperators", ParticleSupportInfo.IsPreEmissionOperatorSupported),
+            ("Emitters", "m_Emitters", ParticleSupportInfo.IsEmitterSupported),
+            ("Initializers", "m_Initializers", ParticleSupportInfo.IsInitializerSupported),
+            ("Operators", "m_Operators", ParticleSupportInfo.IsOperatorSupported),
+            ("Force Generators", "m_ForceGenerators", ParticleSupportInfo.IsForceGeneratorSupported),
+            ("Constraints", "m_Constraints", ParticleSupportInfo.IsConstraintSupported),
+            ("Renderers", "m_Renderers", ParticleRendererFactory.IsSupported),
+        ];
+
+        internal readonly ParticleSystem particleSystem;
         private readonly ParticleSnapshot? particleSnapshot;
+        internal IReadOnlyDictionary<string, IReadOnlyList<ParticleUpgradeTrace.TracedFunction>>? functionLists;
         private ParticleSceneNode? particleSceneNode;
         private GLViewerSliderControl? slowmodeTrackBar;
         private ThemedButton? restartButton;
+        private ThemedButton? pauseButton;
         private ThemedButton? endCapButton;
         private float screenSize = SnapshotParticleSystem.DefaultScreenSize;
-        private bool ShowRenderBounds { get; set; }
 
         public GLParticleViewer(VrfGuiContext vrfGuiContext, RendererContext rendererContext, ParticleSystem particleSystem, ParticleSnapshot? particleSnapshot = null)
             : base(vrfGuiContext, rendererContext, Frustum.CreateEmpty())
@@ -41,6 +63,7 @@ namespace GUI.Types.GLViewers
 
             slowmodeTrackBar?.Dispose();
             restartButton?.Dispose();
+            pauseButton?.Dispose();
             endCapButton?.Dispose();
         }
 
@@ -49,6 +72,10 @@ namespace GUI.Types.GLViewers
             InitializeSoundPlayer();
             LoadDefaultLighting();
             Scene.LightingInfo.UseSceneBoundsForSunLightFrustum = false;
+
+            // Taken before the scene node reads the upgraded tree, so the chain runs once and the
+            // function list describes the tree that is being simulated.
+            functionLists = particleSystem.GetUpgradeTrace();
 
             particleSceneNode = new ParticleSceneNode(Scene, particleSystem, particleSnapshot, true)
             {
@@ -87,14 +114,13 @@ namespace GUI.Types.GLViewers
         {
             if (particleSceneNode != null && particleSnapshot != null && SnapshotParticleSystem.UsesConstantScreenSize(particleSnapshot))
             {
-                SnapshotParticleSystem.SetScreenSize(particleSceneNode, screenSize, Input.Camera.GetFOV());
+                SnapshotParticleSystem.SetScreenSize(particleSceneNode.GetControlPoint(SnapshotParticleSystem.ScreenSizeControlPoint), screenSize, Input.Camera.GetFOV());
             }
         }
 
         protected override void AddUiControls()
         {
             Debug.Assert(UiControl != null);
-            Debug.Assert(SelectedNodeRenderer != null);
 
             AddRenderModeSelectionControl();
 
@@ -125,6 +151,22 @@ namespace GUI.Types.GLViewers
                 particleSceneNode?.Restart();
             };
 
+            pauseButton = new ThemedButton
+            {
+                Text = "Pause",
+                AutoSize = true,
+            };
+            pauseButton.Click += (_, _) =>
+            {
+                if (particleSceneNode == null)
+                {
+                    return;
+                }
+
+                particleSceneNode.IsPaused = !particleSceneNode.IsPaused;
+                pauseButton.Text = particleSceneNode.IsPaused ? "Resume" : "Pause";
+            };
+
             endCapButton = new ThemedButton
             {
                 Text = "Play Endcap",
@@ -138,10 +180,45 @@ namespace GUI.Types.GLViewers
 
             using (UiControl.BeginGroup("Playback"))
             {
+                var playbackModeComboBox = UiControl.AddSelection("Mode", (_, i) =>
+                {
+                    if (i < 0 || particleSceneNode == null)
+                    {
+                        return;
+                    }
+
+                    using var lockedGl = MakeCurrent();
+                    particleSceneNode.PlaybackMode = (ParticlePlaybackMode)i;
+                    particleSceneNode.Restart();
+                }, horizontal: true, fill: true);
+                playbackModeComboBox.Items.AddRange(["Normal", "Normal + Endcap", "Endcap Only"]);
+                playbackModeComboBox.SelectedIndex = (int)ParticlePlaybackMode.Normal;
+
+                UiControl.AddCheckBox("Loop", true, value =>
+                {
+                    if (particleSceneNode == null)
+                    {
+                        return;
+                    }
+
+                    using var lockedGl = MakeCurrent();
+                    particleSceneNode.Loop = value;
+                    particleSceneNode.Restart();
+                });
+
+                UiControl.AddCheckBox("Collide With Floor", false, value =>
+                {
+                    Renderer.EntitySystem.PhysicsWorld.GroundPlane = value ? 0f : null;
+
+                    using var lockedGl = MakeCurrent();
+                    particleSceneNode?.Restart();
+                });
+
                 UiControl.AddControl(restartButton);
+                UiControl.AddControl(pauseButton);
                 UiControl.AddControl(endCapButton);
 
-                slowmodeTrackBar = UiControl.AddTrackBar(value =>
+                slowmodeTrackBar = UiControl.AddTrackBar("Speed", value =>
                 {
                     particleSceneNode?.FrametimeMultiplier = value;
                 }, particleSceneNode?.FrametimeMultiplier ?? 1f);
@@ -149,7 +226,7 @@ namespace GUI.Types.GLViewers
 
             using (UiControl.BeginGroup("Display"))
             {
-                UiControl.AddCheckBox("Show Render Bounds", ShowRenderBounds, value => SelectedNodeRenderer.SelectNode(value ? particleSceneNode : null));
+                UiControl.AddCheckBox("Show Render Bounds", false, value => Selection.Select(value ? particleSceneNode : null));
 
                 // Only when the snapshot stores no radius, in which case the preview invents a size.
                 if (particleSnapshot != null && SnapshotParticleSystem.UsesConstantScreenSize(particleSnapshot))
@@ -171,25 +248,38 @@ namespace GUI.Types.GLViewers
         {
             Debug.Assert(UiControl != null);
 
-            var unsupportedColor = Color.FromArgb(224, 80, 80);
+            var lists = functionLists ?? particleSystem.GetUpgradeTrace();
 
-            // Order matches the CS2 particle editor (PET): pre-emission first, then emit/init/operate,
-            // forces, constraints, and renderers last.
-            AddFunctionGroup("Pre-Emission Operators", particleSystem.GetPreEmissionOperators(), ParticleSupportInfo.IsPreEmissionOperatorSupported, unsupportedColor);
-            AddFunctionGroup("Emitters", particleSystem.GetEmitters(), ParticleSupportInfo.IsEmitterSupported, unsupportedColor);
-            AddFunctionGroup("Initializers", particleSystem.GetInitializers(), ParticleSupportInfo.IsInitializerSupported, unsupportedColor);
-            AddFunctionGroup("Operators", particleSystem.GetOperators(), ParticleSupportInfo.IsOperatorSupported, unsupportedColor);
-            AddFunctionGroup("Force Generators", particleSystem.GetForceGenerators(), ParticleSupportInfo.IsForceGeneratorSupported, unsupportedColor);
-            AddFunctionGroup("Constraints", particleSystem.GetConstraints(), ParticleSupportInfo.IsConstraintSupported, unsupportedColor);
-            AddFunctionGroup("Renderers", particleSystem.GetRenderers(), ParticleSupportInfo.IsRendererSupported, unsupportedColor);
+            foreach (var (title, listName, isSupported) in FunctionGroups)
+            {
+                AddFunctionGroup(title, lists[listName], isSupported);
+            }
+
+            AddChildList();
         }
 
-        private void AddFunctionGroup(string groupName, IEnumerable<KVObject> functions, Func<string, bool> isSupported, Color unsupportedColor)
+        private void AddChildList()
         {
             Debug.Assert(UiControl != null);
 
-            var functionList = functions.ToList();
-            if (functionList.Count == 0)
+            var upgradedData = particleSystem.GetUpgradedData();
+            var children = new List<ChildSystemItem>();
+
+            foreach (var childInfo in upgradedData.GetArray("m_Children") ?? [])
+            {
+                var childRef = childInfo.GetStringProperty("m_ChildRef");
+
+                if (string.IsNullOrEmpty(childRef))
+                {
+                    continue;
+                }
+
+                var disabled = !particleSystem.IsChildEnabled(childInfo);
+                var shortName = Path.GetFileNameWithoutExtension(childRef);
+                children.Add(new ChildSystemItem(disabled ? $"{shortName} (disabled)" : shortName, childRef, disabled));
+            }
+
+            if (children.Count == 0)
             {
                 return;
             }
@@ -201,13 +291,102 @@ namespace GUI.Types.GLViewers
                 BorderStyle = BorderStyle.None,
                 SelectionMode = SelectionMode.None,
                 IntegralHeight = false,
+                Cursor = Cursors.Hand,
             };
 
-            foreach (var function in functionList)
+            listBox.Items.AddRange([.. children]);
+
+            var darkMode = Application.IsDarkModeEnabled;
+            var linkColor = darkMode ? LinkColorDark : LinkColorLight;
+            var disabledLinkColor = darkMode ? DisabledLinkColorDark : DisabledLinkColorLight;
+            Font? linkFont = null;
+
+            listBox.DrawItem += (_, e) =>
             {
-                var className = function.GetStringProperty("_class");
-                var displayName = StripClassPrefix(className);
-                listBox.Items.Add(new ParticleFunctionItem(displayName, isSupported(className)));
+                if (e.Index < 0)
+                {
+                    return;
+                }
+
+                using var brush = new SolidBrush(listBox.BackColor);
+                e.Graphics.FillRectangle(brush, e.Bounds);
+
+                linkFont ??= new Font(e.Font!, FontStyle.Underline);
+
+                var item = (ChildSystemItem)listBox.Items[e.Index];
+                var color = item.Disabled ? disabledLinkColor : linkColor;
+
+                System.Windows.Forms.TextRenderer.DrawText(e.Graphics, item.Text, linkFont, e.Bounds, color, TextFormatFlags.Left | TextFormatFlags.VerticalCenter);
+            };
+
+            listBox.Disposed += (_, _) => linkFont?.Dispose();
+
+            listBox.MouseClick += (_, e) =>
+            {
+                if (e.Button != MouseButtons.Left)
+                {
+                    return;
+                }
+
+                var index = listBox.IndexFromPoint(e.Location);
+
+                if (index >= 0)
+                {
+                    Viewers.Resource.OpenExternalReference(GuiContext, ((ChildSystemItem)listBox.Items[index]).ChildRef);
+                }
+            };
+
+            Themer.ThemeControl(listBox);
+
+            listBox.Height = listBox.ItemHeight * children.Count + 2;
+
+            using (UiControl.BeginGroup("Children"))
+            {
+                UiControl.AddControl(listBox);
+            }
+        }
+
+        private void AddFunctionGroup(string groupName, IReadOnlyList<ParticleUpgradeTrace.TracedFunction> functions, Func<string, bool> isSupported)
+        {
+            Debug.Assert(UiControl != null);
+
+            if (functions.Count == 0)
+            {
+                return;
+            }
+
+            using (UiControl.BeginGroup(groupName))
+            {
+                UiControl.AddControl(BuildFunctionList(functions, isSupported));
+            }
+        }
+
+        private static ListBox BuildFunctionList(IReadOnlyList<ParticleUpgradeTrace.TracedFunction> functions, Func<string, bool> isSupported)
+        {
+            var listBox = new ListBox
+            {
+                Dock = DockStyle.Fill,
+                DrawMode = DrawMode.OwnerDrawFixed,
+                BorderStyle = BorderStyle.None,
+                SelectionMode = SelectionMode.None,
+                IntegralHeight = false,
+            };
+
+            foreach (var function in functions)
+            {
+                var displayName = StripClassPrefix(function.Class);
+                var support = GetFunctionSupport(function, isSupported);
+
+                if (support == FunctionSupport.Removed)
+                {
+                    displayName = $"{displayName} (removed by upgrade)";
+                }
+                else if (function.OriginalClass != null)
+                {
+                    displayName = $"{displayName} (was {StripClassPrefix(function.OriginalClass)})";
+                }
+
+                listBox.Items.Add(new ParticleFunctionItem(displayName, support));
             }
 
             listBox.DrawItem += (_, e) =>
@@ -221,19 +400,21 @@ namespace GUI.Types.GLViewers
                 e.Graphics.FillRectangle(brush, e.Bounds);
 
                 var item = (ParticleFunctionItem)listBox.Items[e.Index];
-                var color = item.IsSupported ? listBox.ForeColor : unsupportedColor;
+                var color = item.Support switch
+                {
+                    FunctionSupport.Unsupported => UnsupportedColor,
+                    FunctionSupport.Removed => RemovedColor,
+                    _ => listBox.ForeColor,
+                };
 
-                System.Windows.Forms.TextRenderer.DrawText(e.Graphics, item.ClassName, e.Font, e.Bounds, color, TextFormatFlags.Left | TextFormatFlags.VerticalCenter);
+                System.Windows.Forms.TextRenderer.DrawText(e.Graphics, item.Text, e.Font, e.Bounds, color, TextFormatFlags.Left | TextFormatFlags.VerticalCenter);
             };
 
             Themer.ThemeControl(listBox);
 
-            listBox.Height = listBox.ItemHeight * functionList.Count + 2;
+            listBox.Height = listBox.ItemHeight * functions.Count + 2;
 
-            using (UiControl.BeginGroup(groupName))
-            {
-                UiControl.AddControl(listBox);
-            }
+            return listBox;
         }
 
         private static string StripClassPrefix(string className)
@@ -251,11 +432,33 @@ namespace GUI.Types.GLViewers
             return className;
         }
 
-        private sealed record ParticleFunctionItem(string ClassName, bool IsSupported);
-
-        protected override void OnPicked(object? sender, PickingTexture.PickingResponse pixelInfo)
+        /// <summary>Whether the viewer runs a particle function, or the format upgrade removed it.</summary>
+        /// <param name="function">The function as the upgrade left it.</param>
+        /// <param name="isSupported">Whether the viewer implements a class of the function's group.</param>
+        internal static FunctionSupport GetFunctionSupport(ParticleUpgradeTrace.TracedFunction function, Func<string, bool> isSupported)
         {
-            //
+            if (function.RemovedByUpgrade)
+            {
+                return FunctionSupport.Removed;
+            }
+
+            if (isSupported(function.Class))
+            {
+                return FunctionSupport.Supported;
+            }
+
+            return FunctionSupport.Unsupported;
         }
+
+        internal enum FunctionSupport
+        {
+            Supported,
+            Unsupported,
+            Removed,
+        }
+
+        private sealed record ParticleFunctionItem(string Text, FunctionSupport Support);
+
+        private sealed record ChildSystemItem(string Text, string ChildRef, bool Disabled);
     }
 }

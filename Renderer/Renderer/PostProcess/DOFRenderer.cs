@@ -110,7 +110,7 @@ public class DOFRenderer
             DOF = RendererContext.ShaderLoader.LoadShader("dof2");
             BlurredResult = Framebuffer.Prepare("Depth Of Field", 2, 2, 0, PostProcessRenderer.DefaultColorFormat, null);
             BlurredResult.Initialize();
-            BlurredResult.SetColorSamplerState(TextureMinFilter.Linear, TextureMagFilter.Linear, TextureWrapMode.ClampToEdge);
+            BlurredResult.SetColorSamplerState(TextureMinFilter.Linear, TextureMagFilter.Linear, RsTextureAddressMode.Clamp);
         }
 
         Debug.Assert(DOF != null);
@@ -220,7 +220,7 @@ public class DOFRenderer
             sample++;
         }
 
-        DOF.SetUniform4Array("g_vSampleOffsetsRadMinMax", Offsets.Length, Offsets);
+        DOF.SetUniform4Array("g_vSampleOffsetsRadMinMax", sample, Offsets);
         DOF.SetUniform("g_nSamples", sample);
     }
 }

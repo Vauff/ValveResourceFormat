@@ -12,6 +12,7 @@ namespace ValveResourceFormat.ResourceTypes
     /// <summary>
     /// Represents a mesh resource containing geometry and vertex buffer data.
     /// </summary>
+    /// <seealso href="https://s2v.app/SchemaExplorer/cs2/modellib/CRenderMesh">CRenderMesh</seealso>
     public class Mesh : KeyValuesOrNTRO
     {
         /// <summary>
@@ -23,6 +24,7 @@ namespace ValveResourceFormat.ResourceTypes
             {
                 //new format has VBIB block, for old format we can get it from NTRO DATA block
                 cachedVBIB ??= (VBIB?)Resource.GetBlockByType(BlockType.VBIB) ?? new VBIB(Resource, Data) { Resource = Resource };
+                cachedVBIB.EnsureRead();
                 return cachedVBIB;
             }
             set
@@ -51,7 +53,44 @@ namespace ValveResourceFormat.ResourceTypes
         /// </summary>
         public Morph? MorphData { get; set; }
 
+        private int? cachedBoneWeightCount;
+
+        /// <summary>
+        /// Gets how many bone weights each vertex carries, or zero when the mesh is not skinned.
+        /// </summary>
+        /// <remarks>
+        /// Read off the vertex buffers rather than the skeleton's own <c>m_nBoneWeightCount</c>. A buffer
+        /// with blend indices but no weights is skinned to one bone per vertex.
+        /// </remarks>
+        public int BoneWeightCount => cachedBoneWeightCount ??= ReadBoneWeightCount();
+
+        private int ReadBoneWeightCount()
+        {
+            var declared = Data.GetSubCollection("m_skeleton")?.GetInt32Property("m_nBoneWeightCount") ?? 0;
+
+            if (declared == 0)
+            {
+                return 0;
+            }
+
+            foreach (var buffer in VBIB.VertexBuffers)
+            {
+                foreach (var field in buffer.InputLayoutFields)
+                {
+                    if (field.SemanticName == "BLENDINDICES")
+                    {
+                        return declared;
+                    }
+                }
+            }
+
+            return 0;
+        }
+
         private VBIB? cachedVBIB { get; set; }
+
+        /// <summary>Drops the decoded vertex and index buffer data.</summary>
+        public void ReleaseVBIB() => cachedVBIB?.Release();
 
         /// <summary>
         /// Gets the attachments associated with this mesh.
@@ -78,18 +117,19 @@ namespace ValveResourceFormat.ResourceTypes
 
             Name = Resource.FileName ?? string.Empty;
 
-            if (Data.ContainsKey("m_attachments"))
+            var attachmentsData = Data.GetArray("m_attachments");
+            if (attachmentsData != null)
             {
-                var attachmentsData = Data.GetArray("m_attachments");
                 for (var i = 0; i < attachmentsData.Count; i++)
                 {
                     var attachment = new Attachment(attachmentsData[i]);
                     Attachments.Add(attachment.Name, attachment);
                 }
             }
-            if (Data.ContainsKey("m_hitboxsets"))
+
+            var hitboxSetsData = Data.GetArray("m_hitboxsets");
+            if (hitboxSetsData != null)
             {
-                var hitboxSetsData = Data.GetArray("m_hitboxsets");
                 for (var i = 0; i < hitboxSetsData.Count; i++)
                 {
                     var hitboxSet = hitboxSetsData[i].GetSubCollection("value") ?? hitboxSetsData[i];
@@ -123,12 +163,8 @@ namespace ValveResourceFormat.ResourceTypes
                 var localMin = sceneObjects[i].GetSubCollection("m_vMinBounds").ToVector3();
                 var localMax = sceneObjects[i].GetSubCollection("m_vMaxBounds").ToVector3();
 
-                minBounds.X = Math.Min(minBounds.X, localMin.X);
-                minBounds.Y = Math.Min(minBounds.Y, localMin.Y);
-                minBounds.Z = Math.Min(minBounds.Z, localMin.Z);
-                maxBounds.X = Math.Max(maxBounds.X, localMax.X);
-                maxBounds.Y = Math.Max(maxBounds.Y, localMax.Y);
-                maxBounds.Z = Math.Max(maxBounds.Z, localMax.Z);
+                minBounds = Vector3.Min(minBounds, localMin);
+                maxBounds = Vector3.Max(maxBounds, localMax);
             }
 
             MinBounds = minBounds;
@@ -154,7 +190,7 @@ namespace ValveResourceFormat.ResourceTypes
 
             if (flags.ValueType == KVValueType.String)
             {
-                return ((string)flags).Contains("MESH_DRAW_FLAGS_USE_COMPRESSED_NORMAL_TANGENT", StringComparison.InvariantCulture);
+                return ((string)flags).Contains("MESH_DRAW_FLAGS_USE_COMPRESSED_NORMAL_TANGENT", StringComparison.Ordinal);
             }
 
             return ((RenderMeshDrawPrimitiveFlags)(int)flags & RenderMeshDrawPrimitiveFlags.UseCompressedNormalTangent) != 0;
@@ -166,8 +202,7 @@ namespace ValveResourceFormat.ResourceTypes
         /// <param name="drawCall">The draw call data.</param>
         /// <returns>True if baked lighting from lightmap is present.</returns>
         public static bool HasBakedLightingFromLightMap(KVObject drawCall)
-            => drawCall.ContainsKey("m_bHasBakedLightingFromLightMap")
-                && drawCall.GetBooleanProperty("m_bHasBakedLightingFromLightMap");
+            => drawCall.GetBooleanProperty("m_bHasBakedLightingFromLightMap");
 
         /// <summary>
         /// Determines if the draw call has baked lighting from vertex stream.
@@ -175,8 +210,7 @@ namespace ValveResourceFormat.ResourceTypes
         /// <param name="drawCall">The draw call data.</param>
         /// <returns>True if baked lighting from vertex stream is present.</returns>
         public static bool HasBakedLightingFromVertexStream(KVObject drawCall)
-            => drawCall.ContainsKey("m_bHasBakedLightingFromVertexStream")
-                && drawCall.GetBooleanProperty("m_bHasBakedLightingFromVertexStream");
+            => drawCall.GetBooleanProperty("m_bHasBakedLightingFromVertexStream");
 
         /// <summary>
         /// Determines if the draw call is an occluder.
@@ -184,8 +218,18 @@ namespace ValveResourceFormat.ResourceTypes
         /// <param name="drawCall">The draw call data.</param>
         /// <returns>True if the draw call is an occluder.</returns>
         public static bool IsOccluder(KVObject drawCall)
-            => drawCall.ContainsKey("m_bIsOccluder")
-                && drawCall.GetBooleanProperty("m_bIsOccluder");
+            => drawCall.GetBooleanProperty("m_bIsOccluder");
+
+        /// <summary>
+        /// Gets the material a draw call renders with, or <see langword="null"/> when it names none.
+        /// </summary>
+        /// <param name="drawCall">The draw call to read.</param>
+        public static string? GetMaterialName(KVObject drawCall)
+        {
+            ArgumentNullException.ThrowIfNull(drawCall);
+
+            return drawCall.GetStringProperty("m_material") ?? drawCall.GetStringProperty("m_pMaterial");
+        }
 
         /// <summary>
         /// Loads external morph data from the file loader.
@@ -201,21 +245,13 @@ namespace ValveResourceFormat.ResourceTypes
                     var morphSetResource = fileLoader.LoadFileCompiled(morphSetPath);
                     if (morphSetResource != null)
                     {
-                        MorphData = morphSetResource.GetBlockByType(BlockType.MRPH) as Morph;
+                        // A standalone vmorf_c keeps the morph set in its DATA block, an embedded one in MRPH.
+                        MorphData = (morphSetResource.GetBlockByType(BlockType.MRPH) ?? morphSetResource.DataBlock) as Morph;
                     }
                 }
             }
 
-            if (MorphData != null)
-            {
-                MorphData.LoadFlexData(fileLoader);
-
-                //If texture was not loaded, that means that this model doesn't have any valid morph data.
-                if (MorphData.TextureResource == null)
-                {
-                    MorphData = null;
-                }
-            }
+            MorphData?.LoadFlexData(fileLoader);
         }
     }
 }

@@ -15,33 +15,31 @@ namespace ValveResourceFormat.Renderer
         /// <summary>Gets the OpenGL handles for each uploaded index buffer.</summary>
         public int[] IndexBuffers { get; private set; }
 
+        /// <summary>Gets the VBIB of the uploaded buffers.</summary>
+        public VBIB Layout { get; }
+
         /// <summary>Uploads all vertex and index buffers from the provided <see cref="VBIB"/> to the GPU.</summary>
         /// <param name="vbib">Source vertex and index buffer data.</param>
         /// <param name="name">Mesh name used to label the buffers.</param>
         public GPUMeshBuffers(VBIB vbib, string name)
         {
+            Layout = new VBIB { Resource = vbib.Resource };
             VertexBuffers = new int[vbib.VertexBuffers.Count];
-            GL.CreateBuffers(vbib.VertexBuffers.Count, VertexBuffers);
 
             for (var i = 0; i < vbib.VertexBuffers.Count; i++)
             {
-#if DEBUG
-                var label = $"{name} VB {i}";
-                GL.ObjectLabel(ObjectLabelIdentifier.Buffer, VertexBuffers[i], Math.Min(GLEnvironment.MaxLabelLength, label.Length), label);
-#endif
-                GL.NamedBufferData(VertexBuffers[i], (IntPtr)vbib.VertexBuffers[i].TotalSizeInBytes, vbib.VertexBuffers[i].Data, BufferUsageHint.StaticDraw);
+                var buffer = vbib.VertexBuffers[i];
+                VertexBuffers[i] = GraphicsDevice.CreateBuffer($"{name} VB {i}", buffer.Data.AsSpan(0, (int)buffer.TotalSizeInBytes), BufferUsage.Static);
+                Layout.VertexBuffers.Add(buffer with { Data = [] });
             }
 
             IndexBuffers = new int[vbib.IndexBuffers.Count];
-            GL.CreateBuffers(vbib.IndexBuffers.Count, IndexBuffers);
 
             for (var i = 0; i < vbib.IndexBuffers.Count; i++)
             {
-#if DEBUG
-                var label = $"{name} IB {i}";
-                GL.ObjectLabel(ObjectLabelIdentifier.Buffer, IndexBuffers[i], Math.Min(GLEnvironment.MaxLabelLength, label.Length), label);
-#endif
-                GL.NamedBufferData(IndexBuffers[i], (IntPtr)vbib.IndexBuffers[i].TotalSizeInBytes, vbib.IndexBuffers[i].Data, BufferUsageHint.StaticDraw);
+                var buffer = vbib.IndexBuffers[i];
+                IndexBuffers[i] = GraphicsDevice.CreateBuffer($"{name} IB {i}", buffer.Data.AsSpan(0, (int)buffer.TotalSizeInBytes), BufferUsage.Static);
+                Layout.IndexBuffers.Add(buffer with { Data = [] });
             }
         }
 

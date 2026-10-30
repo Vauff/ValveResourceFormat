@@ -4,7 +4,6 @@ using System.Reflection;
 using System.Runtime.InteropServices;
 using OpenTK.Graphics.OpenGL;
 using ValveResourceFormat.Blocks;
-using ValveResourceFormat.ResourceTypes;
 using ValveResourceFormat.ResourceTypes.GenericData.CS2;
 using ValveResourceFormat.Serialization.KeyValues;
 
@@ -64,7 +63,7 @@ public class CS2BombDamageSceneNode : SceneNode
     /// <param name="bombsiteLabel">Display label for the bombsite ("A", "B", or a per-site index when unresolved).</param>
     public CS2BombDamageSceneNode(Scene scene, BombDamage bombDamageData, int bombsiteIndex, RenderTexture renderTexture, string bombsiteLabel) : base(scene)
     {
-        var shader = Scene.RendererContext.ShaderLoader.LoadShader("cs2_baked_bomb_damage");
+        var shader = Scene.RendererContext.ShaderLoader.LoadShader("cs2_baked_bomb_damage.vfx");
         meshName = $"{bombDamageData.Resource.FileName}:site{bombsiteIndex}";
 
         material = new RenderMaterial(shader);
@@ -90,8 +89,8 @@ public class CS2BombDamageSceneNode : SceneNode
         Debug.Assert(stream != null);
         resource.Read(stream);
 
-        var renderTexture = scene.RendererContext.MaterialLoader.LoadTexture(resource, srgbRead: true, isViewerRequest: true);
-        renderTexture.SetWrapMode(TextureWrapMode.ClampToEdge);
+        var renderTexture = scene.RendererContext.MaterialLoader.LoadTexture(resource, srgbRead: true);
+        renderTexture.SetWrapMode(RsTextureAddressMode.Clamp);
         return renderTexture;
     }
 
@@ -199,7 +198,6 @@ public class CS2BombDamageSceneNode : SceneNode
         renderShader.Use();
         VertexArray.Bind(vao, renderShader);
         material.Render(renderShader);
-        renderShader.SetUniform3x4("transform", Matrix4x4.Identity);
 
         GL.DrawElementsInstancedBaseInstance(PrimitiveType.Triangles, indicesCount, DrawElementsType.UnsignedInt, 0, 1, Id);
 
@@ -242,8 +240,7 @@ public class CS2BombDamageSceneNode : SceneNode
                 .Select(GetBombsiteDesignation)
                 .Distinct()
                 .ToList();
-            // Fall back to a per-site index when unresolved (e.g. standalone viewer has no
-            // entities) so each site still gets a distinct scene layer.
+            // Fall back to a per-site index when unresolved (e.g. standalone viewer has no entities) so each site gets its own layer.
             var label = designations.Count == 1 ? designations[0] : $"#{i + 1}";
 
             var sceneNode = new CS2BombDamageSceneNode(scene, bombDamageData, i, arrowTexture, label);

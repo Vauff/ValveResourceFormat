@@ -32,6 +32,16 @@ public abstract class SoundEvent
     /// <summary>Gets whether the event is active in the mixer (it may be momentarily silent, e.g. between retriggers).</summary>
     public bool Started { get; private set; }
 
+    /// <summary>Gets the id of the play this pooled instance currently represents, so a <see cref="SoundHandle"/> can tell its own play from a later reuse.</summary>
+    public long PlaybackId { get; internal set; }
+
+    /// <summary>Gets or sets a live 0..1 gain on top of the volume the play started with, unlike <see cref="VolumeOverride"/> which is folded in at start.</summary>
+    public float LiveVolume
+    {
+        get => SampleProvider.LiveVolume;
+        set => SampleProvider.LiveVolume = value;
+    }
+
     /// <summary>
     /// Gets or sets the world position of the sound. Null plays the sound without spatialization (e.g. UI or first person sounds).
     /// Can be updated while the sound is playing to move it.
@@ -48,9 +58,8 @@ public abstract class SoundEvent
     public float? VolumeOverride { get; set; }
 
     /// <summary>
-    /// Gets or sets an extra multiplier applied on top of whatever volume this event ends up playing at,
-    /// including a <see cref="VolumeOverride"/>. Carries a scripted soundscape's "playsoundscape" volume,
-    /// which scales everything the soundscape it pulls in plays, and so cascades to child events.
+    /// Gets or sets an extra multiplier applied on top of the final volume, including a <see cref="VolumeOverride"/>.
+    /// Carries a scripted soundscape's "playsoundscape" volume, cascading to every child event it pulls in.
     /// </summary>
     public float VolumeScale { get; set; } = 1f;
 
@@ -109,6 +118,8 @@ public abstract class SoundEvent
     private SampleProvider3D? spatializedTrackSource;
     private SoundEvent?[]? children;
 
+    private volatile bool finishedPending;
+
     /// <summary>Gets the random source for randomized event properties (track picking, volume/pitch jitter, retrigger intervals).</summary>
     private protected SoundRandom Random => Mixer.Player.Random;
 
@@ -131,7 +142,7 @@ public abstract class SoundEvent
 
         // Start() fills the providers in, no point seeding them here
         SampleProvider = new SampleProviderMulti();
-        SampleProvider.OnOver += OnFinished;
+        SampleProvider.OnOver += () => finishedPending = true;
     }
 
     /// <summary>
@@ -145,6 +156,7 @@ public abstract class SoundEvent
     /// </returns>
     public bool Start()
     {
+        finishedPending = false;
         SampleProviders.Clear();
         ChildSoundEvents.Clear();
         SampleProvider.ClearProviders();
@@ -235,7 +247,7 @@ public abstract class SoundEvent
             return false;
         }
 
-        var retriggerAt = float.Lerp(interval.Min, interval.Max, Random.NextSingle()) * intervalScale;
+        var retriggerAt = MathUtils.Lerp(interval.Min, interval.Max, Random.NextSingle()) * intervalScale;
         retriggerTimestamp = Stopwatch.GetTimestamp() + (long)(retriggerAt * Stopwatch.Frequency);
         waitingForRetrigger = true;
         return true;
@@ -327,9 +339,8 @@ public abstract class SoundEvent
     }
 
     /// <summary>
-    /// Starts another sound event as a child of this one, mixed into this event's output. Callers may pass
-    /// the same instance again on a later retrigger (e.g. cached by child index) instead of building a new
-    /// one - already-wired instances are recognized and only restarted, not rebuilt.
+    /// Starts a child sound event mixed into this event's output. A retrigger may pass the same instance
+    /// again (e.g. cached by child index), which is restarted rather than rebuilt.
     /// </summary>
     protected void StartAsChild(SoundEvent childSoundEvent)
     {
@@ -436,7 +447,7 @@ public abstract class SoundEvent
 
         if (randomMin != 0f || randomMax != 0f)
         {
-            pitch += float.Lerp(randomMin, randomMax, Random.NextSingle());
+            pitch += MathUtils.Lerp(randomMin, randomMax, Random.NextSingle());
         }
 
         return Math.Clamp(pitch, 0.25f, 4f);
@@ -449,10 +460,10 @@ public abstract class SoundEvent
 
         if (randomMin != 0f || randomMax != 0f)
         {
-            volume += float.Lerp(randomMin, randomMax, Random.NextSingle());
+            volume += MathUtils.Lerp(randomMin, randomMax, Random.NextSingle());
         }
 
-        return Math.Clamp(volume, 0f, 1f) * VolumeScale * Mixer.Player.GetMixGroupVolume(mixGroup);
+        return MathUtils.Saturate(volume) * VolumeScale * Mixer.Player.GetMixGroupVolume(mixGroup);
     }
 
     /// <summary>
@@ -473,10 +484,9 @@ public abstract class SoundEvent
     }
 
     /// <summary>
-    /// Starts (or restarts, on a later retrigger) one child per entry in <paramref name="definitions"/>: builds
-    /// each the first time and reuses the same instance afterwards instead of rebuilding its whole provider
-    /// subtree from scratch every time. Null entries (unresolved definitions) are skipped.
-    /// Call once per <see cref="DoStart"/> when a definition plays a fixed set of child events.
+    /// Starts (or restarts, on a retrigger) one child per entry in <paramref name="definitions"/>, building each
+    /// once and reusing it afterwards instead of rebuilding its provider subtree. Null entries (unresolved
+    /// definitions) are skipped. Call once per <see cref="DoStart"/> for a definition with a fixed set of children.
     /// </summary>
     /// <param name="definitions">The child definitions to start, by index.</param>
     /// <param name="beforeStart">
@@ -530,11 +540,10 @@ public abstract class SoundEvent
     }
 
     /// <summary>
-    /// Pre-builds everything this event would otherwise lazily create on its first start - child
-    /// instances, track providers - and queues background decodes for every vsnd it could pick, so the
-    /// first real play allocates nothing and reads warm samples. Called on pooled idle instances by
-    /// <see cref="SoundEventPlayer.Cache(string)"/> at load/approach time; must not start anything.
-    /// Types override this to warm the parts only they know about; the base does nothing.
+    /// Pre-builds what the first start would otherwise create (child instances, track providers) and queues
+    /// background decodes for every vsnd it could pick, so the first play allocates nothing and reads warm
+    /// samples. Called on idle pooled instances by <see cref="SoundEventPlayer.Cache(string)"/> at load or
+    /// approach time; must not start anything. Types override this to warm their own parts.
     /// </summary>
     /// <param name="depth">Recursion depth, guarding against cyclic child references.</param>
     internal virtual void Prewarm(int depth)
@@ -701,6 +710,12 @@ public abstract class SoundEvent
     /// <summary>Updates spatialization and time-based behavior. Returns whether any sample provider is currently audible.</summary>
     public virtual bool Update(in ListenerState listener)
     {
+        if (finishedPending)
+        {
+            finishedPending = false;
+            OnFinished();
+        }
+
         if (Started && !FadingOut && waitingForRetrigger && Stopwatch.GetTimestamp() >= retriggerTimestamp)
         {
             waitingForRetrigger = false;

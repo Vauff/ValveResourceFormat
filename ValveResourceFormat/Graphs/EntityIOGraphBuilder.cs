@@ -1,7 +1,7 @@
+using System.Globalization;
 using System.Linq;
 using ValveResourceFormat.ResourceTypes;
 using ValveResourceFormat.Serialization.KeyValues;
-using ValveResourceFormat.Utils;
 using Connection = ValveResourceFormat.ResourceTypes.EntityLump.Connection;
 
 namespace ValveResourceFormat.Graphs;
@@ -27,22 +27,13 @@ internal static class EntityIOGraphBuilder
     /// <summary>Wires and sockets linking a point_template to the entities it spawns.</summary>
     public const GraphHue TemplateSpawnHue = GraphHue.Purple;
 
-    // Prefab-instanced entities carry a "[PR#]" targetname prefix, hide it for display.
-    private static string StripTargetnamePrefix(string value)
-    {
-        const string Prefix = "[PR#]";
-        return value.StartsWith(Prefix, StringComparison.Ordinal) ? value[Prefix.Length..] : value;
-    }
-
-    private static GraphHue ClassHue(string classname) => EntityClassHues.For(classname);
-
     private static string? FormatConnectionLabel(Connection connection)
     {
         var parts = new List<string>(3);
 
         if (connection.Delay > 0f)
         {
-            parts.Add($"{connection.Delay:0.##}s");
+            parts.Add(string.Create(CultureInfo.InvariantCulture, $"{connection.Delay:0.##}s"));
         }
 
         if (connection.TimesToFire == 1)
@@ -57,6 +48,11 @@ internal static class EntityIOGraphBuilder
         if (!string.IsNullOrEmpty(connection.OverrideParam) && connection.OverrideParam != "(null)")
         {
             parts.Add($"({connection.OverrideParam})");
+        }
+
+        if (connection.ParamMap is { Count: > 0 })
+        {
+            parts.Add("(mapped params)");
         }
 
         return parts.Count > 0 ? string.Join(" ", parts) : null;
@@ -129,7 +125,6 @@ internal static class EntityIOGraphBuilder
         var annotations = new List<(GraphNode Node, string Text)>();
         var outputSockets = new Dictionary<(GraphNode Node, string Name), GraphSocket>();
         var inputSockets = new Dictionary<(GraphNode Node, string Name), GraphSocket>();
-        var mergedWires = new Dictionary<(GraphSocket From, GraphSocket To), GraphWire>();
 
         GraphNode NodeFor(EntityLump.Entity entity)
         {
@@ -158,11 +153,13 @@ internal static class EntityIOGraphBuilder
                         members = [entity];
                     }
 
+                    var title = EntityLump.ApplyNameFixup(name, string.Empty, string.Empty);
+
                     node = document.AddNode(new GraphNode
                     {
-                        Title = members.Count > 1 ? $"{StripTargetnamePrefix(name)}  ×{members.Count}" : StripTargetnamePrefix(name),
+                        Title = members.Count > 1 ? $"{title}  ×{members.Count}" : title,
                         Subtitle = classname,
-                        Category = ClassHue(classname),
+                        Category = EntityClassHues.For(classname),
                         Tag = entity,
                     });
                     namedNodes[key] = node;
@@ -179,7 +176,7 @@ internal static class EntityIOGraphBuilder
                 {
                     Title = classname,
                     Subtitle = classname,
-                    Category = ClassHue(classname),
+                    Category = EntityClassHues.For(classname),
                     Tag = entity,
                 });
             }
@@ -199,7 +196,7 @@ internal static class EntityIOGraphBuilder
 
                 node = document.AddNode(new GraphNode
                 {
-                    Title = StripTargetnamePrefix(targetName),
+                    Title = EntityLump.ApplyNameFixup(targetName, string.Empty, string.Empty),
                     Subtitle = unresolved ? "unresolved target" : "special target",
                     Category = unresolved ? UnresolvedTargetHue : SpecialTargetHue,
                 });
@@ -253,17 +250,12 @@ internal static class EntityIOGraphBuilder
 
                 foreach (var childEntity in childEntities)
                 {
-                    var input = InputFor(NodeFor(childEntity), "spawned by", TemplateSpawnHue);
-
-                    if (!mergedWires.ContainsKey((output, input)))
-                    {
-                        mergedWires[(output, input)] = document.Connect(output, input, dashed: true);
-                    }
+                    document.ConnectOrMerge(output, InputFor(NodeFor(childEntity), "spawned by", TemplateSpawnHue), dashed: true);
                 }
             }
         }
 
-        if (connections.Count == 0 && mergedWires.Count == 0)
+        if (connections.Count == 0 && document.WireCount == 0)
         {
             var infoNode = document.AddNode(new GraphNode { Title = "No entity I/O", Subtitle = "EntityLump", Category = GraphHue.Neutral });
             infoNode.AddText($"{entities.Count} entities, no connections");
@@ -303,24 +295,13 @@ internal static class EntityIOGraphBuilder
 
             foreach (var targetNode in targetNodes)
             {
-                var input = InputFor(targetNode, connection.InputName, InputHue);
-
-                if (mergedWires.TryGetValue((output, input), out var existing))
-                {
-                    // Same output firing the same input multiple times (e.g. different delays)
-                    if (label != null)
-                    {
-                        existing.Label = existing.Label == null ? label : $"{existing.Label} | {label}";
-                    }
-
-                    continue;
-                }
-
-                mergedWires[(output, input)] = document.Connect(output, input, label: label);
+                document.ConnectOrMerge(output, InputFor(targetNode, connection.InputName, InputHue), label: label);
             }
         }
 
-        foreach (var node in entityNodes.Values.Concat(syntheticNodes.Values))
+        var nodes = entityNodes.Values.Distinct().Concat(syntheticNodes.Values).ToList();
+
+        foreach (var node in nodes)
         {
             node.PairSocketRows();
         }
@@ -331,6 +312,6 @@ internal static class EntityIOGraphBuilder
             node.AddAnnotation(text, SpecialTargetHue);
         }
 
-        progressReporter?.Report($"Created {entityNodes.Count + syntheticNodes.Count} nodes from {connections.Count} connections ({entities.Count} entities).");
+        progressReporter?.Report($"Created {nodes.Count} nodes from {connections.Count} connections ({entities.Count} entities).");
     }
 }

@@ -3,36 +3,9 @@
 #ifndef VRF_LIGHT_CULL_INCLUDE
 #define VRF_LIGHT_CULL_INCLUDE
 
-#include "ViewConstants.slang"
+#include "view_constants.slang"
 
-layout(binding = 6, std140) uniform LightCullConstants
-{
-    uint g_nLightTileBase;
-    uint g_nLightSliceBase;
-    uint g_nLightCullWords;
-    uint g_nLightTileShift;
-
-    uint g_nLightTileCols;
-    uint g_nLightTileRows;
-    uint g_nLightSliceCount;
-    uint g_nEnvMapTileBase;
-
-    uint g_nEnvMapBinBase;
-    uint g_nEnvMapCullWords;
-    uint g_nEnvMapCount;
-    uint _lightCullPadding0;
-
-    vec4 g_vLightDepthSliceParams;
-    vec4 g_vLightCullPixelRemap;
-
-    vec3 g_vLightCullCameraPositionWs;
-    float _lightCullPadding1;
-
-    vec3 g_vLightCullCameraDirWs;
-    float _lightCullPadding2;
-};
-
-layout(std430, binding = 12) readonly buffer LightCullBitsBuffer
+layout(std430, binding = 4) readonly buffer LightCullBitsBuffer
 {
     uint g_CullBits[];
 };
@@ -60,23 +33,36 @@ struct CullLookup_t
 // Set by a pass whose vertices are displaced in clip space
 bool g_bCullFromShadedPosition = false;
 
+// The pixel a world position projects to
+vec2 GetCullPixelFromPosition(vec3 positionWs)
+{
+    vec4 cullClip = g_matWorldToProjection * vec4(positionWs, 1.0);
+    vec2 cullNdc = cullClip.xy / max(cullClip.w, 1e-6);
+
+    return ((cullNdc * 0.5) + 0.5) * g_vViewportSize;
+}
+
 CullLookup_t GetCullLookup(vec3 positionWs)
 {
+#ifdef VRF_VERTEX_STAGE
+    // A vertex has no pixel of its own, so it takes the tile its position projects into
+    vec2 cullPixelVs = GetCullPixelFromPosition(positionWs);
+#else
     vec2 cullPixelVs = gl_FragCoord.xy;
 
     // A pass that displaces the vertex in clip space rasterizes somewhere other than where the world
     // position it shades with projects, so its gl_FragCoord names the wrong tile.
     if (g_bCullFromShadedPosition)
     {
-        vec4 cullClip = g_matWorldToProjection * vec4(positionWs, 1.0);
-        vec2 cullNdc = cullClip.xy / max(cullClip.w, 1e-6);
-        cullPixelVs = ((cullNdc * 0.5) + 0.5) * g_vViewportSize;
+        cullPixelVs = GetCullPixelFromPosition(positionWs);
     }
+#endif
 
-    // Carries the pixel into the view the masks were built for; identity for everything but the viewmodel.
+    // Carries the pixel into the view the masks were built for; identity except for the viewmodel and
+    // passes drawn below the scene resolution.
     vec2 cullPixel = (cullPixelVs * g_vLightCullPixelRemap.xy) + g_vLightCullPixelRemap.zw;
 
-    uvec2 tile = uvec2(clamp(cullPixel, vec2(0.0), g_vViewportSize - 1.0)) >> uvec2(g_nLightTileShift);
+    uvec2 tile = uvec2(max(cullPixel, vec2(0.0))) >> uvec2(g_nLightTileShift);
     tile = min(tile, uvec2(g_nLightTileCols, g_nLightTileRows) - 1u);
 
     CullLookup_t lookup;
@@ -141,6 +127,17 @@ uint GetCullLiveMask(uint word, uint count)
 uint GetEnvMapLiveMask(uint word)
 {
     return GetCullLiveMask(word, g_nEnvMapCount);
+}
+
+CullMasks_t GetLightProbeCullMasks(vec3 positionWs)
+{
+    return MakeCullMasks(GetCullLookupCached(positionWs),
+                         g_nLightProbeTileBase, g_nLightProbeBinBase, g_nLightProbeCullWords);
+}
+
+uint GetLightProbeLiveMask(uint word)
+{
+    return GetCullLiveMask(word, g_nLightProbeCount);
 }
 
 uint GetCullMaskWord(CullMasks_t masks, uint word)

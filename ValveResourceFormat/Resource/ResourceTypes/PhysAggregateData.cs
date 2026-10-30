@@ -1,6 +1,7 @@
 using System.Linq;
 using ValveKeyValue;
 using ValveResourceFormat.ResourceTypes.RubikonPhysics;
+using ValveResourceFormat.ResourceTypes.RubikonPhysics.Softbody;
 using ValveResourceFormat.Serialization.KeyValues;
 
 namespace ValveResourceFormat.ResourceTypes
@@ -32,20 +33,26 @@ namespace ValveResourceFormat.ResourceTypes
             => parts ??= Data.GetArray("m_parts").Select(p => new Part(p)).ToArray();
 
         /// <summary>
+        /// Gets the joints (constraints) between parts in this aggregate.
+        /// </summary>
+        public Joint[] Joints
+            => joints ??= Data.GetArray("m_joints")?.Select(j => new Joint(j)).ToArray() ?? [];
+
+        /// <summary>
         /// Gets the referenced bone names.
         /// </summary>
-        public string[] BoneNames => Data.GetArray<string>("m_boneNames");
+        public string[] BoneNames => boneNames ??= Data.GetArray<string>("m_boneNames");
 
         /// <summary>
         /// Gets the bone parent indices for each part.
         /// </summary>
-        public uint[] BoneParents => Data.GetArray<uint>("m_boneParents");
+        public uint[] BoneParents => boneParents ??= Data.GetArray<uint>("m_boneParents");
 
         /// <summary>
         /// Gets the surface property hashes for collision materials.
         /// </summary>
         public uint[] SurfacePropertyHashes
-            => surfacePropertyHashes ??= Data.GetArray<object>("m_surfacePropertyHashes").Select(Convert.ToUInt32).ToArray();
+            => surfacePropertyHashes ??= Data.GetArray<uint>("m_surfacePropertyHashes");
 
         /// <summary>
         /// Gets the collision attributes.
@@ -53,10 +60,59 @@ namespace ValveResourceFormat.ResourceTypes
         public IReadOnlyList<KVObject> CollisionAttributes
             => collisionAttributes ??= Data.GetArray("m_collisionAttributes");
 
+        /// <summary>
+        /// Gets the embedded cloth (soft body) model (<c>m_pFeModel</c>), or null when the aggregate has none.
+        /// </summary>
+        public FeModel? FeModel
+        {
+            get
+            {
+                if (feModelParsed)
+                {
+                    return feModel;
+                }
+
+                if (Data.GetSubCollection("m_pFeModel") is { } feModelData
+                    && new FeModel(feModelData) is { CtrlName.Length: > 0 } parsed)
+                {
+                    feModel = parsed;
+                }
+
+                feModelParsed = true;
+                return feModel;
+            }
+        }
+
+        /// <summary>
+        /// Gets what a shape with these collision attributes interacts as. Older assets carry the tags
+        /// under <c>m_PhysicsTagStrings</c>.
+        /// </summary>
+        public static string[] GetInteractAsTags(KVObject collisionAttributes)
+        {
+            ArgumentNullException.ThrowIfNull(collisionAttributes);
+
+            return collisionAttributes.GetArray<string>("m_InteractAsStrings")
+                ?? collisionAttributes.GetArray<string>("m_PhysicsTagStrings")
+                ?? [];
+        }
+
+        /// <summary>
+        /// Gets what a shape interacts as, by index into <see cref="CollisionAttributes"/>.
+        /// </summary>
+        public string[] GetInteractAsTags(int collisionAttributeIndex)
+            => collisionAttributeIndex >= 0 && collisionAttributeIndex < CollisionAttributes.Count
+                ? GetInteractAsTags(CollisionAttributes[collisionAttributeIndex])
+                : [];
+
         private Matrix4x4[]? bindPose;
         private Part[]? parts;
+        private string[]? boneNames;
+        private uint[]? boneParents;
+        private Joint[]? joints;
         private uint[]? surfacePropertyHashes;
         private IReadOnlyList<KVObject>? collisionAttributes;
+        private FeModel? feModel;
+        private bool feModelParsed;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="PhysAggregateData"/> class.

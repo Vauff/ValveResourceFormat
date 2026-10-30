@@ -37,16 +37,16 @@ namespace ValveResourceFormat.Renderer.SceneEnvironment
         /// <summary>Gets the toe denominator of the tonemapping curve.</summary>
         public float ToeDenom { get; init; }
 
-        /// <summary>Gets the white point value; passed through the tonemapper before GPU upload.</summary>
-        public float WhitePoint { get; init; } // This is run through the tonemapper before being given to the shader
+        /// <summary>Gets the white point in stops, the scene value that displays as white being two to its power.</summary>
+        public float WhitePoint { get; init; }
 
         /// <summary>
         /// The scale the shader applies to the exposed scene before the curve.
         /// </summary>
         public const float PreTonemapScale = 2.8f;
 
-        /// <summary>Gets the white point the curve is actually normalized against: <see cref="WhitePoint"/> scaled by <see cref="PreTonemapScale"/>.</summary>
-        public readonly float EffectiveWhitePoint => WhitePoint * PreTonemapScale;
+        /// <summary>Gets the white point the curve clamps to and is normalized against: two to the power of <see cref="WhitePoint"/>.</summary>
+        public readonly float EffectiveWhitePoint => MathF.Pow(2f, WhitePoint);
         // The following params aren't used, I think?
         /*float LuminanceSource; // CS2
         float ExposureBiasShadows; // CS2
@@ -70,33 +70,33 @@ namespace ValveResourceFormat.Renderer.SceneEnvironment
             WhitePoint = 4.0f;
         }
 
-        /// <summary>Returns a <see cref="TonemapSettings"/> intended for linear (non-filmic) tonemapping. Note: <see cref="ApplyTonemapping"/> returns a constant 0 with these values, so they are not a true passthrough curve.</summary>
+        /// <summary>The nearly linear curve the game uses where no post processing gives one, when its game sets it to.</summary>
         public static TonemapSettings Linear()
         {
             return new TonemapSettings()
             {
                 ExposureBias = 0.0f,
                 ShoulderStrength = 0.0f,
-                LinearStrength = 0.0f,
-                LinearAngle = 0.0f,
+                LinearStrength = 0.001f,
+                LinearAngle = 0.001f,
                 ToeStrength = 1.0f,
                 ToeNum = 1.0f,
                 ToeDenom = 1.0f,
-                WhitePoint = 2.83f,
+                WhitePoint = 1.5f,
             };
         }
         /// <summary>Initializes a new <see cref="TonemapSettings"/> by reading values from a KV object.</summary>
         /// <param name="tonemapParams">The KV object containing tonemapping parameters.</param>
         public TonemapSettings(KVObject tonemapParams)
         {
-            ExposureBias = (float)tonemapParams.GetDoubleProperty("m_flExposureBias");
-            ShoulderStrength = (float)tonemapParams.GetDoubleProperty("m_flShoulderStrength");
-            LinearStrength = (float)tonemapParams.GetDoubleProperty("m_flLinearStrength");
-            LinearAngle = (float)tonemapParams.GetDoubleProperty("m_flLinearAngle");
-            ToeStrength = (float)tonemapParams.GetDoubleProperty("m_flToeStrength");
-            ToeNum = (float)tonemapParams.GetDoubleProperty("m_flToeNum");
-            ToeDenom = (float)tonemapParams.GetDoubleProperty("m_flToeDenom");
-            WhitePoint = (float)tonemapParams.GetDoubleProperty("m_flWhitePoint");
+            ExposureBias = tonemapParams.GetFloatProperty("m_flExposureBias");
+            ShoulderStrength = tonemapParams.GetFloatProperty("m_flShoulderStrength");
+            LinearStrength = tonemapParams.GetFloatProperty("m_flLinearStrength");
+            LinearAngle = tonemapParams.GetFloatProperty("m_flLinearAngle");
+            ToeStrength = tonemapParams.GetFloatProperty("m_flToeStrength");
+            ToeNum = tonemapParams.GetFloatProperty("m_flToeNum");
+            ToeDenom = tonemapParams.GetFloatProperty("m_flToeDenom");
+            WhitePoint = tonemapParams.GetFloatProperty("m_flWhitePoint");
         }
         /// <summary>Linearly interpolates between two <see cref="TonemapSettings"/> by a given weight.</summary>
         /// <param name="weight">Blend factor in the range [0, 1]; 0 returns <paramref name="TonemapSettings1"/>, 1 returns <paramref name="TonemapSettings2"/>.</param>
@@ -125,68 +125,6 @@ namespace ValveResourceFormat.Renderer.SceneEnvironment
             var num = inputValue * (inputValue * ShoulderStrength + (LinearAngle * LinearStrength)) + (ToeStrength * ToeNum);
             var denom = inputValue * (inputValue * ShoulderStrength + LinearStrength) + (ToeStrength * ToeDenom);
             return (num / denom) - (ToeNum / ToeDenom);
-        }
-
-        /// <summary>
-        /// Runs the full tonemap the shader performs: the pre-curve scale and clamp, the curve, and the
-        /// white point normalization.
-        /// </summary>
-        /// <param name="sceneValue">The exposed linear scene value.</param>
-        /// <returns>The displayed value, in the 0-1 range before the sRGB encode.</returns>
-        public readonly float Display(float sceneValue)
-        {
-            var effectiveWhitePoint = EffectiveWhitePoint;
-            var curveInput = MathF.Min(sceneValue * PreTonemapScale, effectiveWhitePoint);
-
-            return ApplyTonemapping(curveInput) / ApplyTonemapping(effectiveWhitePoint);
-        }
-
-        /// <summary>
-        /// Inverts <see cref="Display"/>: the exposed scene value that displays as <paramref name="displayValue"/>.
-        /// </summary>
-        /// <param name="displayValue">The desired displayed value, in the 0-1 range the shader outputs.</param>
-        /// <returns>
-        /// The exposed linear scene value that displays as <paramref name="displayValue"/>,
-        /// or <see cref="float.NaN"/> if this curve cannot be inverted.
-        /// </returns>
-        public readonly float InvertTonemapping(float displayValue)
-        {
-            // Solving ApplyTonemapping(x) = displayValue * ApplyTonemapping(EffectiveWhitePoint) for x, after
-            // clearing the curve's denominator, leaves a quadratic in x with these coefficients. g is the
-            // curve's numerator/denominator ratio before the ToeNum/ToeDenom shift. x is the curve input,
-            // so the result is divided by the pre-curve scale to land back in scene space.
-            var g = (displayValue * ApplyTonemapping(EffectiveWhitePoint)) + (ToeNum / ToeDenom);
-
-            var a = ShoulderStrength * (1f - g);
-            var b = LinearStrength * (LinearAngle - g);
-            var c = ToeStrength * (ToeNum - (g * ToeDenom));
-
-            float result;
-
-            if (a == 0f)
-            {
-                // No shoulder, so the curve is a straight line.
-                result = -c / b;
-            }
-            else
-            {
-                var discriminant = (b * b) - (4f * a * c);
-
-                if (discriminant < 0f)
-                {
-                    return float.NaN;
-                }
-
-                var root = MathF.Sqrt(discriminant);
-                result = (-b + root) / (2f * a);
-
-                if (result <= 0f)
-                {
-                    result = (-b - root) / (2f * a);
-                }
-            }
-
-            return (float.IsFinite(result) && result > 0f) ? result / PreTonemapScale : float.NaN;
         }
     }
 
@@ -223,7 +161,7 @@ namespace ValveResourceFormat.Renderer.SceneEnvironment
             ExposureMin = 0.25f;
             ExposureMax = 8.0f;
             ExposureSpeedUp = 1.0f;
-            ExposureSpeedDown = 1.0f;
+            ExposureSpeedDown = 2.0f;
             ExposureSmoothingRange = 100f;
             ExposureCompensation = 0.0f;
         }
@@ -234,12 +172,8 @@ namespace ValveResourceFormat.Renderer.SceneEnvironment
             var def = new ExposureSettings();
             var settings = new ExposureSettings
             {
-                ExposureMin = entity.ContainsKey("minlogexposure")
-                    ? MathF.Pow(2, entity.GetFloatProperty("minlogexposure"))
-                    : entity.GetFloatProperty("minexposure", def.ExposureMin),
-                ExposureMax = entity.ContainsKey("maxlogexposure")
-                    ? MathF.Pow(2, entity.GetFloatProperty("maxlogexposure"))
-                    : entity.GetFloatProperty("maxexposure", def.ExposureMax),
+                ExposureMin = GetExposureBound(entity, "minexposure", "minlogexposure", def.ExposureMin),
+                ExposureMax = GetExposureBound(entity, "maxexposure", "maxlogexposure", def.ExposureMax),
                 ExposureSpeedUp = entity.GetFloatProperty("exposurespeedup", def.ExposureSpeedUp),
                 ExposureSpeedDown = entity.GetFloatProperty("exposurespeeddown", def.ExposureSpeedDown),
                 ExposureCompensation = entity.GetFloatProperty("exposurecompensation", def.ExposureCompensation),
@@ -248,6 +182,23 @@ namespace ValveResourceFormat.Renderer.SceneEnvironment
             };
 
             return settings;
+        }
+
+        // A positive linear bound wins; otherwise the log2 bound applies
+        private static float GetExposureBound(Entity entity, string linearKey, string logKey, float defaultValue)
+        {
+            var linear = entity.GetFloatProperty(linearKey);
+            if (linear > 0f)
+            {
+                return linear;
+            }
+
+            if (entity.ContainsKey(logKey))
+            {
+                return MathF.Pow(2f, entity.GetFloatProperty(logKey));
+            }
+
+            return defaultValue;
         }
 
         /// <summary>Linearly interpolates the numeric fields between two exposure settings.</summary>
@@ -479,6 +430,7 @@ namespace ValveResourceFormat.Renderer.SceneEnvironment
     /// <summary>
     /// Spatial volume that applies post-processing effects to the camera view.
     /// </summary>
+    /// <seealso href="https://s2v.app/SchemaExplorer/cs2/server/CPostProcessingVolume">CPostProcessingVolume</seealso>
     public class ScenePostProcessVolume(Scene scene) : SceneNode(scene)
     {
         /// <summary>Gets the fade time in seconds when transitioning into this volume.</summary>
@@ -490,15 +442,15 @@ namespace ValveResourceFormat.Renderer.SceneEnvironment
         /// <summary>Gets whether this is the global master post-process volume.</summary>
         public bool IsMaster { get; init; }
 
-        /// <summary>Gets whether this volume starts disabled and contributes nothing.</summary>
-        public bool StartDisabled { get; init; }
+        /// <summary>Gets or sets whether this volume is enabled. A disabled volume contributes nothing.</summary>
+        public bool IsEnabled { get; set; } = true;
 
         // Don't skip if no postprocess resource. Could still affect exposure
         /// <summary>Gets or sets the parsed post-processing resource for this volume.</summary>
         public PostProcessing? PostProcessingResource { get; set; }
 
         /// <summary>Gets or sets the model used as the trigger volume shape.</summary>
-        public Model? ModelVolume { get; set; } // dumb
+        public Model? ModelVolume { get; set; }
 
         /// <summary>Gets or sets the collider built from the volume model's physics, used to test whether the camera is inside.</summary>
         public EntityCollider? Collider { get; set; }
@@ -509,7 +461,7 @@ namespace ValveResourceFormat.Renderer.SceneEnvironment
         /// </summary>
         public float Weight { get; set; }
 
-        /// <summary>Gets or sets whether this post-processing resource uses the newer post-Half-Life: Alyx format (detected via the presence of local contrast parameters).</summary>
+        /// <summary>Whether this resource uses the newer post-Half-Life: Alyx format, detected by local contrast parameters.</summary>
         public bool IsPostHLA { get; set; }
 
         /// <summary>Gets or sets whether this volume has tonemapping curve data.</summary>
@@ -533,21 +485,9 @@ namespace ValveResourceFormat.Renderer.SceneEnvironment
         /// <summary>Gets or sets the resolution of the color correction LUT cube.</summary>
         public int ColorCorrectionLutDimensions { get; set; }
 
-        // Bloom isn't implemented yet.
-        // But the BlurWeight array corresponds to the 1/2, 1/4, 1/8, 1/16, and 1/32 resolution blur strengths respectively.
-        // Same goes for BlurTint.
-
         // Local Contrast requires a scene blur, so that's off the table for the time being.
 
         // Vignette could easily be added but I haven't actually found any vpost file that uses it yet.
-
-
-        // For the time being we're only going to support one LUT at a time, as that's all that can be used.
-        // The most accurate method would be to go the valve route of using
-        // a compute shader to blend LUTs (up to 8) at the start of every frame.
-
-        // Additionally, due to collision detection being An Absolute Pain, we can't
-        // use local post process volumes, and can only use the master.
 
         /// <summary>
         /// Reads tonemapping, bloom, and color correction data from the given post-processing resource.
@@ -584,10 +524,9 @@ namespace ValveResourceFormat.Renderer.SceneEnvironment
 
                 ColorCorrectionLutDimensions = resolution;
 
-                ColorCorrectionLUT = new RenderTexture(TextureTarget.Texture3D, resolution, resolution, resolution, 1, nameof(ColorCorrectionLUT));
-                ColorCorrectionLUT.SetWrapMode(TextureWrapMode.ClampToEdge);
+                ColorCorrectionLUT = RenderTexture.Create3D(TextureTarget.Texture3D, resolution, resolution, resolution, ImageFormat.RGBA8888, 1, nameof(ColorCorrectionLUT));
+                ColorCorrectionLUT.SetWrapMode(RsTextureAddressMode.Clamp);
                 ColorCorrectionLUT.SetFiltering(TextureMinFilter.Linear, TextureMagFilter.Linear);
-                GL.TextureStorage3D(ColorCorrectionLUT.Handle, 1, SizedInternalFormat.Rgba8, resolution, resolution, resolution);
                 GL.TextureSubImage3D(ColorCorrectionLUT.Handle, 0, 0, 0, 0, resolution, resolution, resolution, PixelFormat.Rgba, PixelType.UnsignedByte, data);
             }
         }

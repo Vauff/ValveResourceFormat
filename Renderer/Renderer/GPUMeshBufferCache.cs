@@ -15,7 +15,9 @@ namespace ValveResourceFormat.Renderer
     /// </summary>
     public partial class GPUMeshBufferCache
     {
+#pragma warning disable IDE0052 // Only read by the DEBUG diagnostic in the attribute binding loop
         private readonly RendererContext RendererContext;
+#pragma warning restore IDE0052
         private readonly Dictionary<string, GPUMeshBuffers> gpuBuffers = [];
         private readonly Dictionary<VAOKey, int> vertexArrayObjects = [];
 
@@ -69,6 +71,19 @@ namespace ValveResourceFormat.Renderer
             {
                 gpuVbib = new GPUMeshBuffers(vbib, meshName);
                 gpuBuffers.Add(meshName, gpuVbib);
+            }
+
+            return gpuVbib;
+        }
+
+        /// <summary>Get or create GPU buffers for the mesh.</summary>
+        public GPUMeshBuffers CreateVertexIndexBuffers(Mesh mesh)
+        {
+            if (!gpuBuffers.TryGetValue(mesh.Name, out var gpuVbib))
+            {
+                gpuVbib = new GPUMeshBuffers(mesh.VBIB, mesh.Name);
+                gpuBuffers.Add(mesh.Name, gpuVbib);
+                mesh.ReleaseVBIB();
             }
 
             return gpuVbib;
@@ -135,9 +150,25 @@ namespace ValveResourceFormat.Renderer
         /// buffer GL later reuses that handle for.</summary>
         /// <param name="bufferHandles">Vertex and/or index buffer handles about to be freed.</param>
         public void InvalidateVertexArrayObjectsForFreedBuffers(params int[] bufferHandles)
-            => DeleteVertexArrayObjects(key
-                => Array.IndexOf(bufferHandles, key.IndexBuffer) >= 0
-                || key.VertexBuffers.Any(handle => Array.IndexOf(bufferHandles, handle) >= 0));
+            => DeleteVertexArrayObjects(key => UsesAnyBuffer(key, bufferHandles));
+
+        private static bool UsesAnyBuffer(VAOKey key, int[] bufferHandles)
+        {
+            if (Array.IndexOf(bufferHandles, key.IndexBuffer) >= 0)
+            {
+                return true;
+            }
+
+            foreach (var handle in key.VertexBuffers)
+            {
+                if (Array.IndexOf(bufferHandles, handle) >= 0)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
 
         private void DeleteVertexArrayObjects(Func<VAOKey, bool> predicate)
         {
@@ -195,7 +226,7 @@ namespace ValveResourceFormat.Renderer
         {
             Debug.Assert(vertexBuffers != null && vertexBuffers.Length > 0);
 
-            GL.CreateVertexArrays(1, out int newVaoHandle);
+            var newVaoHandle = GraphicsDevice.CreateVertexArray(debugLabel ?? string.Empty);
             VertexArray.StartRecording(newVaoHandle);
 
             // Check for non-indexed geometry
@@ -243,20 +274,13 @@ namespace ValveResourceFormat.Renderer
                 bindingIndex++;
             }
 
-#if DEBUG
-            if (debugLabel != null)
-            {
-                GL.ObjectLabel(ObjectLabelIdentifier.VertexArray, newVaoHandle, Math.Min(GLEnvironment.MaxLabelLength, debugLabel.Length), debugLabel);
-            }
-#endif
-
             return newVaoHandle;
         }
 
         private VertexDrawBuffer[] AddMissingAttributes(VertexDrawBuffer[] vertexBuffers)
         {
             // Shaders read white where a mesh has no COLOR stream, matching the engine default
-            if (!vertexBuffers.Any(vb => vb.InputLayoutFields.Any(f => f.SemanticName == "COLOR")))
+            if (!vertexBuffers.Any(vb => vb.InputLayoutFields.Any(f => f.SemanticName == "COLOR" && f.SemanticIndex == 0)))
             {
                 var defaultColor = new VertexDrawBuffer
                 {

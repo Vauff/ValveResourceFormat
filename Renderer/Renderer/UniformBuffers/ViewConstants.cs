@@ -13,11 +13,10 @@ namespace ValveResourceFormat.Renderer.Buffers
 
         /// <summary>Gets the distance to the near plane this view was projected with.</summary>
         /// <remarks>
-        /// Recovered from the projection rather than carried as a field, so it costs nothing in the layout
-        /// this class is marshalled to the GPU with. The reverse Z form
+        /// Recovered from the projection, so it adds nothing to the GPU layout. The reverse Z form
         /// <see cref="Camera.CreateProjectionMatrix"/> builds has <c>M33 = near / (far - near)</c> and
-        /// <c>M43 = near * far / (far - near)</c>, which inverts to this exactly and collapses to plain
-        /// <c>M43</c> when the far plane is infinite.
+        /// <c>M43 = near * far / (far - near)</c>, which inverts to this exactly and reduces to <c>M43</c>
+        /// when far is infinite.
         /// </remarks>
         public float NearPlane => ViewToProjection.M43 / (1f + ViewToProjection.M33);
 
@@ -29,7 +28,7 @@ namespace ValveResourceFormat.Renderer.Buffers
 
         /// <summary>Combined world-to-clip transform (view * projection).</summary>
         public Matrix4x4 WorldToProjection = Matrix4x4.Identity;
-        /// <summary>Inverse of <see cref="WorldToProjection"/>, mapping clip space back to world space.</summary>
+        /// <summary>Inverse of the projection matrix alone, mapping clip space back to view space.</summary>
         public Matrix4x4 ProjectionToWorld = Matrix4x4.Identity;
         /// <summary>View matrix transforming world-space positions into camera space.</summary>
         public Matrix4x4 WorldToView = Matrix4x4.Identity;
@@ -57,12 +56,16 @@ namespace ValveResourceFormat.Renderer.Buffers
         public Matrix4x4 WorldToShadow = Matrix4x4.Identity;
         /// <summary>Transform into the second, wider sun shadow cascade. Forms <c>g_matWorldToShadow[1]</c>.</summary>
         public Matrix4x4 WorldToShadowCascade1 = Matrix4x4.Identity;
-        /// <summary>Padding to maintain 16-byte struct alignment.</summary>
-        public Vector2 _ViewPadding1;
+        /// <summary>Transform into the third, widest sun shadow cascade. Forms <c>g_matWorldToShadow[2]</c>.</summary>
+        public Matrix4x4 WorldToShadowCascade2 = Matrix4x4.Identity;
+        /// <summary>Index of the drawn scene in <see cref="Renderer.Scenes"/>, which replacement shaders can write out.</summary>
+        public uint SceneIndex;
+        /// <summary>Whether this view draws the 3D skybox rather than the world.</summary>
+        public bool IsSkybox;
         /// <summary>Depth bias applied when sampling the sun light shadow map.</summary>
         public float SunLightShadowBias = 0.001f;
-        /// <summary>Padding to maintain 16-byte struct alignment.</summary>
-        public float _ViewPadding2;
+        /// <summary>Whether this view samples the sun shadow cascades.</summary>
+        public bool SunShadowsEnabled = true;
 
         /// <summary>When <see langword="true"/>, volumetric fog is active and evaluated in the shader.</summary>
         public bool VolumetricFogActive;
@@ -97,6 +100,18 @@ namespace ValveResourceFormat.Renderer.Buffers
 
         /// <summary>Puddle ripple direction in X, over 0 to 1 for a full turn.</summary>
         public Vector4 EnvWetnessRipple;
+
+        /// <summary>
+        /// Scene depth texels per pixel of the target being drawn: one, except in a pass drawn below the
+        /// scene's resolution.
+        /// </summary>
+        public Vector2 SceneDepthFetchScale = Vector2.One;
+
+        /// <summary>Distance of the volumetric fog volume's first slice and the distance from it to the last slice.</summary>
+        public Vector2 VolumetricFogNearRange;
+
+        /// <summary>Cull mask layout of the scene being drawn, from its <see cref="LightBinner"/>.</summary>
+        public LightCullConstants LightCull;
 
         /// <summary>Initializes a new <see cref="ViewConstants"/> with identity matrices and default values.</summary>
         public ViewConstants()

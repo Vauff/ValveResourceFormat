@@ -6,8 +6,17 @@ namespace ValveResourceFormat.Renderer.Buffers
     [StructLayout(LayoutKind.Sequential)]
     public struct BarnLightConstants
     {
-        /// <summary>Maximum number of barn lights that can be active in a scene.</summary>
-        public const int MAX_BARN_LIGHTS = 320;
+        /// <summary>Maximum number of barn lights that can be lit in a view. An omni2 or rect light counts once.</summary>
+        public const int MAX_BARN_LIGHTS = 315;
+
+        /// <summary>Faces a single light can have, which an omni2 light uses all of.</summary>
+        public const int MAX_FACES_PER_LIGHT = 6;
+
+        /// <summary>
+        /// Capacity of the per face barn light buffers. Rounded up from <see cref="MAX_BARN_LIGHTS"/> times
+        /// <see cref="MAX_FACES_PER_LIGHT"/> to a whole number of 32 bit cull masks.
+        /// </summary>
+        public const int MAX_BARN_LIGHT_FACES = (MAX_BARN_LIGHTS * MAX_FACES_PER_LIGHT + 31) / 32 * 32;
 
         /// <summary>Frustum matrix used for barn light shadow projection.</summary>
         public Matrix4x4 BarnFrustum;
@@ -21,7 +30,8 @@ namespace ValveResourceFormat.Renderer.Buffers
         public Vector4 BarnLightOrientationQ;
         /// <summary>Angle-based fade parameters for the barn light.</summary>
         public Vector3 BarnLightAngleFade;
-        private uint _padding0;
+        /// <summary>Half width of a rect light luminaire, for the shaders that shade it as an area light.</summary>
+        public float BarnLightLuminaireHalfWidth;
         /// <summary>Shadow map offset and scale for the barn light.</summary>
         public Vector4 BarnLightShadowOffsetScale;
         /// <summary>Cookie texture parameters for the barn light.</summary>
@@ -34,7 +44,8 @@ namespace ValveResourceFormat.Renderer.Buffers
         public float BarnLightShadowScale;
         /// <summary>Packed path trace index and barn light flags.</summary>
         public uint PathTraceIndex_BarnLightFlags;
-        private uint _padding1;
+        /// <summary>Half height of a rect light luminaire, for the shaders that shade it as an area light.</summary>
+        public float BarnLightLuminaireHalfHeight;
         /// <summary>Transform matrix from world space to barn light illumination space.</summary>
         public OpenTK.Mathematics.Matrix3x4 BarnIlluminationFromWorld;
     }

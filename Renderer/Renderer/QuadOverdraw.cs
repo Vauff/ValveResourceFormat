@@ -1,7 +1,5 @@
 using System.Diagnostics;
 using OpenTK.Graphics.OpenGL;
-using ValveResourceFormat.CompiledShader;
-using ValveResourceFormat.Renderer.Buffers;
 
 namespace ValveResourceFormat.Renderer;
 
@@ -10,11 +8,8 @@ namespace ValveResourceFormat.Renderer;
 /// </summary>
 ///
 /// <remarks>
-/// The scene is rendered with a replacement shader that counts, per 2x2 pixel quad, how
-/// many primitives were shaded into it, using an atomic lock so a primitive spanning
-/// several pixels of the same quad counts once.
-///
-/// The first render only fills out the depth buffer, the second one renders overdraw
+/// The frame is drawn once for depth, then again through each material's overdraw mode to count primitives
+/// per 2x2 pixel quad.
 /// </remarks>
 public class QuadOverdraw(RendererContext rendererContext)
 {
@@ -26,7 +21,7 @@ public class QuadOverdraw(RendererContext rendererContext)
     private ClearBufferMask savedClearMask;
     private RenderState savedPassState;
 
-    /// <summary>Gets the replacement shader that counts quad overdraw while the scene renders.</summary>
+    /// <summary>Gets the counting shader used by materials whose own shader has no overdraw mode.</summary>
     public Shader SceneShader => sceneShader ??= rendererContext.ShaderLoader.LoadShader("quad_overdraw");
 
     /// <summary>Gets whether the current render mode has activated the quad overdraw visualization.</summary>
@@ -45,26 +40,18 @@ public class QuadOverdraw(RendererContext rendererContext)
         IsActive = SceneShader.RenderModes.Contains(renderMode);
     }
 
-    /// <summary>
-    /// Sizes the count buffer to the framebuffer, zeroes it, binds it to its slot, and puts
-    /// <see cref="SceneShader"/> in depth prime mode. Call before the first scene render of the frame.
-    /// </summary>
-    /// <param name="width">Framebuffer width in pixels.</param>
-    /// <param name="height">Framebuffer height in pixels.</param>
+    /// <summary>Sizes, zeroes and binds the count buffer. Call before the first scene render of the frame.</summary>
     public void Prepare(int width, int height)
     {
-        // All variants: skinned meshes draw with a skinning variant of this shader (see MeshBatchRenderer)
-        SceneShader.SetUniform1AllVariants("bCountQuads", 0u);
-
         // one entry per 2x2 pixel quad
-        var quadWidth = (width + 1) / 2;
-        var quadHeight = (height + 1) / 2;
+        var quadWidth = MathUtils.DivideRoundUp(width, 2);
+        var quadHeight = MathUtils.DivideRoundUp(height, 2);
         var elementCount = quadWidth * quadHeight * 2;
 
         if (quadBuffer == null || quadBuffer.Size != elementCount * sizeof(uint))
         {
             quadBuffer?.Delete();
-            quadBuffer = StorageBuffer.Allocate<uint>(ReservedBufferSlots.QuadOverdraw, nameof(ReservedBufferSlots.QuadOverdraw), elementCount, BufferUsageHint.DynamicCopy);
+            quadBuffer = StorageBuffer.Allocate<uint>(ReservedBufferSlots.QuadOverdraw, nameof(ReservedBufferSlots.QuadOverdraw), elementCount, BufferUsage.GpuOnly);
         }
 
         // zero is both the unlocked lock value and the starting count
@@ -72,35 +59,26 @@ public class QuadOverdraw(RendererContext rendererContext)
         quadBuffer.BindBufferBase();
     }
 
-    /// <summary>
-    /// Switches from the depth prime render to the counting render by enabling counting in <see cref="SceneShader"/>.
-    /// </summary>
-    /// <param name="framebuffer">The framebuffer the scene renders into.</param>
+    /// <summary>Keeps the first render's depth and has the counting render test against it.</summary>
     public void BeginCountingPass(Framebuffer framebuffer)
     {
         savedClearMask = framebuffer.ClearMask;
         framebuffer.ClearMask &= ~ClearBufferMask.DepthBufferBit;
 
-        savedPassState = rendererContext.RenderState.CurrentPass;
+        savedPassState = GraphicsContext.RenderState.CurrentPass;
         var countingState = savedPassState;
         countingState.DepthStencil.DepthFunc = RsComparison.CloserEqual;
-        rendererContext.RenderState.SetPassBaseline(in countingState);
-
-        SceneShader.SetUniform1AllVariants("bCountQuads", 1u);
+        GraphicsContext.RenderState.SetPassBaseline(in countingState);
     }
 
     /// <summary>Restores the depth state changed by <see cref="BeginCountingPass"/>.</summary>
-    /// <param name="framebuffer">The framebuffer passed to <see cref="BeginCountingPass"/>.</param>
     public void EndCountingPass(Framebuffer framebuffer)
     {
         framebuffer.ClearMask = savedClearMask;
-        rendererContext.RenderState.SetPassBaseline(in savedPassState);
+        GraphicsContext.RenderState.SetPassBaseline(in savedPassState);
     }
 
-    /// <summary>
-    /// Replaces the bound framebuffer contents with the overdraw heat map and legend.
-    /// Call after the scene rendered with <see cref="SceneShader"/> as the replacement shader.
-    /// </summary>
+    /// <summary>Replaces the framebuffer contents with the overdraw heat map. Call after the counting render.</summary>
     public void Render()
     {
         Debug.Assert(quadBuffer != null, $"{nameof(Prepare)} must be called before {nameof(Render)}");
@@ -114,7 +92,7 @@ public class QuadOverdraw(RendererContext rendererContext)
 
         visualizeShader.Use();
 
-        using var overdrawState = rendererContext.RenderState.Scope(depthTest: false, depthWrite: false);
+        using var overdrawState = GraphicsContext.RenderState.Scope(depthTest: false, depthWrite: false);
 
         GL.BindVertexArray(rendererContext.MeshBufferCache.EmptyVAO);
         GL.DrawArrays(PrimitiveType.Triangles, 0, 3);

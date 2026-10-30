@@ -1,5 +1,9 @@
+using System.Collections.Concurrent;
+using System.Diagnostics.CodeAnalysis;
+using System.Threading;
 using Microsoft.Extensions.Logging;
 using ValveResourceFormat.IO;
+using ValveResourceFormat.ResourceTypes.ModelAnimation;
 
 namespace ValveResourceFormat.Renderer;
 
@@ -19,9 +23,25 @@ public class RendererContext : IDisposable
     public GameFileLoader FileLoader { get; }
 
     /// <summary>
+    /// Information lookup from compiled shaders (.vcs).
+    /// </summary>
+    public ShaderDataProvider ShaderDataProvider { get; }
+
+    /// <summary>
+    /// Owns the GPU objects created for this renderer. Creation goes through the static methods on
+    /// <see cref="GraphicsDevice"/> rather than through this property.
+    /// </summary>
+    public GraphicsDevice Device { get; }
+
+    /// <summary>
     /// Material and texture loader and cache.
     /// </summary>
     public MaterialLoader MaterialLoader { get; }
+
+    /// <summary>
+    /// Background loader for textures.
+    /// </summary>
+    public TextureStreamingHelper TextureStreaming { get; }
 
     /// <summary>
     /// Shader compiler and cache.
@@ -33,15 +53,12 @@ public class RendererContext : IDisposable
     /// </summary>
     public GPUMeshBufferCache MeshBufferCache { get; }
 
-    /// <summary>
-    /// Render state tracker for the GL context this renderer context renders with.
-    /// </summary>
-    public RenderStateTracker RenderState { get; } = new();
+    private bool disposed;
 
     /// <summary>
     /// Maximum texture mip size to load in <see cref="MaterialLoader"/>.
     /// </summary>
-    public int MaxTextureSize { get; set; } = 1024;
+    public int MaxTextureSize { get; set; } = int.MaxValue;
 
     /// <summary>
     /// Main camera field of view, in horizontal degrees at a 4:3 aspect ratio.
@@ -55,6 +72,23 @@ public class RendererContext : IDisposable
     public float ViewmodelFieldOfView { get; set; } = 64.0f;
 
     /// <summary>
+    /// Holds the morph composites of every mesh loaded through this context.
+    /// </summary>
+    public MorphCompositeAtlas MorphAtlas { get; }
+
+    /// <summary>
+    /// Holds the sheet sequences of every texture the particle renderers of this context draw.
+    /// </summary>
+    internal Particles.ParticleSheetCache ParticleSheets { get; } = new();
+
+    internal ConcurrentDictionary<string, Lazy<List<AnimationBase>>> ModelAnimations { get; } = new();
+
+    /// <summary>
+    /// Whether scene nodes simulate across the thread pool, published by the renderer each frame.
+    /// </summary>
+    public bool ParallelSimulation { get; set; } = true;
+
+    /// <summary>
     /// Initializes a new renderer context.
     /// </summary>
     /// <param name="fileLoader">Game file loader for resource access.</param>
@@ -62,11 +96,15 @@ public class RendererContext : IDisposable
     public RendererContext(GameFileLoader fileLoader, ILogger logger)
     {
         FileLoader = fileLoader;
+        ShaderDataProvider = new ShaderDataProvider(fileLoader);
         Logger = logger;
+        Device = GraphicsDevice.Create();
 
+        TextureStreaming = new TextureStreamingHelper(this);
         MaterialLoader = new MaterialLoader(this);
         ShaderLoader = new ShaderLoader(this);
         MeshBufferCache = new GPUMeshBufferCache(this);
+        MorphAtlas = new MorphCompositeAtlas(this);
     }
 
     /// <inheritdoc/>
@@ -82,11 +120,77 @@ public class RendererContext : IDisposable
     /// <param name="disposing">True to release managed resources.</param>
     protected virtual void Dispose(bool disposing)
     {
-        if (!disposing)
+        if (!disposing || disposed)
         {
             return;
         }
 
+        CancelLoading();
+
+        disposed = true;
+
+        TextureStreaming.CancelAllStreaming();
+
         ShaderLoader?.Dispose();
+        MorphAtlas.Dispose();
+    }
+
+    // Outlive Dispose: the loader wait runs off the UI thread after teardown and reads these fields.
+    [SuppressMessage("Usage", "CA2213:Disposable fields should be disposed", Justification = "Outlives Dispose so WaitForLoadingToStop still works after it")]
+    private readonly CancellationTokenSource loadCancellation = new();
+
+    [SuppressMessage("Usage", "CA2213:Disposable fields should be disposed", Justification = "Outlives Dispose so WaitForLoadingToStop still works after it")]
+    private readonly ManualResetEventSlim loadIdle = new(true);
+    private int loadsInFlight;
+
+    private static readonly TimeSpan LoadStopTimeout = TimeSpan.FromSeconds(1);
+
+    /// <summary>Cancels loading on this context.</summary>
+    public CancellationToken CancellationToken => loadCancellation.Token;
+
+    /// <summary>Marks loading in progress until the returned scope is disposed.</summary>
+    public IDisposable BeginLoading()
+    {
+        if (Interlocked.Increment(ref loadsInFlight) == 1)
+        {
+            loadIdle.Reset();
+        }
+
+        return new LoadScope(this);
+    }
+
+    /// <summary>Asks loading to stop. Returns straight away without waiting for it.</summary>
+    public void CancelLoading()
+    {
+        if (!disposed)
+        {
+            loadCancellation.Cancel();
+        }
+    }
+
+    /// <summary>Waits for everything reading resources to stop, returning whether it did.</summary>
+    public bool WaitForLoadingToStop()
+    {
+        var stopped = loadIdle.Wait(LoadStopTimeout);
+
+        if (!stopped)
+        {
+            Logger.LogWarning("Loading did not stop within {Timeout}, carrying on without it", LoadStopTimeout);
+        }
+
+        TextureStreaming.DrainPendingLoads();
+
+        return stopped;
+    }
+
+    private sealed class LoadScope(RendererContext context) : IDisposable
+    {
+        public void Dispose()
+        {
+            if (Interlocked.Decrement(ref context.loadsInFlight) == 0)
+            {
+                context.loadIdle.Set();
+            }
+        }
     }
 }

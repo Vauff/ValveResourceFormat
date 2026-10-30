@@ -11,36 +11,26 @@ using GUI.Types.Exporter;
 using GUI.Types.GLViewers;
 using GUI.Types.PackageViewer;
 using GUI.Utils;
-using SteamDatabase.ValvePak;
+using ValvePak;
+using ValveResourceFormat.IO;
 
 namespace GUI
 {
     partial class MainForm
     {
-        public void ShowVpkContextMenu(Control control, Point position, bool isRootNode, bool isFolderNode, bool deletedFilesRecovered)
+        public void ShowVpkContextMenu(Control control, Point position, bool isRootNode, bool isFolderNode, bool deletedFilesRecovered, bool canEdit)
         {
             copyFileNameToolStripMenuItem.Visible = !isRootNode;
             openWithDefaultAppToolStripMenuItem.Visible = !isRootNode && !isFolderNode;
             openWithoutViewerToolStripMenuItem.Visible = !isRootNode && !isFolderNode;
             viewAssetInfoToolStripMenuItem.Visible = !isRootNode && !isFolderNode;
-            toolStripSeparator3.Visible = isRootNode || !isFolderNode;
+            searchInFolderToolStripMenuItem.Visible = isFolderNode && !isRootNode;
 
             verifyPackageContentsToolStripMenuItem.Visible = isRootNode;
             recoverDeletedToolStripMenuItem.Visible = isRootNode && !deletedFilesRecovered;
+            editThisVpkToolStripMenuItem.Visible = isRootNode && canEdit;
 
             vpkContextMenu.Show(control, position);
-        }
-
-        public void ShowVpkEditingContextMenu(Control control, Point position, bool isRootNode, bool isFolderNode)
-        {
-            vpkEditSaveToDiskToolStripMenuItem.Visible = isRootNode;
-            vpkEditRemoveThisFileToolStripMenuItem.Visible = !isFolderNode;
-            vpkEditRemoveThisFolderToolStripMenuItem.Visible = isFolderNode && !isRootNode;
-            vpkEditAddExistingFilesToolStripMenuItem.Visible = isFolderNode;
-            vpkEditAddExistingFolderToolStripMenuItem.Visible = isFolderNode;
-            vpkEditCreateFolderToolStripMenuItem.Visible = isFolderNode;
-
-            vpkEditingContextMenu.Show(control, position);
         }
 
         private static TabPage FetchToolstripTabContext(object sender)
@@ -57,12 +47,17 @@ namespace GUI
                 throw new InvalidDataException("Context menu tag is not a Point");
             }
 
-            return tabs.Cast<TabPage>().Where((t, i) => tabControl.GetTabRect(i).Contains(location)).First();
+            return tabs.Cast<TabPage>().Where((t, i) => tabControl.GetDisplayTabRect(i).Contains(location)).First();
         }
 
         private void CloseToolStripMenuItem_Click(object sender, EventArgs e)
         {
             mainTabs.CloseTab(FetchToolstripTabContext(sender));
+        }
+
+        private void CloseOtherTabsToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            CloseOtherTabs(FetchToolstripTabContext(sender));
         }
 
         private void CloseToolStripMenuItemsToLeft_Click(object sender, EventArgs e)
@@ -88,6 +83,15 @@ namespace GUI
             }
         }
 
+        private void SearchInFolderToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            if (GetSelectedItems(sender).Items is [{ PkgNode: { } folder }]
+                && mainTabs.SelectedTab?.Controls.OfType<TreeViewWithSearchResults>().FirstOrDefault() is { } package)
+            {
+                ShowPackageSearch(package, folder, onlyInFolder: true);
+            }
+        }
+
         private void CopyFileNameToolStripMenuItem_Click(object sender, EventArgs e)
         {
             CopyFileName(sender, wantsFullPath: false);
@@ -98,50 +102,39 @@ namespace GUI
             CopyFileName(sender, wantsFullPath: true);
         }
 
-        private static void CopyFileName(object sender, bool wantsFullPath)
+        /// <summary>
+        /// Gets the files and folders selected in the tree or list view that a context menu was opened on.
+        /// </summary>
+        private static (VrfGuiContext? Context, List<IBetterBaseItem> Items) GetSelectedItems(object sender)
         {
             if (sender is not ToolStripMenuItem { Owner: ContextMenuStrip { SourceControl: var control } })
             {
-                return;
+                return (null, []);
             }
-
-            VrfGuiContext? context;
-            List<IBetterBaseItem> selectedNodes;
 
             if (control is BetterTreeView treeView)
             {
-                context = treeView.VrfGuiContext;
-
-                if (treeView.SelectedNode is not IBetterBaseItem selectedNode)
-                {
-                    return;
-                }
-
-                selectedNodes = [selectedNode];
+                return (treeView.VrfGuiContext, treeView.SelectedNode is IBetterBaseItem selectedNode ? [selectedNode] : []);
             }
-            else if (control is BetterListView listView)
+
+            if (control is BetterListView listView)
             {
-                context = listView.VrfGuiContext;
-                selectedNodes = [];
+                return (listView.VrfGuiContext, [.. listView.GetSelectedVirtualItems().OfType<IBetterBaseItem>()]);
+            }
 
-                foreach (var item in listView.GetSelectedVirtualItems())
-                {
-                    if (item is IBetterBaseItem selectedNode)
-                    {
-                        selectedNodes.Add(selectedNode);
-                    }
-                }
-            }
-            else
-            {
-                throw new InvalidDataException("Unknown state");
-            }
+            throw new InvalidDataException("Unknown state");
+        }
+
+        private static void CopyFileName(object sender, bool wantsFullPath)
+        {
+            var (context, selectedNodes) = GetSelectedItems(sender);
 
             if (context == null)
             {
                 return;
             }
 
+            var packageLink = wantsFullPath ? context.GetVpkLink() : null;
             var sb = new StringBuilder();
 
             foreach (var selectedNode in selectedNodes)
@@ -151,10 +144,9 @@ namespace GUI
                     sb.AppendLine();
                 }
 
-                if (wantsFullPath)
+                if (packageLink != null)
                 {
-                    sb.Append("vpk:");
-                    sb.Append(context.FileName.Replace('\\', '/'));
+                    sb.Append(packageLink);
                 }
 
                 if (!selectedNode.IsFolder)
@@ -167,7 +159,8 @@ namespace GUI
                     var packageEntry = selectedNode.PackageEntry;
                     if (packageEntry != null)
                     {
-                        sb.Append(packageEntry.GetFullPath());
+                        var entryPath = packageEntry.GetFullPath();
+                        sb.Append(wantsFullPath ? VpkLink.EscapePath(entryPath) : entryPath);
                     }
                 }
                 else
@@ -199,7 +192,7 @@ namespace GUI
 
                     while (stack.TryPop(out var name))
                     {
-                        sb.Append(name);
+                        sb.Append(wantsFullPath ? VpkLink.EscapePath(name) : name);
                         sb.Append(Package.DirectorySeparatorChar);
                     }
                 }
@@ -303,21 +296,21 @@ namespace GUI
                     continue;
                 }
 
-                context.CurrentPackage.ReadEntry(file, out var output, validateCrc: file.CRC32 > 0);
-
-                var tempPath = $"{Path.GetTempPath()}Source 2 Viewer - {Path.GetFileName(context.CurrentPackage.FileName)} - {file.GetFileName()}";
-                using (var stream = new FileStream(tempPath, FileMode.Create))
-                {
-                    stream.Write(output, 0, output.Length);
-                }
-
                 try
                 {
+                    context.CurrentPackage.ReadEntry(file, out var output, validateCrc: file.CRC32 > 0);
+
+                    var tempPath = $"{Path.GetTempPath()}Source 2 Viewer - {Path.GetFileName(context.CurrentPackage.FileName)} - {file.GetFileName()}";
+                    using (var stream = new FileStream(tempPath, FileMode.Create))
+                    {
+                        stream.Write(output, 0, output.Length);
+                    }
+
                     Process.Start(new ProcessStartInfo(tempPath) { UseShellExecute = true });
                 }
                 catch (Exception ex)
                 {
-                    Log.Error(nameof(MainForm), $"Failed to start process: {ex.Message}");
+                    ErrorReport.ShowError(ex, file.GetFullPath());
                 }
             }
         }
@@ -342,6 +335,10 @@ namespace GUI
                     mainTabs.TabPages.Add(tab);
                     mainTabs.SelectTab(tab);
                 }
+            }
+            catch (Exception ex)
+            {
+                ErrorReport.ShowError(ex, selectedNode.PackageEntry.GetFullPath());
             }
             finally
             {
@@ -443,7 +440,7 @@ namespace GUI
 
                     try
                     {
-                        await ExportFile.ExtractFileFromStream(Path.GetFileName(exportData.VrfGuiContext.FileName), fileStream, exportData.VrfGuiContext, decompile).ConfigureAwait(true);
+                        await ExportFile.ExtractFileFromStream(Path.GetFileName(exportData.VrfGuiContext.FileName), fileStream, exportData.VrfGuiContext, decompile, exportData.VrfGuiContext.DisplayPath).ConfigureAwait(true);
                         fileStream = null; // ExtractFileFromStream should dispose it when done, not `using` here in case there's some threading
                     }
                     finally
@@ -477,113 +474,7 @@ namespace GUI
             }
         }
 
-        private void CreateVpkFromFolderToolStripMenuItem_Click(object sender, EventArgs e)
-        {
-            var newVrfGuiContext = new VrfGuiContext("new.vpk", null);
-
-            try
-            {
-#pragma warning disable CA2000 // If creating an empty TabPage throws, all hope is lost
-                var contents = new PackageViewer(newVrfGuiContext).CreateEmpty();
-#pragma warning restore CA2000
-
-                var tab = new ThemedTabPage("New VPK")
-                {
-                    ToolTipText = "New VPK"
-                };
-                tab.Controls.Add(contents);
-                tab.ImageIndex = AppIcons.ExtensionIcons["vpk"];
-                mainTabs.TabPages.Add(tab);
-                mainTabs.SelectTab(tab);
-
-                newVrfGuiContext = null;
-            }
-            finally
-            {
-                newVrfGuiContext?.Dispose();
-            }
-
-        }
-
         private async void RegisterVpkFileAssociationToolStripMenuItem_Click(object sender, EventArgs e) => await SettingsControl.RegisterFileAssociationAsync().ConfigureAwait(true);
-
-        private void OnVpkCreateFolderToolStripMenuItem_Click(object sender, EventArgs e)
-        {
-            using var dialog = new PromptForm("New folder name");
-
-            if (dialog.ShowDialog() != DialogResult.OK || dialog.ResultText.Length < 1)
-            {
-                return;
-            }
-
-            var directory = dialog.ResultText;
-
-            if (directory.IndexOfAny(Path.GetInvalidPathChars()) != -1)
-            {
-                _ = AppMessageDialogs.ShowMessageAsync("Entered folder name contains invalid characters.", "Invalid characters", MessageIcon.Warning);
-                return;
-            }
-
-            if (mainTabs.SelectedTab?.Controls[nameof(TreeViewWithSearchResults)] is TreeViewWithSearchResults treeViewWithSearchResults)
-            {
-                treeViewWithSearchResults.Viewer.AddFolder(directory);
-            }
-        }
-
-        private void OnVpkAddNewFolderToolStripMenuItem_Click(object sender, EventArgs e)
-        {
-            var inputDirectory = AppFileDialogs.PickFolder("Choose which folder to pack into a VPK", AppFileDialogs.RememberIn.OpenDirectory);
-
-            if (inputDirectory == null)
-            {
-                return;
-            }
-
-            if (mainTabs.SelectedTab?.Controls[nameof(TreeViewWithSearchResults)] is TreeViewWithSearchResults treeViewWithSearchResults)
-            {
-                treeViewWithSearchResults.Viewer.AddFilesFromFolder(inputDirectory);
-            }
-        }
-
-        private void OnVpkAddNewFileToolStripMenuItem_Click(object sender, EventArgs e)
-        {
-            var files = AppFileDialogs.OpenFiles("Choose which files to add to the VPK", null);
-
-            if (files == null)
-            {
-                return;
-            }
-
-            if (mainTabs.SelectedTab?.Controls[nameof(TreeViewWithSearchResults)] is TreeViewWithSearchResults treeViewWithSearchResults)
-            {
-                treeViewWithSearchResults.Viewer.AddFiles(files);
-            }
-        }
-
-        private void OnVpkEditingRemoveThisToolStripMenuItem_Click(object sender, EventArgs e)
-        {
-            if (mainTabs.SelectedTab?.Controls[nameof(TreeViewWithSearchResults)] is TreeViewWithSearchResults treeViewWithSearchResults)
-            {
-                treeViewWithSearchResults.Viewer.RemoveCurrentFiles();
-            }
-        }
-
-        private void OnSaveVPKToDiskToolStripMenuItem_Click(object sender, EventArgs e)
-        {
-            var fileName = AppFileDialogs.SaveFile("Save VPK package", null, "vpk", "Valve Pak|*.vpk");
-
-            if (fileName == null)
-            {
-                return;
-            }
-
-            Log.Info(nameof(MainForm), $"Packing to '{fileName}'...");
-
-            if (mainTabs.SelectedTab?.Controls[nameof(TreeViewWithSearchResults)] is TreeViewWithSearchResults treeViewWithSearchResults)
-            {
-                treeViewWithSearchResults.Viewer.SaveToFile(fileName);
-            }
-        }
 
         private void OnOpenWelcomeScreenToolStripMenuItem_Click(object sender, EventArgs e)
         {

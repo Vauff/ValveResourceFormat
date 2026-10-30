@@ -3,7 +3,6 @@ using System.Linq;
 using OpenTK.Graphics.OpenGL;
 using ValveKeyValue;
 using ValveResourceFormat.Blocks;
-using ValveResourceFormat.Renderer.Buffers;
 using ValveResourceFormat.ResourceTypes;
 using ValveResourceFormat.Serialization.KeyValues;
 
@@ -18,13 +17,8 @@ namespace ValveResourceFormat.Renderer
         /// <summary>Gets the axis-aligned bounding box of the mesh in local space.</summary>
         public AABB BoundingBox { get; }
 
-        /// <summary>Gets or sets the tint color multiplier applied to the entire mesh.</summary>
-        public Vector4 Tint { get; set; } = Vector4.One;
-
-        /// <summary>Gets or sets the alpha component of <see cref="Tint"/>.</summary>
-        public float Alpha { get => Tint.W; set => Tint = Tint with { W = value }; }
-
         private readonly RendererContext renderContext;
+        private readonly bool isAggregate;
 
         /// <summary>Gets the list of meshlets for GPU-driven indirect culling.</summary>
         public List<Meshlet> Meshlets { get; } = [];
@@ -41,8 +35,8 @@ namespace ValveResourceFormat.Renderer
         /// <summary>Gets all draw calls across all render buckets.</summary>
         public IEnumerable<DrawCall> DrawCalls => DrawCallsOpaque.Concat(DrawCallsOverlay).Concat(DrawCallsBlended);
 
-        /// <summary>Gets the GPU storage buffer holding the bone matrices for skeletal animation, or <see langword="null"/> if not animated.</summary>
-        public StorageBuffer? BoneMatricesGpu { get; private set; }
+        /// <summary>Gets whether this mesh is currently skinned.</summary>
+        public bool IsSkinningActive { get; private set; }
 
         /// <summary>Gets the starting bone index in the model-space bone array for this mesh.</summary>
         public int MeshBoneOffset { get; private set; }
@@ -57,7 +51,7 @@ namespace ValveResourceFormat.Renderer
         public MeshSkinning Skinning { get; private set; }
 
         /// <summary>Gets the variant to draw with now. Bind pose does not need skinning.</summary>
-        public MeshSkinning ActiveSkinning => BoneMatricesGpu != null ? Skinning : MeshSkinning.None;
+        public MeshSkinning ActiveSkinning => IsSkinningActive ? Skinning : MeshSkinning.None;
 
         /// <summary>Gets the name of the source mesh resource.</summary>
         public string Name { get; }
@@ -76,31 +70,26 @@ namespace ValveResourceFormat.Renderer
         /// <param name="initialMaterialTable">Optional material name overrides.</param>
         /// <param name="morph">Optional morph data for facial animation.</param>
         /// <param name="isAggregate">When <see langword="true"/>, all draw calls go into the opaque bucket for aggregate rendering.</param>
+        /// <param name="shaderArguments">Optional shader combos set on every draw call, over the ones the scene gives it.</param>
         public RenderableMesh(Mesh mesh, int meshIndex, Scene scene, Model? model = null,
-            Dictionary<string, string>? initialMaterialTable = null, Morph? morph = null, bool isAggregate = false)
+            Dictionary<string, string>? initialMaterialTable = null, Morph? morph = null, bool isAggregate = false,
+            IReadOnlyDictionary<string, byte>? shaderArguments = null)
         {
             renderContext = scene.RendererContext;
+            this.isAggregate = isAggregate;
 
             Name = mesh.Name;
 
-            var vbib = mesh.VBIB;
-
             if (model != null)
             {
-                var remapTableStarts = model.Data.GetIntegerArray("m_remappingTableStarts");
-                if (remapTableStarts.Length > meshIndex)
-                {
-                    MeshBoneOffset = (int)remapTableStarts[meshIndex];
-                }
-
-                var modelSpaceBoneIndices = model.GetRemapTable(meshIndex);
-                if (modelSpaceBoneIndices != null)
-                {
-                    MeshBoneCount = modelSpaceBoneIndices.Length;
-                }
+                MeshBoneOffset = model.BoneRemapTable.GetMeshStart(meshIndex);
+                MeshBoneCount = model.BoneRemapTable.GetMeshBoneCount(meshIndex);
             }
 
-            BoneWeightCount = mesh.Data.GetSubCollection("m_skeleton")?.GetInt32Property("m_nBoneWeightCount") ?? 0;
+            BoneWeightCount = mesh.BoneWeightCount;
+
+            var gpuVbib = renderContext.MeshBufferCache.CreateVertexIndexBuffers(mesh);
+            var vbib = gpuVbib.Layout;
             Skinning = GetSkinning(vbib, BoneWeightCount);
 
             mesh.GetBounds();
@@ -108,15 +97,16 @@ namespace ValveResourceFormat.Renderer
             MeshIndex = meshIndex;
 
             var meshSceneObjects = mesh.Data.GetArray("m_sceneObjects");
-            ConfigureDrawCalls(scene, vbib, meshSceneObjects, initialMaterialTable, isAggregate);
+            ConfigureDrawCalls(scene, vbib, gpuVbib, meshSceneObjects, initialMaterialTable, isAggregate, shaderArguments);
 
-            if (morph != null)
+            // Without an atlas of deltas there is nothing for the composite to sample.
+            if (morph?.TextureResource != null)
             {
                 FlexStateManager = new FlexStateManager(renderContext, morph);
             }
         }
 
-        /// <summary>Returns the render mode names supported by the materials in this mesh, concatenated across draw calls (may contain duplicates).</summary>
+        /// <summary>Returns render mode names of all draw call materials, without deduplication.</summary>
         public IEnumerable<string> GetSupportedRenderModes()
             => DrawCalls
                 .SelectMany(static drawCall => drawCall.Material.Shader.RenderModes);
@@ -133,13 +123,23 @@ namespace ValveResourceFormat.Renderer
         }
 #endif
 
-        /// <summary>Assigns the GPU bone matrices buffer and resets flex controllers.</summary>
-        /// <param name="buffer">The storage buffer holding bone matrices, or <see langword="null"/> to disable skinning.</param>
-        public void SetBoneMatricesBuffer(StorageBuffer? buffer)
+        /// <summary>Turns skinning on or off for this mesh and resets flex controllers.</summary>
+        public void SetSkinningActive(bool active)
         {
-            BoneMatricesGpu = buffer;
+            IsSkinningActive = active;
 
-            FlexStateManager?.ResetControllers();
+            if (FlexStateManager is { } flexStateManager)
+            {
+                flexStateManager.ResetControllers();
+
+                var composite = flexStateManager.MorphComposite;
+
+                if (composite.IsPlaced)
+                {
+                    composite.Clear();
+                    renderContext.MorphAtlas.Queue(composite);
+                }
+            }
         }
 
         /// <summary>Recompiles all draw call materials with a modified shader static combo value.</summary>
@@ -177,12 +177,51 @@ namespace ValveResourceFormat.Renderer
 
                 if (materialTable.TryGetValue(materialName, out var replacementName))
                 {
-                    // Recycle non-material-derived shader arguments
-                    var staticParams = materialData.GetShaderArguments();
-                    var dynamicParams = new Dictionary<string, byte>(material.Shader.Parameters.Except(staticParams));
-
-                    drawCall.SetNewMaterial(renderContext.MaterialLoader.GetMaterial(replacementName, dynamicParams));
+                    ReplaceMaterial(drawCall, replacementName);
                 }
+            }
+        }
+
+        /// <summary>Replaces the material of a single draw call.</summary>
+        /// <param name="drawCall">One of <see cref="DrawCalls"/>.</param>
+        /// <param name="replacementName">Name of the replacement material.</param>
+        public void ReplaceMaterial(DrawCall drawCall, string replacementName)
+        {
+            ArgumentNullException.ThrowIfNull(drawCall);
+
+            var material = drawCall.Material;
+
+            // Recycle non-material-derived shader arguments
+            var staticParams = material.Material.GetShaderArguments();
+            var dynamicParams = new Dictionary<string, byte>(material.Shader.Parameters.Except(staticParams));
+
+            drawCall.SetNewMaterial(renderContext.MaterialLoader.GetMaterial(replacementName, dynamicParams));
+        }
+
+        /// <summary>
+        /// Replaces the material of every draw call <paramref name="shouldReplace"/> accepts, and moves each
+        /// draw call into the opaque, overlay or blended list its material now belongs in.
+        /// </summary>
+        /// <param name="replacementName">Name of the replacement material.</param>
+        /// <param name="shouldReplace">Decides from a draw call's current material whether to replace it.</param>
+        public void ReplaceMaterials(string replacementName, Func<RenderMaterial, bool> shouldReplace)
+        {
+            ArgumentNullException.ThrowIfNull(shouldReplace);
+
+            var drawCalls = DrawCalls.ToList();
+
+            DrawCallsOpaque.Clear();
+            DrawCallsOverlay.Clear();
+            DrawCallsBlended.Clear();
+
+            foreach (var drawCall in drawCalls)
+            {
+                if (shouldReplace(drawCall.Material))
+                {
+                    ReplaceMaterial(drawCall, replacementName);
+                }
+
+                AddDrawCall(drawCall, isAggregate);
             }
         }
 
@@ -251,19 +290,19 @@ namespace ValveResourceFormat.Renderer
             return boneWeightCount > 4 ? MeshSkinning.EightBones : MeshSkinning.FourBones;
         }
 
-        private void ConfigureDrawCalls(Scene scene, VBIB vbib, IReadOnlyList<KVObject> sceneObjects, Dictionary<string, string>? materialReplacementTable, bool isAggregate)
+        private void ConfigureDrawCalls(Scene scene, VBIB vbib, GPUMeshBuffers gpuVbib, IReadOnlyList<KVObject> sceneObjects, Dictionary<string, string>? materialReplacementTable, bool isAggregate,
+            IReadOnlyDictionary<string, byte>? extraShaderArguments)
         {
             if (vbib.VertexBuffers.Count == 0)
             {
                 return;
             }
 
-            var gpuVbib = renderContext.MeshBufferCache.CreateVertexIndexBuffers(Name, vbib);
-
-            // note: we are flattening the scene objects into one mesh
-            // we are not sure when there can be more than one scene object here.
+            // Scene objects are flattened into one mesh. Unsure when there can be more than one.
 
             var vertexOffset = 0;
+            var drawCallIndex = 0;
+
             foreach (var sceneObject in sceneObjects)
             {
                 var i = 0;
@@ -274,18 +313,31 @@ namespace ValveResourceFormat.Renderer
 
                 foreach (var objectDrawCall in objectDrawCalls)
                 {
-                    var materialName = objectDrawCall.GetStringProperty("m_material") ?? objectDrawCall.GetStringProperty("m_pMaterial");
-                    if (materialReplacementTable?.TryGetValue(materialName, out var replacementName) is true)
-                    {
-                        materialName = replacementName;
-                    }
+                    var index = drawCallIndex++;
+                    var materialName = Mesh.GetMaterialName(objectDrawCall);
 
                     if (materialName == null && Mesh.IsOccluder(objectDrawCall))
                     {
                         continue;
                     }
 
-                    var shaderArguments = new Dictionary<string, byte>(scene.RenderAttributes);
+                    if (materialName != null && materialReplacementTable?.TryGetValue(materialName, out var replacementName) is true)
+                    {
+                        materialName = replacementName;
+                    }
+
+                    var shaderArguments = scene.LightingInfo.CreateShaderArguments(
+                        hasLightmapUvs: Mesh.HasBakedLightingFromLightMap(objectDrawCall),
+                        hasVertexLighting: Mesh.HasBakedLightingFromVertexStream(objectDrawCall)
+                    );
+
+                    if (extraShaderArguments != null)
+                    {
+                        foreach (var (name, value) in extraShaderArguments)
+                        {
+                            shaderArguments[name] = value;
+                        }
+                    }
 
                     if (Skinning != MeshSkinning.None)
                     {
@@ -319,22 +371,9 @@ namespace ValveResourceFormat.Renderer
                         shaderArguments.Add("D_COMPRESSED_NORMALS_AND_TANGENTS", compressedVersion);
                     }
 
-                    if (Mesh.HasBakedLightingFromLightMap(objectDrawCall) && scene.LightingInfo.HasValidLightmaps)
-                    {
-                        shaderArguments.Add("D_BAKED_LIGHTING_FROM_LIGHTMAP", 1);
-                    }
-                    else if (Mesh.HasBakedLightingFromVertexStream(objectDrawCall))
-                    {
-                        shaderArguments.Add("D_BAKED_LIGHTING_FROM_VERTEX_STREAM", 1);
-                    }
-                    else if (scene.LightingInfo.HasValidLightProbes)
-                    {
-                        shaderArguments.Add("D_BAKED_LIGHTING_FROM_PROBE", 1);
-                    }
-
                     var material = renderContext.MaterialLoader.GetMaterial(materialName, shaderArguments);
 
-                    var drawCall = CreateDrawCall(objectDrawCall, material, vbib, gpuVbib);
+                    var drawCall = CreateDrawCall(objectDrawCall, index, material, vbib, gpuVbib);
                     if (i < objectDrawBounds.Count)
                     {
                         drawCall.DrawBounds = new AABB(
@@ -386,7 +425,7 @@ namespace ValveResourceFormat.Renderer
             }
         }
 
-        private DrawCall CreateDrawCall(KVObject objectDrawCall, RenderMaterial material, VBIB vbib, GPUMeshBuffers gpuVbib)
+        private DrawCall CreateDrawCall(KVObject objectDrawCall, int drawCallIndex, RenderMaterial material, VBIB vbib, GPUMeshBuffers gpuVbib)
         {
             var vertexBuffers = objectDrawCall.GetArray("m_vertexBuffers");
 
@@ -395,7 +434,8 @@ namespace ValveResourceFormat.Renderer
                 Material = material,
                 MeshBuffers = renderContext.MeshBufferCache,
                 MeshName = Name,
-                VertexBuffers = new VertexDrawBuffer[vertexBuffers.Count]
+                VertexBuffers = new VertexDrawBuffer[vertexBuffers.Count],
+                Index = drawCallIndex,
             };
 
             var primitiveType = objectDrawCall.GetEnumValue<RenderPrimitiveType>("m_nPrimitiveType");
@@ -591,6 +631,39 @@ namespace ValveResourceFormat.Renderer
             mesh.DrawCallsOpaque.Add(drawCall);
             return mesh;
         }
+
+        /// <summary>
+        /// Creates a renderable mesh with a single material over vertex and index buffers the caller owns and
+        /// may rewrite every frame. The draw call starts empty; the caller sets its <see cref="DrawCall.IndexCount"/>
+        /// to the indices it uploads, which are 32 bit.
+        /// </summary>
+        /// <param name="name">Name for the mesh.</param>
+        /// <param name="material">Material to assign to the single draw call.</param>
+        /// <param name="vertexBuffer">The vertex buffer and its layout.</param>
+        /// <param name="indexBuffer">OpenGL handle of the index buffer.</param>
+        /// <param name="renderContext">Renderer context the buffers belong to.</param>
+        /// <returns>A new <see cref="RenderableMesh"/> with one draw call, translucent when the material is.</returns>
+        public static RenderableMesh CreateMesh(string name, RenderMaterial material, VertexDrawBuffer vertexBuffer, int indexBuffer, RendererContext renderContext)
+        {
+            var mesh = new RenderableMesh(name, new AABB(), renderContext);
+
+            var drawCall = new DrawCall
+            {
+                Material = material,
+                MeshBuffers = renderContext.MeshBufferCache,
+                MeshName = name,
+                PrimitiveType = PrimitiveType.Triangles,
+                IndexType = DrawElementsType.UnsignedInt,
+                VertexBuffers = [vertexBuffer],
+                IndexBuffer = new IndexDrawBuffer()
+                {
+                    Handle = indexBuffer,
+                },
+            };
+
+            mesh.AddDrawCall(drawCall, isAggregate: false);
+            return mesh;
+        }
     }
 
     /// <summary>
@@ -598,9 +671,6 @@ namespace ValveResourceFormat.Renderer
     /// </summary>
     public abstract class MeshCollectionNode : SceneNode
     {
-        /// <summary>Gets or sets the tint color applied to all meshes in this node.</summary>
-        public abstract Vector4 Tint { get; set; }
-
         /// <inheritdoc/>
         protected MeshCollectionNode(Scene scene) : base(scene)
         {
@@ -608,5 +678,7 @@ namespace ValveResourceFormat.Renderer
 
         /// <summary>Gets the list of renderable meshes owned by this node.</summary>
         public List<RenderableMesh> RenderableMeshes { get; protected init; } = [];
+
+        internal virtual List<RenderableMesh> AllRenderableMeshes => RenderableMeshes;
     }
 }

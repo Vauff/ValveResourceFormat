@@ -2,6 +2,7 @@ using System.Drawing;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
 using GUI.Controls;
+using Microsoft.Win32;
 using Windows.Win32;
 using Windows.Win32.Foundation;
 using Windows.Win32.UI.WindowsAndMessaging;
@@ -145,6 +146,9 @@ partial class MainForm
                         case ControlsBoxPanel.CustomTitleBarHoveredButton.Close:
                             m.Result = new IntPtr(PInvoke.HTCLOSE);
                             return;
+                        case ControlsBoxPanel.CustomTitleBarHoveredButton.Discord:
+                            m.Result = new IntPtr(PInvoke.HTOBJECT);
+                            return;
                     }
                 }
 
@@ -154,7 +158,7 @@ partial class MainForm
         }
         else if (m.Msg == PInvoke.WM_NCLBUTTONDOWN)
         {
-            if ((uint)m.WParam is PInvoke.HTCLOSE or PInvoke.HTMINBUTTON or PInvoke.HTMAXBUTTON)
+            if ((uint)m.WParam is PInvoke.HTCLOSE or PInvoke.HTMINBUTTON or PInvoke.HTMAXBUTTON or PInvoke.HTOBJECT)
             {
                 m.Result = 0;
                 return;
@@ -178,6 +182,12 @@ partial class MainForm
             {
                 var mode = IsWindowMaximised() ? SHOW_WINDOW_CMD.SW_NORMAL : SHOW_WINDOW_CMD.SW_MAXIMIZE;
                 PInvoke.ShowWindow((HWND)Handle, mode);
+                m.Result = 0;
+                return;
+            }
+            else if (m.WParam == PInvoke.HTOBJECT)
+            {
+                Forms.AboutForm.OpenUrl(Forms.AboutForm.DiscordUrl);
                 m.Result = 0;
                 return;
             }
@@ -208,8 +218,7 @@ partial class MainForm
 
             if (command == SC_WEBSITE)
             {
-                using var aboutForm = new Forms.AboutForm();
-                aboutForm.OnWebsiteClick(this, EventArgs.Empty);
+                Forms.AboutForm.OpenUrl("https://s2v.app/");
                 m.Result = 0;
                 return;
             }
@@ -275,21 +284,26 @@ partial class MainForm
 
     private static readonly Lazy<bool> IsRunningOnWine = new(GetIsRunningOnWine);
 
-    // Detect Wine by checking for the `wine_get_version` export on ntdll.dll.
+    // Detect Wine by checking for the `wine_get_version` export on ntdll.dll. Wine-staging can hide that
+    // export, so fall back to the registry key that every Wine prefix has.
     private static bool GetIsRunningOnWine()
     {
-        if (!NativeLibrary.TryLoad("ntdll.dll", out var lib))
+        if (NativeLibrary.TryLoad("ntdll.dll", out var lib))
         {
-            return false;
+            try
+            {
+                if (NativeLibrary.TryGetExport(lib, "wine_get_version", out _))
+                {
+                    return true;
+                }
+            }
+            finally
+            {
+                NativeLibrary.Free(lib);
+            }
         }
 
-        try
-        {
-            return NativeLibrary.TryGetExport(lib, "wine_get_version", out _);
-        }
-        finally
-        {
-            NativeLibrary.Free(lib);
-        }
+        using var wineKey = Registry.LocalMachine.OpenSubKey(@"Software\Wine");
+        return wineKey != null;
     }
 }

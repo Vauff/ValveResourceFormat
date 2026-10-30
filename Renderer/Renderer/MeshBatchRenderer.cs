@@ -1,7 +1,6 @@
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using OpenTK.Graphics.OpenGL;
-using ValveResourceFormat.Renderer.Buffers;
 using ValveResourceFormat.Renderer.World;
 
 namespace ValveResourceFormat.Renderer
@@ -17,7 +16,7 @@ namespace ValveResourceFormat.Renderer
 #if DEBUG
         [DebuggerDisplay("{Node.DebugName,nq}")]
 #endif
-        public record struct Request(RenderableMesh Mesh, DrawCall? Call, float DistanceFromCamera, int RenderOrder, SceneNode Node);
+        public readonly record struct Request(RenderableMesh Mesh, DrawCall? Call, float DistanceFromCamera, int RenderOrder, SceneNode Node);
         record struct BatchRequest(RenderableMesh Mesh, DrawCall Call, SceneNode Node);
 
         /// <summary>Compares two requests by shader pipeline sort ID, placing custom-render nodes at the boundary.</summary>
@@ -45,32 +44,51 @@ namespace ValveResourceFormat.Renderer
             return a.RenderOrder - b.RenderOrder;
         }
 
-        /// <summary>Compares two requests by distance from camera, furthest first (back-to-front).</summary>
+        /// <summary>Compares two requests by distance from camera, furthest first (back-to-front), with ties in a stable order.</summary>
         public static int CompareCameraDistance(Request a, Request b)
         {
-            return -a.DistanceFromCamera.CompareTo(b.DistanceFromCamera);
+            var byDistance = b.DistanceFromCamera.CompareTo(a.DistanceFromCamera);
+            if (byDistance != 0)
+            {
+                return byDistance;
+            }
+
+            var byNode = a.Node.Id.CompareTo(b.Node.Id);
+            if (byNode != 0 || a.Call == null || b.Call == null)
+            {
+                return byNode;
+            }
+
+            var byMesh = a.Mesh.MeshIndex.CompareTo(b.Mesh.MeshIndex);
+            if (byMesh != 0)
+            {
+                return byMesh;
+            }
+
+            return a.Call.Index.CompareTo(b.Call.Index);
         }
 
-        /// <summary>Compares two requests by alpha-test flag first, then by shader program sort ID.</summary>
-        public static int CompareAlphaTestThenProgram(Request a, Request b)
+        /// <summary>Compares two requests by draw stage first, then by shader program sort ID.</summary>
+        public static int CompareStageThenProgram(Request a, Request b)
         {
             Debug.Assert(a.Call != null && b.Call != null);
-            var alphaTestA = a.Call.Material.IsAlphaTest;
-            var alphaTestB = b.Call.Material.IsAlphaTest;
+            var stageA = DrawStage(a.Call.Material);
+            var stageB = DrawStage(b.Call.Material);
 
-            if (alphaTestA == alphaTestB)
+            if (stageA == stageB)
             {
                 return a.Call.Material.SortId - b.Call.Material.SortId;
             }
 
-            return alphaTestA.CompareTo(alphaTestB);
+            return stageA - stageB;
         }
 
-        /// <summary>Returns <see langword="true"/> if the request is a <see cref="SceneAggregate"/> with no visible children.</summary>
-        public static bool IsAggregateWithNoVisibleChildren(Request req)
+        private static int DrawStage(RenderMaterial material) => material switch
         {
-            return req.Node is SceneAggregate { AnyChildrenVisible: false };
-        }
+            { IsOverlay: true } => 2,
+            { IsAlphaTest: true } => 1,
+            _ => 0,
+        };
 
         /// <summary>Sorts requests according to the active render pass and issues all draw calls.</summary>
         /// <param name="requests">Draw call requests to process.</param>
@@ -80,7 +98,7 @@ namespace ValveResourceFormat.Renderer
             // Material-ignoring replacement shaders draw without applying render state, so a scope
             // latches the pass baseline for them.
             using var batchScope = context.ReplacementShader?.IgnoreMaterialData == true
-                ? context.Scene.RendererContext.RenderState.Scope()
+                ? GraphicsContext.RenderState.Scope()
                 : default;
 
             if (context.RenderPass is RenderPass.Opaque or RenderPass.OpaqueRefract)
@@ -89,9 +107,7 @@ namespace ValveResourceFormat.Renderer
             }
             else if (context.RenderPass == RenderPass.OpaqueAggregate)
             {
-                using var _ = new GLDebugGroup("Sort Indirect Draws");
-                var removed = requests.RemoveAll(IsAggregateWithNoVisibleChildren);
-                requests.Sort(CompareAlphaTestThenProgram);
+                requests.Sort(CompareStageThenProgram);
             }
             else if (context.RenderPass == RenderPass.StaticOverlay)
             {
@@ -120,32 +136,39 @@ namespace ValveResourceFormat.Renderer
 
         private ref struct Uniforms
         {
-            public int AnimationData = -1;
-            public int EnvmapTexture = -1;
-            public int LPVIrradianceTexture = -1;
-            public int Transform = -1;
-            public int IsInstancing = -1;
-            public int Tint = -1;
             public int MeshId = -1;
             public int ShaderId = -1;
             public int ShaderProgramId = -1;
-            public int MorphVertexIdOffset = -1;
 
             public Uniforms() { }
         }
 
         private ref struct Config
         {
-            public bool NeedsCubemapBinding;
-            public int LightmapGameVersionNumber;
             public bool IndirectDraw;
-            public LightProbeType LightProbeType;
         }
 
-        /// <summary>Binds a per-draw texture over its reserved unit.</summary>
-        private static void BindInstanceTexture(ReservedTextureSlots slot, RenderTexture texture)
+        /// <summary>Picks the program a draw runs with: the pass's replacement shader, the material's mode for this pass, or the material's own.</summary>
+        private static Shader ResolveShader(Scene.RenderContext context, RenderableMesh mesh, RenderMaterial material)
         {
-            GL.BindTextureUnit((int)slot, texture.Handle);
+            if (context.ReplacementShader is { } replacement)
+            {
+                return replacement.WithSkinning(mesh.ActiveSkinning).WithAlphaTest(material.IsAlphaTest).WithMorph(material.Shader);
+            }
+
+            if (context.DepthOnlyShader is { } depthOnly)
+            {
+                return material.Shader.DepthMode
+                    ?? depthOnly.WithSkinning(mesh.ActiveSkinning).WithAlphaTest(material.IsAlphaTest).WithMorph(material.Shader);
+            }
+
+            if (context.OverdrawShader is { } overdraw)
+            {
+                return material.Shader.OverdrawMode
+                    ?? overdraw.WithSkinning(mesh.ActiveSkinning).WithAlphaTest(material.IsAlphaTest);
+            }
+
+            return material.Shader;
         }
 
         private static void DrawBatch(List<Request> requests, Scene.RenderContext context)
@@ -156,10 +179,8 @@ namespace ValveResourceFormat.Renderer
             Uniforms uniforms = new();
             Config config = new()
             {
-                NeedsCubemapBinding = context.Scene.LightingInfo.CubemapType == CubemapType.IndividualCubemaps,
-                LightmapGameVersionNumber = context.Scene.LightingInfo.LightmapGameVersionNumber,
-                LightProbeType = context.Scene.LightingInfo.LightProbeType,
-                IndirectDraw = context.Scene.DrawMeshletsIndirect && context.RenderPass < RenderPass.Opaque,
+                IndirectDraw = context.Scene.DrawMeshletsIndirect
+                    && context.RenderPass is RenderPass.DepthOnly or RenderPass.OpaqueAggregate or RenderPass.StaticOverlay,
             };
 
             var counters = PerfStats.Active;
@@ -168,7 +189,7 @@ namespace ValveResourceFormat.Renderer
             {
                 if (request.Call == null)
                 {
-                    if (context.RenderPass is RenderPass.Opaque or RenderPass.Translucent or RenderPass.Outline or RenderPass.DepthOnly)
+                    if (context.RenderPass is RenderPass.Opaque or RenderPass.Translucent or RenderPass.All or RenderPass.DepthOnly)
                     {
                         material?.PostRender();
 
@@ -176,14 +197,11 @@ namespace ValveResourceFormat.Renderer
                         counters.Count(Counter.DrawCall);
                         request.Node.Render(context);
 
-                        // Custom nodes bind over the reserved units, so restore them.
-                        BindReservedTextures(context);
-
                         if (context.ReplacementShader?.IgnoreMaterialData == true)
                         {
                             // The node's scope left its own state latched, and the stateless draws
                             // that follow cannot set any themselves.
-                            context.Scene.RendererContext.RenderState.RestorePassBaseline();
+                            GraphicsContext.RenderState.RestorePassBaseline();
                         }
 
                         shader = null;
@@ -196,7 +214,7 @@ namespace ValveResourceFormat.Renderer
 
                 var requestMaterial = request.Call.Material;
 
-                var requestShader = context.ReplacementShader?.WithSkinning(request.Mesh.ActiveSkinning) ?? requestMaterial.Shader;
+                var requestShader = ResolveShader(context, request.Mesh, requestMaterial);
 
                 if (material != requestMaterial || shader != requestShader)
                 {
@@ -210,28 +228,7 @@ namespace ValveResourceFormat.Renderer
                     if (shader != requestShader)
                     {
                         shader = requestShader;
-                        uniforms = new Uniforms
-                        {
-                            AnimationData = shader.GetUniformLocation("uAnimationData"),
-                            Transform = shader.GetUniformLocation("transform"),
-                            IsInstancing = shader.GetUniformLocation("bIsInstancing"),
-                            Tint = shader.GetUniformLocation("vTint"),
-                        };
-
-                        if (shader.Parameters.ContainsKey("S_SCENE_CUBEMAP_TYPE"))
-                        {
-                            uniforms.EnvmapTexture = shader.GetUniformLocation("g_tEnvironmentMap");
-                        }
-
-                        if (shader.Parameters.ContainsKey("F_MORPH_SUPPORTED"))
-                        {
-                            uniforms.MorphVertexIdOffset = shader.GetUniformLocation("morphVertexIdOffset");
-                        }
-
-                        if (shader.Parameters.ContainsKey("D_BAKED_LIGHTING_FROM_PROBE"))
-                        {
-                            uniforms.LPVIrradianceTexture = shader.GetUniformLocation("g_tLPV_Irradiance");
-                        }
+                        uniforms = new Uniforms();
 
                         if (shader.Name == "picking")
                         {
@@ -245,17 +242,11 @@ namespace ValveResourceFormat.Renderer
                         Debug.Assert(context.Scene.InstanceBufferGpu != null && context.Scene.TransformBufferGpu != null);
                         context.Scene.TransformBufferGpu.BindBufferBase();
                         context.Scene.InstanceBufferGpu.BindBufferBase();
-
-                        context.Scene.TransformBufferGpu.BindBufferBase(ReservedBufferSlots.BoneTransforms);
-
-                        if (config.IndirectDraw)
-                        {
-                            GL.ProgramUniform1((uint)shader.Program, uniforms.IsInstancing, 1);
-                        }
+                        context.Scene.ObjectBufferGpu?.BindBufferBase();
                     }
 
                     material = requestMaterial;
-                    material.Render(shader);
+                    material.Render(shader, depthPass: context.DepthOnlyShader != null);
                 }
 
                 var requestVao = request.Call.GetVertexArrayObject();
@@ -288,37 +279,10 @@ namespace ValveResourceFormat.Renderer
                 GL.ProgramUniform1((uint)shader.Program, uniforms.ShaderProgramId, (uint)request.Call.Material.Shader.Program);
             }
 
-            if (uniforms.AnimationData != -1)
-            {
-                var bAnimated = request.Mesh.BoneMatricesGpu != null;
-                var numBones = 0u;
-                var boneStart = 0u;
-
-                if (bAnimated)
-                {
-                    request.Mesh.BoneMatricesGpu!.BindBufferBase();
-                    numBones = (uint)request.Mesh.MeshBoneCount;
-                    boneStart = (uint)request.Mesh.MeshBoneOffset;
-                }
-                else
-                {
-                    // todo: this is not resetting when there are no aggregates in scene
-                    request.Node.Scene.TransformBufferGpu?.BindBufferBase(ReservedBufferSlots.BoneTransforms);
-                }
-
-                GL.ProgramUniform3((uint)shader.Program, uniforms.AnimationData, bAnimated ? 1u : 0u, boneStart, numBones);
-            }
-
             if (config.IndirectDraw)
             {
                 if (request.Node is SceneAggregate agg && agg.IndirectDrawCount > 0)
                 {
-                    // Non-indirect draws below reset this program uniform
-                    if (uniforms.IsInstancing > -1)
-                    {
-                        GL.ProgramUniform1((uint)shader.Program, uniforms.IsInstancing, 1);
-                    }
-
                     PerfStats.Active.CountIndirectDraw(agg.IndirectDrawCount);
 
                     var scene = agg.Scene;
@@ -339,43 +303,11 @@ namespace ValveResourceFormat.Renderer
                 }
             }
 
-            if (config.NeedsCubemapBinding && uniforms.EnvmapTexture != -1 && request.Node.EnvMaps.Count > 0)
+            if (request.Node is SceneClutter clutter)
             {
-                var envmap = request.Node.EnvMaps[0];
-                BindInstanceTexture(ReservedTextureSlots.EnvironmentMap, envmap.EnvMapTexture);
-            }
-
-            if (config.LightProbeType == LightProbeType.IndividualProbes && uniforms.LPVIrradianceTexture != -1
-                && request.Node.LightProbeBinding is { } lightProbe)
-            {
-                request.Node.Scene.LightingInfo.BindInstanceLightProbeTextures(lightProbe);
-            }
-
-            if (uniforms.MorphVertexIdOffset != -1)
-            {
-                var morphComposite = request.Mesh.FlexStateManager?.MorphComposite;
-
-                BindInstanceTexture(ReservedTextureSlots.MorphCompositeTexture,
-                    morphComposite?.CompositeTexture ?? request.Node.Scene.RendererContext.MaterialLoader.GetDefaultColor());
-
-                GL.ProgramUniform1(shader.Program, uniforms.MorphVertexIdOffset, morphComposite != null ? request.Call.VertexIdOffset : -1);
-            }
-
-            if (uniforms.Transform > -1)
-            {
-                var transform = request.Node.Transform.To3x4();
-                GL.ProgramUniformMatrix3x4(shader.Program, uniforms.Transform, false, ref transform);
-            }
-
-            if (uniforms.Tint > -1)
-            {
-                var instanceTint = (request.Node is SceneAggregate.Fragment fragment) ? fragment.Tint : Vector4.One;
-
-                // Content can author out-of-range tints (e.g. renderamt above 255 baked into the draw call
-                // alpha); the packed byte color can only represent [0, 1].
-                var tint = Color32.FromVector4Clamped(request.Mesh.Tint * request.Call.TintColor * instanceTint);
-
-                GL.ProgramUniform1((uint)shader.Program, uniforms.Tint, tint.PackedValue);
+                PerfStats.Active.CountDrawCall(request.Node);
+                clutter.Scene.ClutterCuller?.Draw(clutter, request.Call);
+                return;
             }
 
             var instanceCount = 1;
@@ -383,11 +315,6 @@ namespace ValveResourceFormat.Renderer
             if (request.Node is SceneAggregate { InstanceTransforms.Count: > 0 } aggregate)
             {
                 instanceCount = aggregate.InstanceTransforms.Count;
-            }
-
-            if (uniforms.IsInstancing > -1)
-            {
-                GL.ProgramUniform1((uint)shader.Program, uniforms.IsInstancing, instanceCount > 1 ? 1 : 0);
             }
 
             PerfStats.Active.CountDrawCall(request.Node);
@@ -399,7 +326,7 @@ namespace ValveResourceFormat.Renderer
                 request.Call.StartIndex,
                 instanceCount,
                 request.Call.BaseVertex,
-                request.Node.Id
+                request.Node is MeshCollectionNode ? request.Call.InstanceBufferIndex : request.Node.Id
             );
         }
     }

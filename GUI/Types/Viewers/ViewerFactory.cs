@@ -1,8 +1,7 @@
 using System.IO;
 using System.Threading.Tasks;
 using GUI.Utils;
-using SteamDatabase.ValvePak;
-using ValveResourceFormat.IO;
+using ValvePak;
 
 namespace GUI.Types.Viewers;
 
@@ -24,7 +23,7 @@ static class ViewerFactory
                 throw new InvalidDataException("Parent context or package is null");
             }
 
-            stream = GameFileLoader.GetPackageEntryStream(parentContext.CurrentPackage, entry);
+            stream = parentContext.CurrentPackage.GetMemoryMappedStreamIfPossible(entry);
 
             if (stream.Length >= magicData.Length)
             {
@@ -47,8 +46,13 @@ static class ViewerFactory
 
         if (PackageViewer.PackageViewer.IsAccepted(magic))
         {
+            if (stream != null)
+            {
+                await stream.DisposeAsync().ConfigureAwait(false);
+            }
+
             var viewer = new PackageViewer.PackageViewer(vrfGuiContext);
-            await viewer.LoadAsync(stream).ConfigureAwait(false);
+            viewer.Load(entry);
             return viewer;
         }
         else if (CompiledShader.IsAccepted(magic))
@@ -81,6 +85,12 @@ static class ViewerFactory
             await viewer.LoadAsync(stream).ConfigureAwait(false);
             return viewer;
         }
+        else if (NavSpaceView.IsAccepted(magic))
+        {
+            var viewer = new NavSpaceView(vrfGuiContext);
+            await viewer.LoadAsync(stream).ConfigureAwait(false);
+            return viewer;
+        }
         else if (BinaryKeyValues3.IsAccepted(magic))
         {
             var viewer = new BinaryKeyValues3(vrfGuiContext);
@@ -101,7 +111,7 @@ static class ViewerFactory
         }
         else if (Resource.IsAccepted(magicResourceVersion))
         {
-            var viewer = new Resource(vrfGuiContext, viewMode, verifyFileSize: entry == null || entry.CRC32 > 0);
+            var viewer = new Resource(vrfGuiContext, viewMode);
             await viewer.LoadAsync(stream).ConfigureAwait(false);
             return viewer;
         }

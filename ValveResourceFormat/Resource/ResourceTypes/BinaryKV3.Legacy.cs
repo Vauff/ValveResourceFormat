@@ -1,9 +1,10 @@
 using System.Buffers;
-using System.Diagnostics;
 using System.IO;
 using ValveKeyValue;
+using ValveKeyValue.KeyValues3;
 using ValveResourceFormat.Compression;
 using ValveResourceFormat.Serialization.KeyValues;
+using ValveResourceFormat.Utils;
 
 namespace ValveResourceFormat.ResourceTypes
 {
@@ -16,46 +17,10 @@ namespace ValveResourceFormat.ResourceTypes
                 Version = 0,
             };
 
-            var encoding = KV3IDLookup.GetByValue(new Guid(reader.ReadBytes(16)));
-            var format = KV3IDLookup.GetByValue(new Guid(reader.ReadBytes(16)));
-
-            // Valve's implementation lives in LoadKV3Binary()
-            // KV3_ENCODING_BINARY_BLOCK_COMPRESSED calls CBlockCompress::FastDecompress()
-            // and then it proceeds to call LoadKV3BinaryUncompressed, which should be the same routine for KV3_ENCODING_BINARY_UNCOMPRESSED
-            // Old binary with debug symbols for ref: https://users.alliedmods.net/~asherkin/public/bins/dota_symbols/bin/osx64/libmeshsystem.dylib
-
-            byte[]? outputBuf = null;
+            var outputBuf = DecompressVersion0(reader, Offset + Size, out var format, out var outBufferLength);
 
             try
             {
-                int outBufferLength;
-
-                if (encoding == KV3IDLookup.Get("binary_bc"))
-                {
-                    var info = BlockCompress.GetDecompressedSize(reader);
-                    outBufferLength = info.Size;
-                    outputBuf = ArrayPool<byte>.Shared.Rent(outBufferLength);
-
-                    BlockCompress.FastDecompress(info, reader, outputBuf.AsSpan(0, outBufferLength));
-                }
-                else if (encoding == KV3IDLookup.Get("binary_lz4"))
-                {
-                    outBufferLength = reader.ReadInt32();
-                    var compressedSize = (int)(Size - (reader.BaseStream.Position - Offset));
-                    outputBuf = ArrayPool<byte>.Shared.Rent(outBufferLength);
-                    DecompressLZ4(reader, outputBuf.AsSpan(0, outBufferLength), compressedSize);
-                }
-                else if (encoding == KV3IDLookup.Get("binary"))
-                {
-                    outBufferLength = (int)(Size - (reader.BaseStream.Position - Offset));
-                    outputBuf = ArrayPool<byte>.Shared.Rent(outBufferLength);
-                    reader.Read(outputBuf.AsSpan(0, outBufferLength));
-                }
-                else
-                {
-                    throw new UnexpectedMagicException("Unrecognised KV3 Encoding", encoding.ToString(), nameof(encoding));
-                }
-
                 using var outStream = new MemoryStream(outputBuf, 0, outBufferLength);
                 using var outRead = new BinaryReader(outStream, System.Text.Encoding.UTF8, true);
 
@@ -81,11 +46,51 @@ namespace ValveResourceFormat.ResourceTypes
             }
             finally
             {
-                if (outputBuf != null)
-                {
-                    ArrayPool<byte>.Shared.Return(outputBuf);
-                }
+                ArrayPool<byte>.Shared.Return(outputBuf);
             }
+        }
+
+        /// <returns>A buffer rented from <see cref="ArrayPool{T}.Shared"/> that holds <paramref name="length"/> decompressed bytes.</returns>
+        private static byte[] DecompressVersion0(BinaryReader reader, long blockEnd, out KV3ID format, out int length)
+        {
+            var encoding = KV3IDLookup.GetByValue(reader.ReadGuid());
+            format = KV3IDLookup.GetByValue(reader.ReadGuid());
+
+            // Valve's implementation lives in LoadKV3Binary()
+            // KV3_ENCODING_BINARY_BLOCK_COMPRESSED calls CBlockCompress::FastDecompress()
+            // and then it proceeds to call LoadKV3BinaryUncompressed, which should be the same routine for KV3_ENCODING_BINARY_UNCOMPRESSED
+            // Old binary with debug symbols for ref: https://users.alliedmods.net/~asherkin/public/bins/dota_symbols/bin/osx64/libmeshsystem.dylib
+
+            byte[] output;
+
+            if (encoding == KV3IDLookup.Get("binary_bc"))
+            {
+                var info = BlockCompress.GetDecompressedSize(reader);
+                length = info.Size;
+                output = ArrayPool<byte>.Shared.Rent(length);
+
+                BlockCompress.FastDecompress(info, reader, output.AsSpan(0, length));
+            }
+            else if (encoding == KV3IDLookup.Get("binary_lz4"))
+            {
+                length = reader.ReadInt32();
+                var compressedSize = (int)(blockEnd - reader.BaseStream.Position);
+                output = ArrayPool<byte>.Shared.Rent(length);
+                DecompressLZ4(reader, output.AsSpan(0, length), compressedSize);
+            }
+            else if (encoding == KV3IDLookup.Get("binary") || encoding == KV3IDLookup.Get("binary_zstd") || encoding == KV3IDLookup.Get("binary_auto"))
+            {
+                // Only block compression and LZ4 were ever implemented for this header, other binary encodings are stored as is
+                length = (int)(blockEnd - reader.BaseStream.Position);
+                output = ArrayPool<byte>.Shared.Rent(length);
+                reader.ReadExactly(output.AsSpan(0, length));
+            }
+            else
+            {
+                throw new UnexpectedMagicException("Unrecognised KV3 Encoding", encoding.ToString(), nameof(encoding));
+            }
+
+            return output;
         }
 
         private static (KV3BinaryNodeType Type, KVFlag Flag) LegacyReadType(BinaryReader reader)
@@ -93,33 +98,49 @@ namespace ValveResourceFormat.ResourceTypes
             var databyte = reader.ReadByte();
             var flagInfo = KVFlag.None;
 
-            if ((databyte & 0x80) > 0)
+            if ((databyte & 0x80) != 0)
             {
-                databyte &= 0x7F; // Remove the flag bit
-
-                flagInfo = (KVFlag)reader.ReadByte();
-
-                if (((int)flagInfo & 4) > 0) // Multiline string
-                {
-                    Debug.Assert(databyte == (int)KV3BinaryNodeType.STRING);
-                    flagInfo ^= (KVFlag)4;
-                }
-
-                // Strictly speaking there could be more than one flag set, but in practice it was seemingly never.
-                // Valve's new code just sets whichever flag is highest, new kv3 version does not support multiple flags at once.
-                flagInfo = (int)flagInfo switch
-                {
-                    0 => KVFlag.None,
-                    1 => KVFlag.Resource,
-                    2 => KVFlag.ResourceName,
-                    8 => KVFlag.Panorama,
-                    16 => KVFlag.SoundEvent,
-                    32 => KVFlag.SubClass,
-                    _ => throw new UnexpectedMagicException("Unexpected kv3 flag", (int)flagInfo, nameof(flagInfo))
-                };
+                flagInfo = ConvertLegacyFlags(reader.ReadByte());
             }
 
-            return ((KV3BinaryNodeType)databyte, flagInfo);
+            return ((KV3BinaryNodeType)(databyte & 0x7F), flagInfo);
+        }
+
+        // Before version 3 flags were a bit field
+        private static KVFlag ConvertLegacyFlags(byte flags)
+        {
+            if ((flags & 0x80) != 0)
+            {
+                throw new UnexpectedMagicException("Unexpected kv3 flag", flags, nameof(flags));
+            }
+
+            // Only one flag can be stored, the lowest set bit wins. Bit 4 marked multiline strings and is dropped.
+            if ((flags & 1) != 0)
+            {
+                return KVFlag.Resource;
+            }
+
+            if ((flags & 2) != 0)
+            {
+                return KVFlag.ResourceName;
+            }
+
+            if ((flags & 8) != 0)
+            {
+                return KVFlag.Panorama;
+            }
+
+            if ((flags & 16) != 0)
+            {
+                return KVFlag.SoundEvent;
+            }
+
+            if ((flags & 32) != 0)
+            {
+                return KVFlag.SubClass;
+            }
+
+            return KVFlag.None;
         }
 
         private static void LegacyParseBinaryKV3(Context context, BinaryReader reader, KVObject parent)
@@ -128,8 +149,7 @@ namespace ValveResourceFormat.ResourceTypes
 
             if (!parent.IsArray)
             {
-                var stringID = reader.ReadInt32();
-                name = (stringID == -1) ? string.Empty : context.Strings[stringID];
+                name = GetString(context, reader.ReadInt32());
             }
 
             var (datatype, flagInfo) = LegacyReadType(reader);
@@ -137,7 +157,8 @@ namespace ValveResourceFormat.ResourceTypes
 
             if (name != null)
             {
-                parent.Add(name, result);
+                // A repeated member name replaces the earlier value
+                parent[name] = result;
             }
             else
             {
@@ -188,8 +209,7 @@ namespace ValveResourceFormat.ResourceTypes
                 case KV3BinaryNodeType.DOUBLE_ONE:
                     return 1.0D;
                 case KV3BinaryNodeType.STRING:
-                    var id = reader.ReadInt32();
-                    return id == -1 ? string.Empty : context.Strings[id];
+                    return GetString(context, reader.ReadInt32());
                 case KV3BinaryNodeType.BINARY_BLOB:
                     var length = reader.ReadInt32();
                     return reader.ReadBytes(length);

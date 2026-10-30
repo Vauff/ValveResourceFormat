@@ -1,3 +1,5 @@
+using System.Numerics.Tensors;
+
 namespace ValveResourceFormat.Renderer;
 
 /// <summary>Describes the position and size of a shadow map region within the atlas texture.</summary>
@@ -24,7 +26,7 @@ public class ShadowAtlasPacker
     public void Begin(int atlasSize)
     {
         gridCells = Math.Max(atlasSize / CellSize, 0);
-        wordsPerRow = (gridCells + 63) >> 6;
+        wordsPerRow = MathUtils.DivideRoundUp(gridCells, 64);
 
         if (combinedRow.Length < wordsPerRow)
         {
@@ -55,8 +57,8 @@ public class ShadowAtlasPacker
             return false;
         }
 
-        var wCells = (width + CellSize - 1) / CellSize;
-        var hCells = (height + CellSize - 1) / CellSize;
+        var wCells = MathUtils.DivideRoundUp(width, CellSize);
+        var hCells = MathUtils.DivideRoundUp(height, CellSize);
 
         if (wCells > gridCells || hCells > gridCells)
         {
@@ -93,10 +95,7 @@ public class ShadowAtlasPacker
         for (var r = y + 1; r < y + hCells; r++)
         {
             var row = occupancy.AsSpan(r * wordsPerRow, wordsPerRow);
-            for (var w = 0; w < combined.Length; w++)
-            {
-                combined[w] |= row[w];
-            }
+            TensorPrimitives.BitwiseOr(combined, row, combined);
         }
 
         combined[^1] |= lastWordOccupiedTail;

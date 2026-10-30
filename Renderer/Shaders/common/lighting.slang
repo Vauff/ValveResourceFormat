@@ -3,44 +3,47 @@
 #ifndef VRF_LIGHTING_INCLUDE
 #define VRF_LIGHTING_INCLUDE
 
-#include "features.slang"
+#include "shared_combos.slang"
 
-#define S_SCENE_PROBE_TYPE 0 // 1 = Individual, 2 = Atlas
+#include "light_cull.slang"
+#include "object_data.slang"
+#include "envmap_data.slang"
 
 #define renderMode_Illumination 0
 #define renderMode_Diffuse 0
 #define renderMode_Specular 0
 #define renderMode_Irradiance 0
-#define renderMode_IrradianceDebug 0
+#define renderMode_LightmapCharts 0
 #define renderMode_Occlusion 0
 #define renderMode_LightmapShadows 0
 #define renderMode_LightTiles 0
 #define renderMode_Subgroups 0
 
 #if (D_BAKED_LIGHTING_FROM_LIGHTMAP == 1)
-    centroid in vec3 vLightmapUVScaled;
+    centroid in vec4 vLightmapUVScaled; // GetLightmapCoordinates
     uniform sampler2DArray g_tIrradiance; // reserved
-    uniform sampler2DArray g_tIrradianceDebugChart; // reserved
-    #if (S_LIGHTMAP_VERSION_MINOR >= 3)
+    uniform sampler2DArray g_tLightmapDebugCharts; // reserved
+    #if (LIGHTMAP_SH_LUMINANCE)
+        uniform sampler2DArray g_tDirectionalIrradianceLum; // reserved
+    #elif (LIGHTMAP_SH)
         uniform sampler2DArray g_tDirectionalIrradianceR; // reserved
         uniform sampler2DArray g_tDirectionalIrradianceG; // reserved
         uniform sampler2DArray g_tDirectionalIrradianceB; // reserved
     #else
         uniform sampler2DArray g_tDirectionalIrradiance; // reserved
     #endif
-    #if (S_LIGHTMAP_VERSION_MINOR == 1)
+    #if (BAKED_LIGHT_INDICES)
         uniform sampler2DArray g_tDirectLightIndices; // reserved
         uniform sampler2DArray g_tDirectLightStrengths; // reserved
-    #elif (S_LIGHTMAP_VERSION_MINOR >= 2)
+    #elif (BAKED_LIGHT_SHADOW_MASK)
         uniform sampler2DArray g_tDirectLightShadows; // reserved
     #endif
 #elif (D_BAKED_LIGHTING_FROM_PROBE == 1)
-    #include "lighting.lpv.slang"
+    #include "lighting_lpv.slang"
 #elif (D_BAKED_LIGHTING_FROM_VERTEX_STREAM == 1)
     in vec3 vPerVertexLightingOut;
 #endif
 
-#include "features.slang"
 #include "utils.slang"
 #include "texturing.slang"
 
@@ -48,19 +51,23 @@
 #include "shadowmapping.slang"
 
 #include "pbr.slang"
-#include "environment.slang"
+#include "envmap.slang"
 
-#include "lighting.barn.slang"
+#include "lighting_barn.slang"
+
+#ifndef DYNAMIC_LIGHT_ROUGHNESS_SHAPED_DIFFUSE
+    #define DYNAMIC_LIGHT_ROUGHNESS_SHAPED_DIFFUSE 0 // Lightmap version 1 shades the dynamic lights, not the baked ones, with GetRoughnessShapedDiffuse()
+#endif
 
 const float MIN_LIGHT_ALPHA = 0.0001;
 
-void CalculateShadingGated(inout LightingTerms_t lighting, vec3 lightVector, vec3 lightColor, MaterialProperties_t mat, uint nLightIndex)
+void CalculateShadingGated(inout LightingTerms_t lighting, vec3 lightVector, vec3 lightColor, MaterialProperties_t mat, uint nLightIndex, bool roughnessShapedDiffuse)
 {
     vec3 previousDiffuse = lighting.DiffuseDirect;
     vec3 previousSpecular = lighting.SpecularDirect;
     vec3 previousTransmissive = lighting.TransmissiveDirect;
 
-    CalculateShading(lighting, lightVector, lightColor, mat);
+    CalculateShading(lighting, lightVector, lightColor, mat, roughnessShapedDiffuse);
 
     vec3 vRenderGates = GetLightRenderGates(nLightIndex);
 
@@ -92,6 +99,8 @@ void CalculateSunLighting(inout LightingTerms_t lighting, MaterialProperties_t m
     {
         vec3 previousSpecular = lighting.SpecularDirect;
 
+        ApplyMinRoughness(mat, g_vSunDirection.w);
+
         CalculateShading(lighting, GetSunDirection(), vSunColor * visibility, mat);
 
         if (g_vSunColor.a == 0.0)
@@ -108,7 +117,12 @@ float CalculateStationaryLightRealtimeShadow(uint nLightIndex, vec3 vPositionWs)
         return CalculateSunShadowMapVisibility(vPositionWs);
     }
 
-    // todo
+    // TODO: one stationary light per view, the index in g_vBakedLightShadowIntParams.x, gets a realtime
+    // shadow map that scales its baked strength by lerp(1, shadow, g_vBakedLightShadowStrengthVignette.x).
+    // With g_vBakedLightCascadeThreshold[0].w set it reads two cascades through g_matWorldToBakedLightShadow[0..1],
+    // faded by smoothstep(1, vignette.y or .z, max(|dot(threshold[2c], pos)|, |dot(threshold[2c+1], pos)|));
+    // otherwise one projection through g_matWorldToBakedLightShadow[0], lit outside g_vBakedLightShadowBounds.
+    // Each read is a 3x3 PCF. The engine picks the light per view, by a rule not known here.
     return 1.0;
 }
 
@@ -144,7 +158,7 @@ void CalculateDynamicLightV1(inout LightingTerms_t lighting, MaterialProperties_
     {
         vec3 vToLight = GetLightPositionWs(nLightIndex) - mat.PositionWS;
         vLightVector = normalize(vToLight);
-        flDistanceSquared = dot(vToLight, vToLight);
+        flDistanceSquared = length_squared(vToLight);
     }
 
     if (flDistanceSquared > vFalloffParams.z)
@@ -170,182 +184,386 @@ void CalculateDynamicLightV1(inout LightingTerms_t lighting, MaterialProperties_
         return;
     }
 
-    CalculateShadingGated(lighting, vLightVector, GetLightColor(nLightIndex) * flAttenuation, mat, nLightIndex);
+    bool roughnessShapedDiffuse = false;
+
+    #if (DYNAMIC_LIGHT_ROUGHNESS_SHAPED_DIFFUSE) && (BAKED_LIGHT_INDICES)
+        roughnessShapedDiffuse = true;
+    #endif
+
+    CalculateShadingGated(lighting, vLightVector, GetLightColor(nLightIndex) * flAttenuation, mat, nLightIndex, roughnessShapedDiffuse);
 }
 
-void CalculateDirectLighting(inout LightingTerms_t lighting, inout MaterialProperties_t mat)
-{
-    vec4 dlsh = vec4(1, 1, 1, 1);
+#if (D_BAKED_LIGHTING_FROM_LIGHTMAP == 1) && (BAKED_LIGHT_SHADOW_MASK)
+    // Cubic B-spline filtering from four bilinear taps, to soften the texel steps of baked shadows
+    vec4 SampleLightmapShadowsBicubic(vec2 uv, vec2 size)
+    {
+        vec2 texel = uv * size - 0.5;
+        vec2 base = floor(texel);
+        vec2 f = texel - base;
+        vec2 f2 = f * f;
+        vec2 f3 = f2 * f;
 
-    #if (S_LIGHTMAP_VERSION_MINOR == 1)
-        #if (D_BAKED_LIGHTING_FROM_VERTEX_STREAM == 1)
-            // Per-vertex baked geometry carries no direct light info.
-        #elif (D_BAKED_LIGHTING_FROM_LIGHTMAP == 1) || (D_BAKED_LIGHTING_FROM_PROBE == 1)
-            #if (D_BAKED_LIGHTING_FROM_LIGHTMAP == 1)
-                vec4 dls = texture(g_tDirectLightStrengths, mat.LightmapUv);
-                vec4 dli = texture(g_tDirectLightIndices, mat.LightmapUv);
-            #else
-                vec3 vLightProbeShadowCoords = CalculateProbeShadowCoords(mat.PositionWS);
-                vec4 dls = textureLod(g_tLPV_Scalars, vLightProbeShadowCoords, 0.0);
-                vec4 dli = textureLod(g_tLPV_Indices, vLightProbeShadowCoords, 0.0);
-            #endif
+        vec2 w0 = (-f3 + 3.0 * f2 - 3.0 * f + 1.0) / 6.0;
+        vec2 w1 = (3.0 * f3 - 6.0 * f2 + 4.0) / 6.0;
+        vec2 w2 = (-3.0 * f3 + 3.0 * f2 + 3.0 * f + 1.0) / 6.0;
+        vec2 w3 = f3 / 6.0;
 
-            vec4 vLightStrengths = pow2(dls);
-            uvec4 vLightIndices = uvec4(dli * 255.0);
+        vec2 weight0 = w0 + w1;
+        vec2 weight1 = w2 + w3;
 
-            for (int i = 0; i < 4; i++)
+        // The taps sit a texel below the usual B-spline positions
+        vec2 uv0 = (base + w1 / weight0 - 1.5) / size;
+        vec2 uv1 = (base + w3 / weight1 + 0.5) / size;
+
+        vec4 shadows = textureLod(g_tDirectLightShadows, vec3(uv0.x, uv0.y, 0.0), 0.0) * weight0.x * weight0.y;
+        shadows += textureLod(g_tDirectLightShadows, vec3(uv1.x, uv0.y, 0.0), 0.0) * weight1.x * weight0.y;
+        shadows += textureLod(g_tDirectLightShadows, vec3(uv0.x, uv1.y, 0.0), 0.0) * weight0.x * weight1.y;
+        shadows += textureLod(g_tDirectLightShadows, vec3(uv1.x, uv1.y, 0.0), 0.0) * weight1.x * weight1.y;
+
+        return shadows;
+    }
+
+    vec4 SampleLightmapShadows(vec2 uv)
+    {
+        #if (LIGHTMAP_BICUBIC_SHADOWS)
+            vec2 size = vec2(textureSize(g_tDirectLightShadows, 0).xy);
+
+            // Triangles with collapsed lightmap coordinates keep the plain sample
+            vec2 hashChange = fwidth(vLightmapUVScaled.zw);
+            bool bicubic = min(hashChange.x, hashChange.y) > 0.1 && size.x > LIGHTMAP_BICUBIC_SHADOWS_MIN_WIDTH;
+
+            if (bicubic)
             {
-                float visibility = vLightStrengths[i];
-                if (visibility <= MIN_LIGHT_ALPHA)
-                {
-                    continue;
-                }
-
-                uint uLightIndex = vLightIndices[i];
-                visibility *= CalculateStationaryLightRealtimeShadow(uLightIndex, mat.PositionWS);
-
-                if (visibility > MIN_LIGHT_ALPHA)
-                {
-                    vec3 lightVector = GetLightDirection(mat.PositionWS, uLightIndex);
-                    CalculateShadingGated(lighting, lightVector, GetLightColor(uLightIndex) * visibility, mat, uLightIndex);
-                }
+                return SampleLightmapShadowsBicubic(uv, size);
             }
-        #else
-            CalculateSunLighting(lighting, mat, 1.0);
         #endif
 
-        // Dynamic (directlight 2) lights, evaluated per pixel.
-        for (uint i = g_nNumLights[0]; i < g_nNumLights[1]; i++)
-        {
-            CalculateDynamicLightV1(lighting, mat, i);
-        }
-
-    #elif (S_LIGHTMAP_VERSION_MINOR >= 2)
-        #if (D_BAKED_LIGHTING_FROM_LIGHTMAP == 1)
-            dlsh = textureLod(g_tDirectLightShadows, mat.LightmapUv, 0.0);
-        #elif (D_BAKED_LIGHTING_FROM_PROBE == 1)
-            vec3 vLightProbeShadowCoords = CalculateProbeShadowCoords(mat.PositionWS);
-            dlsh = textureLod(g_tLPV_Shadows, vLightProbeShadowCoords, 0.0);
-        #endif
-
-        CalculateSunLighting(lighting, mat, saturate(1.0 - dot(dlsh, g_vSunLightBakedShadowMask)));
-    #else
-        // Non lightmapped scene
-        CalculateSunLighting(lighting, mat, 1.0);
-
-        for (uint i = g_nNumLights[0]; i < g_nNumLights[1]; i++)
-        {
-            CalculateDynamicLightV1(lighting, mat, i);
-        }
+        return textureLod(g_tDirectLightShadows, vec3(uv, 0.0), 0.0);
+    }
 #endif
 
-    // 0 (dynamic scene) or lightmapped 2+ 
-    if (S_LIGHTMAP_VERSION_MINOR != 1)
+// Dynamic (directlight 2) lights, evaluated per pixel.
+void CalculateDynamicLights(inout LightingTerms_t lighting, MaterialProperties_t mat)
+{
+    for (uint i = g_nNumLights[0]; i < g_nNumLights[1]; i++)
     {
-        CalculateBarnLighting(lighting, mat, dlsh);
+        CalculateDynamicLightV1(lighting, mat, i);
     }
 }
 
+#if (BAKED_LIGHT_INDICES)
+
+// Shades the stationary lights that the lightmap or probe references by index, and the sun where it bakes none
+void CalculateBakedIndexedLights(inout LightingTerms_t lighting, MaterialProperties_t mat)
+{
+#if (D_BAKED_LIGHTING_FROM_VERTEX_STREAM == 1)
+    // Per-vertex baked geometry carries no direct light info.
+#elif (D_BAKED_LIGHTING_FROM_LIGHTMAP == 1) || (D_BAKED_LIGHTING_FROM_PROBE == 1)
+    #if (D_BAKED_LIGHTING_FROM_LIGHTMAP == 1)
+        vec4 dls = texture(g_tDirectLightStrengths, mat.LightmapUv);
+        vec4 dli = texture(g_tDirectLightIndices, mat.LightmapUv);
+    #else
+        vec3 vLightProbeShadowCoords = CalculateProbeShadowCoords(mat.PositionWS);
+        vec4 dls = textureLod(g_tLPV_Scalars, vLightProbeShadowCoords, 0.0);
+        vec4 dli = textureLod(g_tLPV_Indices, vLightProbeShadowCoords, 0.0);
+    #endif
+
+    vec4 vLightStrengths = pow2(dls);
+    uvec4 vLightIndices = uvec4(dli * 255.0);
+
+    for (int i = 0; i < 4; i++)
+    {
+        float visibility = vLightStrengths[i];
+        if (visibility <= MIN_LIGHT_ALPHA)
+        {
+            continue;
+        }
+
+        uint uLightIndex = vLightIndices[i];
+        visibility *= CalculateStationaryLightRealtimeShadow(uLightIndex, mat.PositionWS);
+
+        if (visibility > MIN_LIGHT_ALPHA)
+        {
+            vec3 lightVector = GetLightDirection(mat.PositionWS, uLightIndex);
+            CalculateShadingGated(lighting, lightVector, GetLightColor(uLightIndex) * visibility, mat, uLightIndex, false);
+        }
+    }
+#else
+    CalculateSunLighting(lighting, mat, 1.0);
+#endif
+}
+
+#elif (BAKED_LIGHT_SHADOW_MASK)
+
+// The baked shadow channels of the lights, unshadowed where nothing baked them
+vec4 SampleBakedLightShadows(MaterialProperties_t mat)
+{
+#if (D_BAKED_LIGHTING_FROM_LIGHTMAP == 1)
+    return SampleLightmapShadows(mat.LightmapUv.xy);
+#elif (D_BAKED_LIGHTING_FROM_PROBE == 1)
+    return SampleProbeDirectLightShadows(mat.PositionWS, mat.AmbientNormal);
+#else
+    return vec4(0.0);
+#endif
+}
+
+#endif
+
+void CalculateDirectLighting(inout LightingTerms_t lighting, inout MaterialProperties_t mat)
+{
+#if (BAKED_LIGHT_INDICES)
+    // Scenes with baked light indices light through those and the dynamic lights instead of the barn lights
+    CalculateBakedIndexedLights(lighting, mat);
+    CalculateDynamicLights(lighting, mat);
+#elif (BAKED_LIGHT_SHADOW_MASK)
+    vec4 bakedShadows = SampleBakedLightShadows(mat);
+
+    CalculateSunLighting(lighting, mat, saturate(1.0 - dot(bakedShadows, g_vSunLightBakedShadowMask)));
+    CalculateBarnLighting(lighting, mat, bakedShadows);
+#else
+    // Non lightmapped scene
+    CalculateSunLighting(lighting, mat, 1.0);
+    CalculateDynamicLights(lighting, mat);
+    CalculateBarnLighting(lighting, mat, vec4(0.0));
+#endif
+}
 
 #if (D_BAKED_LIGHTING_FROM_LIGHTMAP == 1)
-
-#define UseLightmapDirectionality true
-uniform float g_flDirectionalLightmapStrength = 1.0;
-uniform float g_flDirectionalLightmapMinZ = 0.05;
 
 const float LIGHTMAP_DIRECTION_MIN_Z = 0.0872; // sin(5 degrees)
 const float LIGHTMAP_DIRECTION_MAX_XY = sqrt(1.0 - LIGHTMAP_DIRECTION_MIN_Z * LIGHTMAP_DIRECTION_MIN_Z);
 
-// I don't actually understand much of this, but it's Valve's code.
-vec3 ComputeLightmapShading(vec3 irradianceColor, vec4 irradianceDirection, MaterialProperties_t mat)
+// The direction texture holds the dominant incoming direction in tangent space in xy, and in z the
+// share of the irradiance that arrives from all around rather than from that direction. The directional
+// share is divided by the direction's z, so a direction close to the surface brightens it the most.
+vec3 ShadeDirectionalLightmap(vec3 irradianceColor, vec3 nonDirectional, vec3 lightVectorTs, float lightVectorZ, vec3 normalTs)
 {
-    if (UseLightmapDirectionality)
-    {
-        vec2 vTangentSpaceXY = UnpackFromColor(irradianceDirection.xy);
+    float NoL = ClampToPositive(dot(lightVectorTs, normalTs));
+    return (NoL * (irradianceColor - nonDirectional) / lightVectorZ) + nonDirectional;
+}
 
-        vTangentSpaceXY *= (LIGHTMAP_DIRECTION_MAX_XY / max(LIGHTMAP_DIRECTION_MAX_XY, length(vTangentSpaceXY)));
+#if (LIGHTMAP_DIRECTION_CLAMP)
 
-        float sinTheta = dot(vTangentSpaceXY, vTangentSpaceXY);
-        float cosTheta = sqrt(1.0 - sinTheta);
+// The direction is kept 5 degrees off the surface
+vec3 ComputeLightmapShading(vec3 irradianceColor, vec3 irradianceDirection, MaterialProperties_t mat)
+{
+    vec2 vTangentSpaceXY = UnpackFromColor(irradianceDirection.xy);
 
+    vTangentSpaceXY *= (LIGHTMAP_DIRECTION_MAX_XY / max(LIGHTMAP_DIRECTION_MAX_XY, length(vTangentSpaceXY)));
+
+    float sinThetaSquared = length_squared(vTangentSpaceXY);
+    float cosTheta = sqrt(1.0 - sinThetaSquared);
+
+    #if (LIGHTMAP_FLATNESS_BOOST)
+        // Flat surfaces get a direction pulled toward the extremes, which brings out their normal maps
         float flCurvature = GetCurvature(mat.GeometricNormal, mat.PositionWS);
         float flFlatness = smoothstep(0.1, 0.01, flCurvature) * 0.8;
         float flZScale = mix(1.0, mix(0.1, 2.0, saturate((1.0 - cosTheta) * 1.5)), flFlatness);
 
         vec3 vTangentSpaceLightVector = normalize(vec3(vTangentSpaceXY, cosTheta * flZScale));
+    #else
+        vec3 vTangentSpaceLightVector = vec3(vTangentSpaceXY, cosTheta);
+    #endif
 
-        float flDirectionality = mix(0.0, irradianceDirection.z, g_flDirectionalLightmapStrength);
-        vec3 vNonDirectionalLightmap = irradianceColor * saturate(flDirectionality);
+    vec3 vNonDirectionalLightmap = irradianceColor * saturate(irradianceDirection.z);
 
-        float NoL = ClampToPositive(dot(vTangentSpaceLightVector, mat.NormalMap));
-        float LightmapZ = max(vTangentSpaceLightVector.z, g_flDirectionalLightmapMinZ);
+    // The final blended normal
+    vec3 normalTs = CalculateTangentNormal(mat.AmbientNormal, mat.GeometricNormal, mat.Tangent, mat.Bitangent);
+    return ShadeDirectionalLightmap(irradianceColor, vNonDirectionalLightmap, vTangentSpaceLightVector, vTangentSpaceLightVector.z, normalTs);
+}
 
-        irradianceColor = (NoL * (irradianceColor - vNonDirectionalLightmap) / LightmapZ) + vNonDirectionalLightmap;
-    }
+#else
 
-    return irradianceColor;
+uniform float g_flDirectionalLightmapStrength = 1.0;
+uniform float g_flDirectionalLightmapMinZ = 0.05;
+
+// The direction is used as baked, its z kept above a per material minimum where it is divided by
+vec3 ComputeLightmapShading(vec3 irradianceColor, vec3 irradianceDirection, MaterialProperties_t mat)
+{
+    vec2 directionXY = UnpackFromColor(irradianceDirection.xy);
+    vec3 lightVectorTs = vec3(directionXY, sqrt(ClampToPositive(1.0 - length_squared(directionXY))));
+
+    vec3 nonDirectional = irradianceColor * saturate(mix(1.0, irradianceDirection.z, g_flDirectionalLightmapStrength));
+
+    return ShadeDirectionalLightmap(irradianceColor, nonDirectional, lightVectorTs, max(lightVectorTs.z, g_flDirectionalLightmapMinZ), mat.NormalMap);
 }
 
 #endif
 
-
-void CalculateIndirectLighting(inout LightingTerms_t lighting, inout MaterialProperties_t mat)
+// Second order spherical harmonics, one set per color channel. The directional textures hold each
+// channel's L1 band relative to its L0 band, which the irradiance texture holds. A ZH3 band is
+// rebuilt along the luminance weighted L1 direction.
+struct LightmapSH_t
 {
-    lighting.DiffuseIndirect = vec3(0.3);
+    vec3 DC;
+    vec3 LinearR; // World space
+    vec3 LinearG;
+    vec3 LinearB;
+    vec3 ZonalAxis;
+    vec3 ZonalScale; // Per channel, for (3cos^2 - 1) about the axis
+};
 
-    // Indirect Lighting
-#if (D_BAKED_LIGHTING_FROM_LIGHTMAP == 1)
-    if (g_iRenderMode == renderMode_IrradianceDebug) {
-        vec3 irradiance = texture(g_tIrradianceDebugChart, mat.LightmapUv).rgb;
-        lighting.DiffuseIndirect = irradiance;
-    } else {
-        vec3 irradiance = texture(g_tIrradiance, mat.LightmapUv).rgb;
-        #if (S_LIGHTMAP_VERSION_MINOR >= 3)
-            vec4 vAHDData = texture(g_tDirectionalIrradianceR, mat.LightmapUv);
-        #else
-            vec4 vAHDData = texture(g_tDirectionalIrradiance, mat.LightmapUv);
-        #endif
+LightmapSH_t g_LightmapSH = LightmapSH_t(vec3(0.0), vec3(0.0), vec3(0.0), vec3(0.0), vec3(0.0), vec3(0.0));
 
-        lighting.DiffuseIndirect = ComputeLightmapShading(irradiance, vAHDData, mat);
+vec3 UnpackLightmapSHLinear(vec3 packedBand, float dc)
+{
+    vec3 linearBand = UnpackFromColor(packedBand) * dc * sqrt(3.0);
+    return vec3(-linearBand.z, -linearBand.x, linearBand.y);
+}
 
+LightmapSH_t DecodeLightmapSH(vec3 irradianceDC, vec3 packedR, vec3 packedG, vec3 packedB)
+{
+    LightmapSH_t sh;
+    sh.DC = irradianceDC;
+    sh.LinearR = UnpackLightmapSHLinear(packedR, irradianceDC.r);
+    sh.LinearG = UnpackLightmapSHLinear(packedG, irradianceDC.g);
+    sh.LinearB = UnpackLightmapSHLinear(packedB, irradianceDC.b);
+
+    vec3 zonalAxis = GetLuma(sh.LinearR, sh.LinearG, sh.LinearB);
+    sh.ZonalAxis = zonalAxis / max(1e-5, length(zonalAxis));
+
+    vec3 axisAlignment = abs(vec3(dot(sh.LinearR, sh.ZonalAxis), dot(sh.LinearG, sh.ZonalAxis), dot(sh.LinearB, sh.ZonalAxis)));
+    vec3 zonalRatio = axisAlignment / max(vec3(1e-5), sh.DC);
+    sh.ZonalScale = sh.DC * zonalRatio * (0.08 + 0.6 * zonalRatio) * 0.25 * sqrt(5.0 / (16.0 * PI));
+
+    return sh;
+}
+
+// Irradiance arriving around a direction. The result already includes the 1/pi of a diffuse BRDF.
+vec3 EvaluateLightmapSH(LightmapSH_t sh, vec3 direction)
+{
+    vec3 linearTerm = (0.886227 * sh.DC) + (1.023328 * vec3(dot(sh.LinearR, direction), dot(sh.LinearG, direction), dot(sh.LinearB, direction)));
+    linearTerm /= PI;
+
+    float cosAngle = dot(sh.ZonalAxis, direction);
+    vec3 zonalTerm = sh.ZonalScale * (3.0 * cosAngle * cosAngle - 1.0);
+
+    return max(vec3(0.0), linearTerm + zonalTerm);
+}
+
+void CalculateLightmapIndirectLighting(inout LightingTerms_t lighting, MaterialProperties_t mat)
+{
+    if (g_iRenderMode == renderMode_LightmapCharts)
+    {
+        lighting.DiffuseIndirect = texture(g_tLightmapDebugCharts, mat.LightmapUv).rgb;
+        return;
+    }
+
+    vec3 irradiance = texture(g_tIrradiance, mat.LightmapUv).rgb;
+
+#if (LIGHTMAP_NON_DIRECTIONAL)
+    // Lights the surface the same from either side, as two sided foliage is lit
+    lighting.DiffuseIndirect = irradiance;
+#elif (LIGHTMAP_SH_LUMINANCE)
+    // One direction relative to luminance, shared by every channel
+    vec3 packedDirection = texture(g_tDirectionalIrradianceLum, mat.LightmapUv).rgb;
+    g_LightmapSH = DecodeLightmapSH(irradiance, packedDirection, packedDirection, packedDirection);
+    lighting.DiffuseIndirect = EvaluateLightmapSH(g_LightmapSH, mat.AmbientNormal);
+#elif (LIGHTMAP_SH)
+    g_LightmapSH = DecodeLightmapSH(irradiance,
+        texture(g_tDirectionalIrradianceR, mat.LightmapUv).rgb,
+        texture(g_tDirectionalIrradianceG, mat.LightmapUv).rgb,
+        texture(g_tDirectionalIrradianceB, mat.LightmapUv).rgb);
+    lighting.DiffuseIndirect = EvaluateLightmapSH(g_LightmapSH, mat.AmbientNormal);
+#else
+    vec4 vAHDData = texture(g_tDirectionalIrradiance, mat.LightmapUv);
+    lighting.DiffuseIndirect = ComputeLightmapShading(irradiance, vAHDData.xyz, mat);
+
+    #if (LIGHTMAP_SPECULAR_OCCLUSION)
         lighting.SpecularOcclusion = vAHDData.a;
-    }
+    #endif
+#endif
+}
 
-#elif (D_BAKED_LIGHTING_FROM_PROBE == 1)
-    if (g_iRenderMode == renderMode_IrradianceDebug) {
-        lighting.DiffuseIndirect = vec3(0);
-    } else {
-        lighting.DiffuseIndirect = ComputeLightProbeShading(mat);
-    }
-
-#elif (D_BAKED_LIGHTING_FROM_VERTEX_STREAM == 1)
-    if (g_iRenderMode == renderMode_IrradianceDebug) {
-        lighting.DiffuseIndirect = vec3(1);
-    } else {
-        lighting.DiffuseIndirect = vPerVertexLightingOut.rgb;
-    }
 #endif
 
-    // Environment Maps
-#if defined(IBL) && (IBL == 1)
-    vec3 environment = GetEnvironment(mat);
+void CalculateBakedIndirectLighting(inout LightingTerms_t lighting, MaterialProperties_t mat)
+{
+#if (D_BAKED_LIGHTING_FROM_LIGHTMAP == 1)
+    CalculateLightmapIndirectLighting(lighting, mat);
+#elif (D_BAKED_LIGHTING_FROM_PROBE == 1)
+    if (g_iRenderMode == renderMode_LightmapCharts)
+    {
+        lighting.DiffuseIndirect = vec3(0);
+        return;
+    }
 
-    lighting.SpecularIndirect = environment
-        * GetEnvMapNormalization(mat.IsometricRoughness, mat.AmbientNormal, lighting.DiffuseIndirect);
+    lighting.DiffuseIndirect = ComputeLightProbeShading(mat);
+#elif (D_BAKED_LIGHTING_FROM_VERTEX_STREAM == 1)
+    if (g_iRenderMode == renderMode_LightmapCharts)
+    {
+        lighting.DiffuseIndirect = vec3(1);
+        return;
+    }
 
-    #if (D_BAKED_LIGHTING_FROM_LIGHTMAP == 0 && D_BAKED_LIGHTING_FROM_PROBE == 0 && D_BAKED_LIGHTING_FROM_VERTEX_STREAM == 0)
-        vec2 oldRoughness = mat.Roughness;
-        mat.Roughness = vec2(1.0);
-        // Roughness is at 1 here, so the full correction lands the lookup on the normal.
-        lighting.DiffuseIndirect = GetEnvironmentNoBRDF(mat, 1.0);
-        mat.Roughness = oldRoughness;
+    lighting.DiffuseIndirect = vPerVertexLightingOut.rgb;
+#endif
+}
+
+#if (IBL == 1)
+
+// Rough non-metals reflect the lightmap rather than the environment maps
+float GetLightmapReflection(MaterialProperties_t mat)
+{
+#if (D_BAKED_LIGHTING_FROM_LIGHTMAP == 1) && (LIGHTMAP_SH)
+    return mix(saturate(LightmapReflectionRoughnessRange.x + LightmapReflectionRoughnessRange.y * mat.IsometricRoughness), 0.0, mat.Metalness);
+#else
+    return 0.0;
+#endif
+}
+
+void BlendLightmapReflection(inout vec3 environment, inout float environmentLuma, MaterialProperties_t mat, float lightmapReflection)
+{
+#if (D_BAKED_LIGHTING_FROM_LIGHTMAP == 1) && (LIGHTMAP_SH)
+    if (lightmapReflection > 0.0)
+    {
+        vec3 lightmapSpecular = EvaluateLightmapSH(g_LightmapSH, GetDominantReflectionDirection(mat, mat.AmbientNormal));
+        environment = mix(environment, lightmapSpecular, lightmapReflection);
+        environmentLuma = mix(environmentLuma, GetLuma(lightmapSpecular), lightmapReflection);
+    }
+#endif
+}
+
+vec3 GetEnvironmentReflectionScale(EnvBRDF_t envBrdf)
+{
+#if (MULTISCATTER_REFLECTS_ENVIRONMENT)
+    return envBrdf.SingleScatter + envBrdf.MultiScatter;
+#else
+    return envBrdf.SingleScatter;
+#endif
+}
+
+// Without baked lighting the environment alone lights the diffuse
+void ApplyEnvironmentDiffuse(inout LightingTerms_t lighting, MaterialProperties_t mat)
+{
+#if (D_BAKED_LIGHTING_FROM_LIGHTMAP == 0 && D_BAKED_LIGHTING_FROM_PROBE == 0 && D_BAKED_LIGHTING_FROM_VERTEX_STREAM == 0)
+    #if (F_USE_NPR_LIGHTING == 1)
+        // The bounce light already comes from the sky
+        if (g_bNPRBounceDiffuse)
+        {
+            return;
+        }
     #endif
 
-    EnvBRDF_t envBrdf = EnvBRDF(mat.SpecularColor, mat.IsometricRoughness, mat.AmbientNormal, mat.ViewDir, mat.ClothMask);
+    mat.Roughness = vec2(1.0);
+    mat.RetroReflectivity = 0.0;
+    // Roughness is at 1 here, so the full correction lands the lookup on the normal.
+    lighting.DiffuseIndirect = GetEnvironmentNoBRDF(mat, 1.0);
+#endif
+}
 
-    lighting.SpecularIndirect += envBrdf.MultiScatter * lighting.DiffuseIndirect;
+void ApplyMultiscatter(inout LightingTerms_t lighting, EnvBRDF_t envBrdf, MaterialProperties_t mat)
+{
+#if (MULTISCATTER)
+    #if !(MULTISCATTER_REFLECTS_ENVIRONMENT)
+        lighting.SpecularIndirect += envBrdf.MultiScatter * lighting.DiffuseIndirect;
+    #endif
 
-    vec3 diffuseEnergy = ClampToPositive(vec3(1.0) - (envBrdf.SingleScatter + envBrdf.MultiScatter));
+    vec3 diffuseEnergy = vec3(1.0) - (envBrdf.SingleScatter + envBrdf.MultiScatter);
+
+    #if (DIFFUSE_ENERGY_CLAMPED)
+        diffuseEnergy = ClampToPositive(diffuseEnergy);
+    #endif
 
     if (F_CLOTH_SHADING == 1)
     {
@@ -356,12 +574,164 @@ void CalculateIndirectLighting(inout LightingTerms_t lighting, inout MaterialPro
 #endif
 }
 
+void CalculateEnvironmentLighting(inout LightingTerms_t lighting, MaterialProperties_t mat)
+{
+    EnvBRDF_t envBrdf = EnvBRDF(mat.SpecularColor, mat.IsometricRoughness, mat.AmbientNormal, mat.ViewDir, mat.ClothMask);
 
-uniform float g_flAmbientOcclusionDirectDiffuse = 1.0;
-uniform float g_flAmbientOcclusionDirectSpecular = 1.0;
+    float lightmapReflection = GetLightmapReflection(mat);
 
-// AO Proxies would be merged here
-void ApplyAmbientOcclusion(inout LightingTerms_t o, MaterialProperties_t mat)
+    vec3 environment = vec3(0.0);
+    float environmentLuma = 0.0;
+
+    if (lightmapReflection < 1.0)
+    {
+        environment = GetEnvironmentNoBRDF(mat, 1.0);
+        environmentLuma = dot(vec4(mat.AmbientNormal, 1.0), g_vEnvMapNormalizationSH);
+    }
+
+    BlendLightmapReflection(environment, environmentLuma, mat, lightmapReflection);
+
+    environment *= GetEnvMapNormalization(mat.IsometricRoughness, environmentLuma, lighting.DiffuseIndirect);
+    lighting.SpecularIndirect = environment * GetEnvironmentReflectionScale(envBrdf);
+
+    ApplyEnvironmentDiffuse(lighting, mat);
+    ApplyMultiscatter(lighting, envBrdf, mat);
+}
+
+#endif
+
+#if (F_USE_NPR_LIGHTING == 1)
+
+// The ambient cube around the surface, from the probe volumes or else from the environment diffuse
+void GetNprAmbientFaces(MaterialProperties_t mat, out vec3 faces[6])
+{
+#if (D_BAKED_LIGHTING_FROM_LIGHTMAP == 0) && (D_BAKED_LIGHTING_FROM_PROBE == 1)
+    SampleLightProbeFaces(mat.PositionWS, mat.AmbientNormal, faces);
+#else
+    mat.Roughness = vec2(1.0);
+    mat.RetroReflectivity = 0.0;
+
+    for (int face = 0; face < 6; face++)
+    {
+        vec3 axis = vec3(0.0);
+        axis[face % 3] = face < 3 ? 1.0 : -1.0;
+
+        mat.Normal = axis;
+        mat.AmbientNormal = axis;
+        faces[face] = GetEnvironmentNoBRDF(mat, 1.0);
+    }
+#endif
+}
+
+vec3 EvaluateNprAmbientCube(vec3 faces[6], vec3 direction)
+{
+    vec3 squared = direction * direction;
+    vec3 positive = step(-direction, vec3(0.0)) * squared;
+    vec3 negative = step(direction, vec3(0.0)) * squared;
+
+    return faces[0] * positive.x + faces[1] * positive.y + faces[2] * positive.z
+        + faces[3] * negative.x + faces[4] * negative.y + faces[5] * negative.z;
+}
+
+// Replaces the diffuse indirect light with a bounce light taken from the cube in a direction that turns
+// from the ground to the camera side to the sky as the surface faces the primary light.
+// The rim light is added to the transmissive light, which the albedo does not tint.
+void ApplyNprBounce(inout LightingTerms_t lighting, MaterialProperties_t mat)
+{
+    vec3 bounce = lighting.DiffuseIndirect;
+
+    if (g_bNPRBounceDiffuse)
+    {
+        vec3 faces[6];
+        GetNprAmbientFaces(mat, faces);
+
+        vec3 average = (faces[0] + faces[1] + faces[2] + faces[3] + faces[4] + faces[5]) / 6.0;
+
+        // The screen space occlusion is not modelled, so only the texture darkens the lit side
+        float sunVisibility = 1.0;
+
+        if (GetSunColor() != vec3(0.0))
+        {
+            sunVisibility = CalculateSunShadowMapVisibility(mat.PositionWS);
+        }
+
+        float halfLambert = 0.5 + 0.5 * dot(GetNprPrimaryLightDirection(), mat.Normal);
+
+        if (halfLambert > 0.5)
+        {
+            halfLambert = mix(0.5, halfLambert, sunVisibility);
+        }
+
+        float occlusionRemap = saturate(1.0 / g_vNPRDfaoInfluenceRange.y) * (1.0 - g_vNPRDfaoInfluenceRange.x) + g_vNPRDfaoInfluenceRange.x;
+        float occlusion = min(mat.AmbientOcclusion, occlusionRemap);
+
+        float lit = saturate(halfLambert * occlusion * 2.0 - 0.5);
+        float stepped = NprStep(lit, g_flNPRDiffuseStepSharpness);
+
+        vec3 horizontal = normalize(vec3(mat.ViewDir.xy, 0.0));
+        vec3 bounceDirection;
+
+        if (stepped < 0.5)
+        {
+            bounceDirection = mix(vec3(0.0, 0.0, -1.0), horizontal, stepped + 0.5);
+        }
+        else
+        {
+            bounceDirection = mix(horizontal, vec3(0.0, 0.0, 1.0), stepped - 0.5);
+        }
+
+        bounceDirection = normalize(bounceDirection);
+
+        bounce = EvaluateNprAmbientCube(faces, bounceDirection);
+        vec3 skyLight = faces[2];
+
+        if (g_bNPRExposureControl)
+        {
+            vec3 averageXyY = NprRgbToXyY(average);
+            float upTarget = bounceDirection.z > 0.0 ? g_vNPRExposureTargets.x : g_vNPRExposureTargets.z;
+            vec3 targets = vec3(g_vNPRExposureTargets.y, g_vNPRExposureTargets.y, upTarget);
+
+            bounce = NprControlExposure(bounce, averageXyY, dot(targets, bounceDirection * bounceDirection) / NPR_EXPOSURE);
+            skyLight = NprControlExposure(skyLight, averageXyY, g_vNPRExposureTargets.x / NPR_EXPOSURE);
+        }
+
+        bounce += skyLight * mat.TransmissiveColor * (1.0 - (stepped + 0.5) * 0.5);
+    }
+
+    float rim = NprRimFactor(mat.PositionWS, mat.Normal, mat.ViewDir, mat.AmbientOcclusion, mat.RimLightMask);
+    lighting.TransmissiveDirect += (lighting.DiffuseDirect + bounce) * rim;
+
+    lighting.DiffuseIndirect = bounce;
+}
+
+#endif
+
+void CalculateIndirectLighting(inout LightingTerms_t lighting, MaterialProperties_t mat)
+{
+    lighting.DiffuseIndirect = vec3(0.3);
+
+#if (F_TRANSMISSIVE_BACKFACE_NDOTL == 1) && (TRANSMISSIVE_GEOMETRIC_NORMAL) && (D_BAKED_LIGHTING_FROM_LIGHTMAP == 0) && (D_BAKED_LIGHTING_FROM_PROBE == 1)
+    // The probe light behind the surface passes through it, without ambient occlusion
+    lighting.TransmissiveDirect += SampleLightProbeIrradiance(mat.PositionWS, -mat.GeometricNormal) * mat.TransmissiveColor;
+#endif
+
+    CalculateBakedIndirectLighting(lighting, mat);
+
+#if (F_USE_NPR_LIGHTING == 1)
+    ApplyNprBounce(lighting, mat);
+#endif
+
+#if (IBL == 1)
+    CalculateEnvironmentLighting(lighting, mat);
+#endif
+
+#if (F_USE_NPR_LIGHTING == 1)
+    lighting.DiffuseIndirect *= NprMultiBounceOcclusion(mat.Albedo, mat.AmbientOcclusion);
+#endif
+}
+
+// The direct weights scale how much the diffuse and specular AO of the material darken the direct light
+void ApplyAmbientOcclusion(inout LightingTerms_t o, MaterialProperties_t mat, float directDiffuseAO, float directSpecularAO)
 {
 #if defined(DIFFUSE_AO_COLOR_BLEED)
     SetDiffuseColorBleed(mat);
@@ -371,8 +741,8 @@ void ApplyAmbientOcclusion(inout LightingTerms_t o, MaterialProperties_t mat)
     // shaders do min(bakedAO, specularAO). That means that bakedAO exists and is a constant 1.0 in those shaders!
     mat.SpecularAO = min(o.SpecularOcclusion, mat.SpecularAO);
 
-    vec3 DirectAODiffuse = mix(vec3(1.0), mat.DiffuseAO, g_flAmbientOcclusionDirectDiffuse);
-    float DirectAOSpecular = mix(1.0, mat.SpecularAO, g_flAmbientOcclusionDirectSpecular);
+    vec3 DirectAODiffuse = mix(vec3(1.0), mat.DiffuseAO, directDiffuseAO);
+    float DirectAOSpecular = mix(1.0, mat.SpecularAO, directSpecularAO);
 
     o.DiffuseDirect *= DirectAODiffuse;
     o.DiffuseIndirect *= mat.DiffuseAO;
@@ -380,24 +750,29 @@ void ApplyAmbientOcclusion(inout LightingTerms_t o, MaterialProperties_t mat)
     o.SpecularIndirect *= mat.SpecularAO;
 }
 
-
 LightingTerms_t CalculateLighting(inout MaterialProperties_t mat)
 {
     LightingTerms_t lighting = InitLighting();
 
-    #if defined(ANISO_ROUGHNESS)
+    #if (ROUGHNESS_FLOOR_OPAQUE && (F_TRANSLUCENT != 1) && (F_GLASS != 1))
+        mat.Roughness = max(mat.Roughness, vec2(0.05));
+    #endif
+
+    #if ((F_ANISOTROPIC_GLOSS == 1) || (F_HIGH_QUALITY_GLOSS == 1))
         mat.IsometricRoughness = dot(mat.Roughness, vec2(0.5));
     #else
         mat.IsometricRoughness = max(mat.Roughness.x, mat.Roughness.y);
     #endif
 
     #if (D_BAKED_LIGHTING_FROM_LIGHTMAP == 1)
-        mat.LightmapUv = vLightmapUVScaled;
+        mat.LightmapUv = vec3(vLightmapUVScaled.xy, 0.0);
     #endif
 
     CalculateDirectLighting(lighting, mat);
 
-    lighting.SpecularDirect *= GetSpecularEnergyCompensation(mat);
+    #if (SPECULAR_ENERGY_COMPENSATION)
+        lighting.SpecularDirect *= GetSpecularEnergyCompensation(mat);
+    #endif
 
     CalculateIndirectLighting(lighting, mat);
 
@@ -425,7 +800,7 @@ vec3 GetSubgroupFootprintColor()
 #endif
 }
 
-bool _HandleLightingRenderModes(inout vec4 outputColor, MaterialProperties_t mat, LightingTerms_t lighting)
+bool HandleLightingRenderModesLinear(inout vec4 outputColor, MaterialProperties_t mat, LightingTerms_t lighting)
 {
     switch (g_iRenderMode)
     {
@@ -433,7 +808,7 @@ bool _HandleLightingRenderModes(inout vec4 outputColor, MaterialProperties_t mat
             outputColor = vec4(lighting.DiffuseDirect + lighting.SpecularDirect, 1.0);
             return true;
         case renderMode_Irradiance:
-        case renderMode_IrradianceDebug:
+        case renderMode_LightmapCharts:
             outputColor = vec4(lighting.DiffuseIndirect, 1.0);
             return true;
         case renderMode_Diffuse:
@@ -443,36 +818,34 @@ bool _HandleLightingRenderModes(inout vec4 outputColor, MaterialProperties_t mat
             outputColor = vec4((lighting.SpecularDirect + lighting.SpecularIndirect) * 0.5, 1.0);
             return true;
         case renderMode_Occlusion:
-            float flLightmapOcclusion = blink() ? 1.0 : lighting.SpecularOcclusion;
+            float flLightmapOcclusion = Blink() ? 1.0 : lighting.SpecularOcclusion;
             outputColor = vec4(SrgbGammaToLinear((mat.AmbientOcclusion * flLightmapOcclusion).xxx), 1.0);
             return true;
         case renderMode_LightTiles:
-            vec3 tileHeat;
+            vec3 lightTileHeat;
             outputColor.rgb *= GetLightCullBinStripe(mat.PositionWS);
 
-            if (!GetBarnLightTileHeatmap(tileHeat))
+            if (GetTileHeatmap(g_nBarnLightsIterated, 12.0, lightTileHeat))
             {
-                return true;
+                outputColor.rgb = mix(outputColor.rgb, lightTileHeat, 0.5);
             }
-            outputColor.rgb = mix(outputColor.rgb, tileHeat, 0.5);
             return true;
         case renderMode_EnvmapTiles:
-            vec3 envMapHeat;
+            vec3 envMapTileHeat;
             outputColor.rgb *= GetLightCullBinStripe(mat.PositionWS);
 
-            if (!GetEnvMapTileHeatmap(envMapHeat))
+            if (GetTileHeatmap(uint(g_nEnvMapsIterated), 4.0, envMapTileHeat))
             {
-                return true;
+                outputColor.rgb = mix(outputColor.rgb, envMapTileHeat, 0.5);
             }
-            outputColor.rgb = mix(outputColor.rgb, envMapHeat, 0.5);
             return true;
         case renderMode_Subgroups:
             outputColor = vec4(GetSubgroupFootprintColor(), 1.0);
             return true;
-    #if (D_BAKED_LIGHTING_FROM_LIGHTMAP == 1 && S_LIGHTMAP_VERSION_MINOR >= 2)
+    #if (D_BAKED_LIGHTING_FROM_LIGHTMAP == 1) && (BAKED_LIGHT_SHADOW_MASK)
         case renderMode_LightmapShadows:
-            vec4 dlsh = texture(g_tDirectLightShadows, mat.LightmapUv);
-            outputColor = vec4(vec3(1.0 - dlsh.x) + vec3(1.0 - min3(dlsh.yzw)) * vec3(0.5, 0.5, 0), 1.0);
+            vec4 dlsh = SampleLightmapShadows(mat.LightmapUv.xy);
+            outputColor = vec4(vec3(1.0 - dlsh.x) + vec3(1.0 - Min3(dlsh.yzw)) * vec3(0.5, 0.5, 0), 1.0);
             return true;
     #endif
         default:
@@ -482,7 +855,7 @@ bool _HandleLightingRenderModes(inout vec4 outputColor, MaterialProperties_t mat
 
 bool HandleLightingRenderModes(inout vec4 outputColor, MaterialProperties_t mat, LightingTerms_t lighting)
 {
-    if (_HandleLightingRenderModes(outputColor, mat, lighting))
+    if (HandleLightingRenderModesLinear(outputColor, mat, lighting))
     {
         outputColor.rgb = SrgbLinearToGamma(outputColor.rgb);
         return true;

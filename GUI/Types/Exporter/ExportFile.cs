@@ -1,12 +1,11 @@
 using System.Diagnostics;
 using System.IO;
-using System.Threading;
+using System.Linq;
 using System.Threading.Tasks;
 using System.Windows.Forms;
-using GUI.Forms;
 using GUI.Types.PackageViewer;
 using GUI.Utils;
-using SteamDatabase.ValvePak;
+using ValvePak;
 using ValveResourceFormat.IO;
 using Resource = ValveResourceFormat.Resource;
 
@@ -19,147 +18,175 @@ namespace GUI.Types.Exporter
             var currentPackage = vrfGuiContext.CurrentPackage;
             if (currentPackage == null)
             {
-                Log.Error(nameof(ExportFile), "CurrentPackage is null, cannot extract file");
+                ErrorReport.ShowError(new InvalidOperationException("The package is not available, cannot extract file"), file.GetFullPath());
                 return;
             }
 
-            var stream = GameFileLoader.GetPackageEntryStream(currentPackage, file);
+            var fileName = file.GetFullPath();
 
-            await ExtractFileFromStream(file.GetFullPath(), stream, vrfGuiContext, decompile).ConfigureAwait(true);
+            var errorContext = vrfGuiContext.GetEntryDisplayPath(fileName);
+
+            Stream stream;
+
+            try
+            {
+                stream = currentPackage.GetMemoryMappedStreamIfPossible(file);
+            }
+            catch (Exception e)
+            {
+                ErrorReport.ShowError(e, errorContext);
+                return;
+            }
+
+            await ExtractFileFromStream(fileName, stream, vrfGuiContext, decompile, errorContext).ConfigureAwait(true);
         }
 
-        public static async Task ExtractFileFromStream(string fileName, Stream stream, VrfGuiContext vrfGuiContext, bool decompile)
+        /// <param name="errorContext">Which file this is, shown when extracting it fails.</param>
+        public static async Task ExtractFileFromStream(string fileName, Stream stream, VrfGuiContext vrfGuiContext, bool decompile, string errorContext)
         {
-            if (!await PreExportDisclaimer(Path.GetExtension(fileName)).ConfigureAwait(true))
+            try
             {
-                return;
+                if (decompile && !await PreExportDisclaimer(Path.GetExtension(fileName)).ConfigureAwait(true))
+                {
+                    return;
+                }
+
+                if (decompile && fileName.EndsWith(GameFileLoader.CompiledFileSuffix, StringComparison.Ordinal))
+                {
+                    await DecompileResource(fileName, stream, vrfGuiContext).ConfigureAwait(true);
+                }
+                else
+                {
+                    await SaveFile(fileName, stream, decompile).ConfigureAwait(true);
+                }
+            }
+            catch (Exception e) when (e is not OperationCanceledException)
+            {
+                ErrorReport.ShowError(e, errorContext);
+            }
+            finally
+            {
+                await stream.DisposeAsync().ConfigureAwait(true);
+            }
+        }
+
+        private static async Task DecompileResource(string fileName, Stream stream, VrfGuiContext vrfGuiContext)
+        {
+            var resourceTemp = new Resource
+            {
+                FileName = fileName,
+            };
+            var resource = resourceTemp;
+            string filaNameToSave;
+
+            try
+            {
+                resource.Read(stream);
+
+                var extension = FileExtract.GetExtension(resource);
+
+                if (extension == null)
+                {
+                    await AppMessageDialogs.ShowMessageAsync($"Exporting \"{fileName}\" is not supported.", "Failed to export", MessageIcon.Warning).ConfigureAwait(true);
+                    return;
+                }
+
+                var filter = $"{extension} file|*.{extension}";
+
+                if (GltfModelExporter.CanExport(resource))
+                {
+                    const string gltfFilter = "glTF|*.gltf";
+                    const string glbFilter = "glTF Binary|*.glb";
+
+                    filter = $"{filter}|{gltfFilter}|{glbFilter}";
+                }
+
+                var fileNameForSave = Path.GetFileNameWithoutExtension(fileName);
+
+                if (Path.GetExtension(fileName) == ".vmap_c")
+                {
+                    // When exporting a vmap, suggest saving with a suffix like de_dust2_d,
+                    // to reduce conflicts when users end up recompiling the map with the same name as it exists in the game
+                    fileNameForSave += "_d";
+                }
+
+                var pickedFileName = AppFileDialogs.SaveFile("Choose where to save the file", fileNameForSave, extension, filter);
+
+                if (pickedFileName == null)
+                {
+                    return;
+                }
+
+                filaNameToSave = pickedFileName;
+                resourceTemp = null;
+            }
+            finally
+            {
+                resourceTemp?.Dispose();
             }
 
-            if (decompile && fileName.EndsWith(GameFileLoader.CompiledFileSuffix, StringComparison.Ordinal))
+            var directory = Path.GetDirectoryName(filaNameToSave);
+            // A tab of the file itself already has a context for it
+            var ownsContext = vrfGuiContext.IsPackage;
+            var exportData = new ExportData
             {
-                var exportData = new ExportData
+                VrfGuiContext = ownsContext ? new VrfGuiContext(fileName, vrfGuiContext) : vrfGuiContext,
+                BypassResourceCache = !ownsContext,
+            };
+
+            try
+            {
+                var exporter = new PackageExporter(exportData, directory ?? string.Empty, true);
+
+                // Cancelling closes the dialog while the extract is still winding down, so wait for it to
+                // stop before the finally pulls the resource out from under it
+                await exporter.ExecuteSingleFileExtractAsync(resource, fileName, filaNameToSave, $"Extracting {fileName} to \"{Path.GetFileName(filaNameToSave)}\"").ConfigureAwait(true);
+            }
+            finally
+            {
+                resource.Dispose();
+
+                if (ownsContext)
                 {
-                    VrfGuiContext = new VrfGuiContext(fileName, vrfGuiContext),
-                };
-
-                var resourceTemp = new Resource
-                {
-                    FileName = fileName,
-                };
-                var resource = resourceTemp;
-                string filaNameToSave;
-
-                try
-                {
-                    resource.Read(stream);
-
-                    var extension = FileExtract.GetExtension(resource);
-
-                    if (extension == null)
-                    {
-                        await stream.DisposeAsync().ConfigureAwait(true);
-                        Log.Error(nameof(ExportFile), $"Export for \"{fileName}\" has no suitable extension");
-                        return;
-                    }
-
-                    var filter = $"{extension} file|*.{extension}";
-
-                    if (GltfModelExporter.CanExport(resource))
-                    {
-                        const string gltfFilter = "glTF|*.gltf";
-                        const string glbFilter = "glTF Binary|*.glb";
-
-                        filter = $"{filter}|{gltfFilter}|{glbFilter}";
-                    }
-
-                    var fileNameForSave = Path.GetFileNameWithoutExtension(fileName);
-
-                    if (Path.GetExtension(fileName) == ".vmap_c")
-                    {
-                        // When exporting a vmap, suggest saving with a suffix like de_dust2_d,
-                        // to reduce conflicts when users end up recompiling the map with the same name as it exists in the game
-                        fileNameForSave += "_d";
-                    }
-
-                    var pickedFileName = AppFileDialogs.SaveFile("Choose where to save the file", fileNameForSave, extension, filter);
-
-                    if (pickedFileName == null)
-                    {
-                        return;
-                    }
-
-                    filaNameToSave = pickedFileName;
-                    resourceTemp = null;
-                }
-                finally
-                {
-                    resourceTemp?.Dispose();
-                }
-
-                var directory = Path.GetDirectoryName(filaNameToSave);
-
-                var extractDialog = new ExtractProgressForm(exportData, directory ?? string.Empty, true)
-                {
-                    ShownCallback = (form, cancellationToken) =>
-                    {
-                        form.SetProgress($"Extracting {fileName} to \"{Path.GetFileName(filaNameToSave)}\"");
-
-                        Task.Run(async () =>
-                        {
-                            await form.ExtractFile(resource, fileName, filaNameToSave, true).ConfigureAwait(false);
-                        }, cancellationToken).ContinueWith(t =>
-                        {
-                            stream.Dispose();
-                            resource.Dispose();
-
-                            form.ExportContinueWith(t);
-                        }, CancellationToken.None);
-                    }
-                };
-
-                try
-                {
-                    await extractDialog.ShowDialogAsync().ConfigureAwait(true);
-                    extractDialog = null;
-                }
-                finally
-                {
-                    extractDialog?.Dispose();
                     exportData.VrfGuiContext.Dispose();
                 }
             }
-            else
+        }
+
+        private static async Task SaveFile(string fileName, Stream stream, bool decompile)
+        {
+            ContentFile? content = null;
+
+            try
             {
-                if (decompile && FileExtract.TryExtractNonResource(stream, fileName, out var content))
+                if (decompile && FileExtract.TryExtractNonResource(stream, fileName, out content))
                 {
                     if (content.Data == null)
                     {
                         // Content has no data to extract, only potentially subfiles
-                        content.Dispose();
-                        await stream.DisposeAsync().ConfigureAwait(true);
                         Log.Info(nameof(ExportFile), $"File \"{fileName}\" has no extractable data");
                         return;
                     }
 
-                    var extension = Path.GetExtension(content.FileName);
-                    fileName = Path.ChangeExtension(fileName, extension);
-                    await stream.DisposeAsync().ConfigureAwait(true);
-
+                    fileName = Path.ChangeExtension(fileName, Path.GetExtension(content.FileName));
                     stream = new MemoryStream(content.Data);
-                    content.Dispose();
                 }
 
                 var saveFileName = AppFileDialogs.SaveFile("Choose where to save the file", Path.GetFileName(fileName), null, "All files (*.*)|*.*");
 
-                if (saveFileName != null)
+                if (saveFileName == null)
                 {
-                    Log.Info(nameof(ExportFile), $"Saved \"{Path.GetFileName(saveFileName)}\"");
-
-                    using var streamOutput = File.Create(saveFileName);
-                    await stream.CopyToAsync(streamOutput).ConfigureAwait(true);
+                    return;
                 }
 
-                await stream.DisposeAsync().ConfigureAwait(true);
+                using var streamOutput = File.Create(saveFileName);
+                await stream.CopyToAsync(streamOutput).ConfigureAwait(true);
+
+                Log.Info(nameof(ExportFile), $"Saved \"{Path.GetFileName(saveFileName)}\"");
+            }
+            finally
+            {
+                content?.Dispose();
             }
         }
 
@@ -178,18 +205,9 @@ namespace GUI.Types.Exporter
                     VrfGuiContext = vrfGuiContext,
                 };
 
-                var extractDialog = new ExtractProgressForm(exportData, null, decompile);
-
-                try
-                {
-                    extractDialog.QueueFiles(selectedNode);
-                    extractDialog.ExecuteMultipleFileExtract();
-                    extractDialog = null;
-                }
-                finally
-                {
-                    extractDialog?.Dispose();
-                }
+                var exporter = new PackageExporter(exportData, null, decompile);
+                exporter.QueueFiles(selectedNode);
+                exporter.ExecuteMultipleFileExtract();
             }
         }
 
@@ -200,24 +218,16 @@ namespace GUI.Types.Exporter
                 VrfGuiContext = vrfGuiContext,
             };
 
-            var extractDialog = new ExtractProgressForm(exportData, null, decompile);
+            var exporter = new PackageExporter(exportData, null, decompile);
 
-            try
+            // When queuing files this way, it'll preserve the original tree
+            // which is probably unwanted behaviour? It works tho /shrug
+            foreach (var item in items.Cast<IBetterBaseItem>())
             {
-                // When queuing files this way, it'll preserve the original tree
-                // which is probably unwanted behaviour? It works tho /shrug
-                foreach (IBetterBaseItem item in items)
-                {
-                    extractDialog.QueueFiles(item);
-                }
+                exporter.QueueFiles(item);
+            }
 
-                extractDialog.ExecuteMultipleFileExtract();
-                extractDialog = null;
-            }
-            finally
-            {
-                extractDialog?.Dispose();
-            }
+            exporter.ExecuteMultipleFileExtract();
         }
 
         public static async Task<bool> PreExportDisclaimer(string fileExtension)
@@ -230,14 +240,9 @@ namespace GUI.Types.Exporter
 
                     messageString =
                     """
-                    Decompiling Source2 maps is a difficult process, as such the output will be messy and imperfect, and will not resemble how
-                    real .vmap files are made!
-
-                    - Models will be merged by material across the map.
-                    - Parts of the skybox mesh might be missing.
-                    - The collision of the map will be merged into one mesh using special materials.
-                    - The map will lack lightmap resolution volumes.
-                    - Hammer meshes will be triangulated.
+                    Compiling a map throws away much of how it was built, so the decompiled map is only an approximation:
+                    props the compiler merged come back as one prop per material, meshes come back as triangles and quads,
+                    and prefabs and groups are gone.
 
                     It is NOT ADVISED to work on decompiled maps as your first map if you are new to mapping!
                     """;
@@ -254,6 +259,5 @@ namespace GUI.Types.Exporter
 
             return true;
         }
-
     }
 }

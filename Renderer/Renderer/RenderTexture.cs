@@ -1,7 +1,6 @@
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using OpenTK.Graphics.OpenGL;
-using ValveResourceFormat.CompiledShader;
 using ValveResourceFormat.ResourceTypes;
 
 namespace ValveResourceFormat.Renderer
@@ -30,6 +29,9 @@ namespace ValveResourceFormat.Renderer
         /// <summary>Gets the depth of the texture (number of slices for 3D or array textures).</summary>
         public int Depth { get; }
 
+        /// <summary>Gets how far, in texels, a motion vector sheet displaces per frame at full deflection.</summary>
+        public short MotionVectorsMaxDistance { get; }
+
         /// <summary>Gets the number of mip levels.</summary>
         public int NumMipLevels { get; private set; }
 
@@ -46,12 +48,7 @@ namespace ValveResourceFormat.Renderer
         RenderTexture(TextureTarget target, string label)
         {
             Target = target;
-            GL.CreateTextures(target, 1, out int handle);
-            Handle = handle;
-
-#if DEBUG
-            GL.ObjectLabel(ObjectLabelIdentifier.Texture, handle, Math.Min(GLEnvironment.MaxLabelLength, label.Length), label);
-#endif
+            Handle = GraphicsDevice.CreateTexture(target, label);
         }
 
         /// <summary>Creates a render texture and populates metadata from the given source texture resource.</summary>
@@ -63,6 +60,7 @@ namespace ValveResourceFormat.Renderer
             Width = data.Width;
             Height = data.Height;
             Depth = data.Depth;
+            MotionVectorsMaxDistance = data.MotionVectorsMaxDistance;
             NumMipLevels = data.NumMipLevels;
             SpriteSheetData = data.GetSpriteSheetData();
             Reflectivity = data.Reflectivity;
@@ -107,9 +105,7 @@ namespace ValveResourceFormat.Renderer
                 ? MaxMipCount(width, height)
                 : 1;
 
-            var texture = new RenderTexture(TextureTarget.Texture2D, width, height, 1, mipCount, label);
-            GL.TextureStorage2D(texture.Handle, mipCount, format.ToGLSizedInternalFormat(), width, height);
-            return texture;
+            return Create(width, height, format, mipCount, label);
         }
 
         /// <summary>Creates a 2D texture with immutable storage and an explicit mip count.</summary>
@@ -126,6 +122,18 @@ namespace ValveResourceFormat.Renderer
             return texture;
         }
 
+        /// <summary>Creates a texture with immutable three dimensional storage.</summary>
+        /// <returns>The newly created render texture.</returns>
+        public static RenderTexture Create3D(TextureTarget target, int width, int height, int depth, ImageFormat format, int mipCount, string label, bool srgb = false)
+        {
+            Debug.Assert(target is TextureTarget.Texture3D or TextureTarget.Texture2DArray or TextureTarget.TextureCubeMapArray,
+                $"{target} does not take three dimensional storage.");
+
+            var texture = new RenderTexture(target, width, height, depth, mipCount, label);
+            GL.TextureStorage3D(texture.Handle, mipCount, format.ToGLSizedInternalFormat(srgb), width, height, depth);
+            return texture;
+        }
+
         /// <summary>Creates a texture view that reinterprets a subrange of this texture's storage.</summary>
         /// <param name="format">The reinterpreted pixel format for the view.</param>
         /// <param name="minLevel">First mip level visible through the view.</param>
@@ -136,30 +144,40 @@ namespace ValveResourceFormat.Renderer
         /// <returns>A new <see cref="RenderTexture"/> wrapping the view.</returns>
         public RenderTexture CreateView(ImageFormat format, string label, int minLevel = 0, int numLevels = 1, int minLayer = 0, int numLayers = 1)
         {
-            var view = new RenderTexture(GL.GenTexture(), Target);
+            var handle = GraphicsDevice.CreateTextureView(Handle, Target, format, minLevel, numLevels, minLayer, numLayers, label);
 
-#if DEBUG
-            GL.ObjectLabel(ObjectLabelIdentifier.Texture, view.Handle, Math.Min(GLEnvironment.MaxLabelLength, label.Length), label);
-#endif
-
-            GL.TextureView(view.Handle, Target, Handle, (PixelInternalFormat)format.ToGLSizedInternalFormat(), minLevel, numLevels, minLayer, numLayers);
-            return view;
+            return new RenderTexture(handle, Target);
         }
 
-        /// <summary>Sets the wrap mode for all relevant texture dimensions.</summary>
-        /// <param name="wrap">The wrap mode to apply.</param>
-        public void SetWrapMode(TextureWrapMode wrap)
+        // Sampler state set through the methods below is remembered, so ReplaceHandle can reapply it;
+        // parameters do not carry over to a replacement texture object
+        private (TextureMinFilter Min, TextureMagFilter Mag)? filtering;
+        private (RsTextureAddressMode S, RsTextureAddressMode T, RsTextureAddressMode R)? wrapMode;
+        private (int BaseLevel, int MaxLevel)? baseMaxLevel;
+        private float maxAnisotropy;
+
+        /// <summary>Sets one addressing mode for all relevant texture dimensions.</summary>
+        /// <param name="mode">The addressing mode to apply.</param>
+        public void SetWrapMode(RsTextureAddressMode mode) => SetWrapMode(mode, mode, mode);
+
+        /// <summary>Sets the addressing mode per texture dimension, skipping the ones this texture does not have.</summary>
+        /// <param name="s">Addressing mode across the width.</param>
+        /// <param name="t">Addressing mode across the height.</param>
+        /// <param name="r">Addressing mode across the depth.</param>
+        public void SetWrapMode(RsTextureAddressMode s, RsTextureAddressMode t, RsTextureAddressMode r)
         {
-            SetParameter(TextureParameterName.TextureWrapS, (int)wrap);
+            wrapMode = (s, t, r);
+
+            SetParameter(TextureParameterName.TextureWrapS, (int)s.ToGLTextureWrapMode());
 
             if (Height > 1)
             {
-                SetParameter(TextureParameterName.TextureWrapT, (int)wrap);
+                SetParameter(TextureParameterName.TextureWrapT, (int)t.ToGLTextureWrapMode());
             }
 
             if (Depth > 1)
             {
-                SetParameter(TextureParameterName.TextureWrapR, (int)wrap);
+                SetParameter(TextureParameterName.TextureWrapR, (int)r.ToGLTextureWrapMode());
             }
         }
 
@@ -168,6 +186,8 @@ namespace ValveResourceFormat.Renderer
         /// <param name="mag">Magnification filter.</param>
         public void SetFiltering(TextureMinFilter min, TextureMagFilter mag)
         {
+            filtering = (min, mag);
+
             SetParameter(TextureParameterName.TextureMinFilter, (int)min);
             SetParameter(TextureParameterName.TextureMagFilter, (int)mag);
         }
@@ -177,8 +197,19 @@ namespace ValveResourceFormat.Renderer
         /// <param name="maxLevel">Highest mip level index.</param>
         public void SetBaseMaxLevel(int baseLevel, int maxLevel)
         {
+            baseMaxLevel = (baseLevel, maxLevel);
+
             SetParameter(TextureParameterName.TextureBaseLevel, baseLevel);
             SetParameter(TextureParameterName.TextureMaxLevel, maxLevel);
+        }
+
+        /// <summary>Sets the maximum anisotropic filtering level.</summary>
+        /// <param name="anisotropy">Maximum anisotropy, typically <see cref="GLEnvironment"/>'s supported maximum.</param>
+        public void SetMaxAnisotropy(float anisotropy)
+        {
+            maxAnisotropy = anisotropy;
+
+            GL.TextureParameter(Handle, (TextureParameterName)ExtTextureFilterAnisotropic.TextureMaxAnisotropyExt, anisotropy);
         }
 
         /// <summary>Sets a single integer texture parameter.</summary>
@@ -187,6 +218,36 @@ namespace ValveResourceFormat.Renderer
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public void SetParameter(TextureParameterName parameter, int value)
             => GL.TextureParameter(Handle, parameter, value);
+
+        // Raw SetParameter writes are not remembered and do not survive the swap.
+        internal void ReplaceHandle(int newHandle, int numMipLevels)
+        {
+            GL.DeleteTexture(Handle);
+            Handle = newHandle;
+            NumMipLevels = numMipLevels;
+
+            if (filtering is { } filter)
+            {
+                SetParameter(TextureParameterName.TextureMinFilter, (int)filter.Min);
+                SetParameter(TextureParameterName.TextureMagFilter, (int)filter.Mag);
+            }
+
+            if (wrapMode is { } wrap)
+            {
+                SetWrapMode(wrap.S, wrap.T, wrap.R);
+            }
+
+            if (baseMaxLevel is { } levels)
+            {
+                SetParameter(TextureParameterName.TextureBaseLevel, levels.BaseLevel);
+                SetParameter(TextureParameterName.TextureMaxLevel, levels.MaxLevel);
+            }
+
+            if (maxAnisotropy > 0f)
+            {
+                SetMaxAnisotropy(maxAnisotropy);
+            }
+        }
 
         /// <summary>Deletes the underlying OpenGL texture object.</summary>
         public void Delete()
@@ -217,5 +278,50 @@ namespace ValveResourceFormat.Renderer
 
             GL.NamedFramebufferTexture(framebuffer.FboHandle, attachment, Handle, mipLevel);
         }
+    }
+
+    /// <summary>
+    /// OpenGL sampler object: the filtering and addressing state a texture is read with, overriding
+    /// the parameters set on the texture itself for the unit it is bound to.
+    /// </summary>
+    public sealed class Sampler
+    {
+        /// <summary>Gets the OpenGL sampler object handle.</summary>
+        public int Handle { get; }
+
+        /// <summary>Creates a sampler with default state.</summary>
+        /// <param name="label">Label string visible in graphics debuggers.</param>
+        public Sampler(string label)
+        {
+            Handle = GraphicsDevice.CreateSampler(label);
+        }
+
+        /// <summary>Sets the addressing mode across the width and height.</summary>
+        /// <param name="s">Addressing mode across the width.</param>
+        /// <param name="t">Addressing mode across the height.</param>
+        public void SetWrapMode(RsTextureAddressMode s, RsTextureAddressMode t)
+        {
+            SetParameter(SamplerParameterName.TextureWrapS, (int)s.ToGLTextureWrapMode());
+            SetParameter(SamplerParameterName.TextureWrapT, (int)t.ToGLTextureWrapMode());
+        }
+
+        /// <summary>Sets the minification and magnification filters.</summary>
+        /// <param name="min">Minification filter.</param>
+        /// <param name="mag">Magnification filter.</param>
+        public void SetFiltering(TextureMinFilter min, TextureMagFilter mag)
+        {
+            SetParameter(SamplerParameterName.TextureMinFilter, (int)min);
+            SetParameter(SamplerParameterName.TextureMagFilter, (int)mag);
+        }
+
+        /// <summary>Sets how many samples anisotropic filtering may take.</summary>
+        /// <param name="maxAnisotropy">Maximum anisotropy, clamped by the driver to what it supports.</param>
+        public void SetMaxAnisotropy(float maxAnisotropy)
+        {
+            GL.SamplerParameter(Handle, (SamplerParameterName)ExtTextureFilterAnisotropic.TextureMaxAnisotropyExt, maxAnisotropy);
+        }
+
+        private void SetParameter(SamplerParameterName parameter, int value)
+            => GL.SamplerParameter(Handle, parameter, value);
     }
 }

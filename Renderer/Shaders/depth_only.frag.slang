@@ -1,5 +1,7 @@
 #version 460
 
+#pragma IgnoreMaterialData
+
 #define F_ALPHA_TEST 0 // most shaders
 
 #if (F_ALPHA_TEST == 0)
@@ -8,7 +10,8 @@
 
 #if (F_ALPHA_TEST == 1)
     layout (location = 0) in vec2 texCoord;
-    uniform sampler2D g_tColor;
+    layout (location = 0) out vec4 outputColor;
+    uniform sampler2D g_tColor; // RepresentativeTexture
     uniform float g_flAlphaTestReference = 0.5;
 #endif
 
@@ -18,5 +21,7 @@ void main()
         float opacity = texture(g_tColor, texCoord).a;
         if (opacity - 0.001 < g_flAlphaTestReference)
             discard;
+
+        outputColor = vec4(0.0, 0.0, 0.0, 1.0);
     #endif
 }

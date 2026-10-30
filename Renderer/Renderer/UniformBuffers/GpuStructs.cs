@@ -30,6 +30,16 @@ public struct MeshletCullInfo
     public uint ParentDrawBoundsIndex;
 }
 
+/// <summary>Per-object LOD state the aggregate cull shader tests before anything else.</summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct ObjectLodInfo
+{
+    /// <summary>LOD levels this object belongs to, one bit per level. Zero means it always draws.</summary>
+    public uint LodGroupMask;
+    /// <summary>Index into the scene's active LOD level bits.</summary>
+    public uint LodSetupIndex;
+}
+
 /// <summary>Axis-aligned bounding box for a draw call, used in GPU culling.</summary>
 [StructLayout(LayoutKind.Sequential)]
 public struct DrawBounds
@@ -58,26 +68,50 @@ public struct OccludedBoundDebug
     public float _Padding2;
 };
 
-/// <summary>Per-object GPU data including tint, transform, and environment map visibility.</summary>
+/// <summary>
+/// Draw or instance uniforms.
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct InstanceDataStandard
+{
+    /// <summary>Packed tint color and alpha.</summary>
+    public uint TintAlpha;
+    /// <summary>Index into the transform buffer.</summary>
+    public uint TransformIndex;
+    /// <summary>The scene node drawn, which replacement shaders can tell draws apart by, and the index of its <see cref="ObjectDataStandard"/>.</summary>
+    public uint Identification;
+    /// <summary>Skinning of the mesh drawn: bit 31: enabled, bits 16-30: bone count, bits 0-15: mesh bone offset.</summary>
+    public uint MeshBoneData;
+    /// <summary>Where the mesh drawn starts in its morph composite, or -1 when it has none.</summary>
+    public int MorphVertexIdOffset;
+    /// <summary>The mesh's rect in the morph composite atlas, x in the low 16 bits and y in the high 16.</summary>
+    public uint MorphAtlasOrigin;
+    /// <summary>Row width of the mesh's rect in the morph composite atlas.</summary>
+    public uint MorphAtlasStride;
+    private readonly uint padding0;
+
+    /// <summary>Packs <see cref="MeshBoneData"/> for a mesh.</summary>
+    /// <param name="mesh">The mesh a draw call belongs to.</param>
+    public static uint PackMeshBoneData(RenderableMesh mesh) => mesh.IsSkinningActive
+        ? 0x80000000u | ((uint)mesh.MeshBoneCount << 16) | (uint)mesh.MeshBoneOffset
+        : 0u;
+};
+
+/// <summary>Scene node uniforms.</summary>
 [StructLayout(LayoutKind.Sequential)]
 public struct ObjectDataStandard
 {
-    /// <summary>Packed tint color and alpha for the object.</summary>
-    public uint TintAlpha;
-    /// <summary>Index into the transform buffer for this object.</summary>
-    public uint TransformIndex;
     /// <summary>
     /// Light probe volume index in the low 16 bits, env map index in the high 16. Both arrays cap far
-    /// below 65535, so sharing a word keeps this struct at 16 bytes. Only the legacy per batch cube map
-    /// path reads the env map half; the array path culls probes per screen tile instead.
+    /// below 65535, so they share a word.
     /// </summary>
     public uint VisibleLPV;
-    /// <summary>Unique identifier for this object used in selection and highlighting.</summary>
-    public uint Identification;
+    private readonly uint padding0;
+    private readonly uint padding1;
+    private readonly uint padding2;
     /// <summary>Bitmask of which environment maps are visible to this object.</summary>
     public SceneEnvMap.EnvMapVisibility128 EnvMapVisibility;
 };
-
 
 /// <summary>Arguments for a <c>glDrawElementsIndirect</c> GPU draw call.</summary>
 [StructLayout(LayoutKind.Sequential)]
@@ -96,8 +130,8 @@ public readonly struct DrawElementsIndirectCommand
 };
 
 /// <summary>
-/// One item class culled by <c>compute_tile_cullbits</c> and <c>compute_depthbin_cullbits</c>. Three are
-/// dispatched together, covering barn lights, env maps and light probe volumes in one pass.
+/// One item class culled by <c>compute_tile_cullbits</c> and <c>compute_depthbin_cullbits</c>. Four are
+/// dispatched together, covering barn lights, env maps, light probe volumes and projected decals in one pass.
 /// </summary>
 /// <remarks>Matches <c>CullBatch_t</c>, 16 bytes.</remarks>
 [StructLayout(LayoutKind.Sequential)]
@@ -164,16 +198,16 @@ public struct CullItem
     public float _Unused76;
 };
 
-/// <summary>Three <see cref="CullBatch"/> entries, matching the fixed size arrays in <c>CullParams_t</c>.</summary>
-[InlineArray(3)]
-public struct CullBatchTriple
+/// <summary>One <see cref="CullBatch"/> per <see cref="TiledCullFeeder.BatchCount"/>, matching the fixed size arrays in <c>CullParams_t</c>.</summary>
+[InlineArray(TiledCullFeeder.BatchCount)]
+public struct CullBatchArray
 {
     private CullBatch Batch0;
 }
 
 /// <summary>Shared constants for both cull passes.</summary>
 /// <remarks>
-/// Matches <c>CullParams_t</c>, 160 bytes. Sequential .NET packing reproduces the std140 offsets, which
+/// Matches <c>CullParams_t</c>, 192 bytes. Sequential .NET packing reproduces the std140 offsets, which
 /// in turn reproduce the packoffsets Source 2's own build uses (c0, c1, c3, c4, c7).
 /// </remarks>
 [StructLayout(LayoutKind.Sequential)]
@@ -214,10 +248,10 @@ public struct CullParams
     public uint FirstMaskForBatch1;
     /// <summary>First mask index of batch 2.</summary>
     public uint FirstMaskForBatch2;
-    /// <summary>Total mask count across all batches. Read by neither shader; it is the dispatch size.</summary>
-    public uint MaskCount;
+    /// <summary>First mask index of batch 3.</summary>
+    public uint FirstMaskForBatch3;
     /// <summary>Output layout of each batch in the tile pass.</summary>
-    public CullBatchTriple TileBatches;
+    public CullBatchArray TileBatches;
     /// <summary>Output layout of each batch in the depth bin pass.</summary>
-    public CullBatchTriple BinBatches;
+    public CullBatchArray BinBatches;
 };

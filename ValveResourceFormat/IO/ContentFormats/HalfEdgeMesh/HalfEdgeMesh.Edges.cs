@@ -6,14 +6,22 @@ namespace ValveResourceFormat.IO.ContentFormats.HalfEdgeMesh;
 
 partial class HalfEdgeMesh
 {
+    /// <summary>
+    /// Returns the vertex the half edge points to.
+    /// </summary>
     public static VertexHandle GetEndVertexConnectedToEdge(HalfEdgeHandle hHalfEdge)
     {
         if (!hHalfEdge.IsValid)
+        {
             return VertexHandle.Invalid;
+        }
 
         return hHalfEdge.Vertex;
     }
 
+    /// <summary>
+    /// Returns the start and end vertices of a half edge.
+    /// </summary>
     public static void GetVerticesConnectedToHalfEdge(HalfEdgeHandle hEdge, out VertexHandle hVertexA, out VertexHandle hVertexB)
     {
         if (!hEdge.IsValid)
@@ -27,11 +35,17 @@ partial class HalfEdgeMesh
         hVertexB = hEdge.Vertex;
     }
 
+    /// <summary>
+    /// Returns both vertices of a full edge.
+    /// </summary>
     public static void GetVerticesConnectedToFullEdge(HalfEdgeHandle hEdge, out VertexHandle hVertexA, out VertexHandle hVertexB)
     {
         GetVerticesConnectedToHalfEdge(hEdge, out hVertexA, out hVertexB);
     }
 
+    /// <summary>
+    /// Returns the two half edges that make up a full edge.
+    /// </summary>
     public static void GetHalfEdgesConnectedToFullEdge(HalfEdgeHandle hFullEdge, out HalfEdgeHandle hOutHalfEdgeA, out HalfEdgeHandle hOutHalfEdgeB)
     {
         if (hFullEdge.IsValid)
@@ -46,16 +60,25 @@ partial class HalfEdgeMesh
         }
     }
 
+    /// <summary>
+    /// Returns the half edge of a full edge that borders the given face.
+    /// </summary>
     public static HalfEdgeHandle GetHalfEdgeForFaceEdge(FaceHandle hFace, HalfEdgeHandle hFullEdge)
     {
         if (!hFullEdge.IsValid)
+        {
             return HalfEdgeHandle.Invalid;
+        }
 
         if (hFullEdge.Face == hFace)
+        {
             return hFullEdge;
+        }
 
         if (hFullEdge.OppositeEdge.Face == hFace)
+        {
             return hFullEdge.OppositeEdge;
+        }
 
         return HalfEdgeHandle.Invalid;
     }
@@ -68,7 +91,9 @@ partial class HalfEdgeMesh
     public HalfEdgeHandle GetFullEdgeForHalfEdge(HalfEdgeHandle hEdge)
     {
         if (!hEdge.IsValid)
+        {
             return HalfEdgeHandle.Invalid;
+        }
 
         if (hEdge.Index < this[hEdge].OppositeEdge)
         {
@@ -80,40 +105,62 @@ partial class HalfEdgeMesh
         }
     }
 
+    /// <summary>
+    /// Returns the half edge running the opposite direction.
+    /// </summary>
     public static HalfEdgeHandle GetOppositeHalfEdge(HalfEdgeHandle hEdge)
     {
         if (!hEdge.IsValid)
+        {
             return HalfEdgeHandle.Invalid;
+        }
 
         return hEdge.OppositeEdge;
     }
 
+    /// <summary>
+    /// Whether the full edge borders only one face.
+    /// </summary>
     public static bool IsFullEdgeOpen(HalfEdgeHandle hFullEdge)
     {
         if (!hFullEdge.IsValid)
+        {
             return false;
+        }
 
         if (hFullEdge.Face == FaceHandle.Invalid)
+        {
             return true;
+        }
 
         if (hFullEdge.OppositeEdge.Face == FaceHandle.Invalid)
+        {
             return true;
+        }
 
         return false;
     }
 
+    /// <summary>
+    /// Returns the faces on either side of a full edge.
+    /// </summary>
     public static void GetFacesConnectedToFullEdge(HalfEdgeHandle hFullEdge, out FaceHandle hOutFaceA, out FaceHandle hOutFaceB)
     {
         hOutFaceA = FaceHandle.Invalid;
         hOutFaceB = FaceHandle.Invalid;
 
         if (!hFullEdge.IsValid)
+        {
             return;
+        }
 
         hOutFaceA = hFullEdge.Face;
         hOutFaceB = hFullEdge.OppositeEdge.Face;
     }
 
+    /// <summary>
+    /// Returns the face on the other side of a full edge from the given one.
+    /// </summary>
     public static FaceHandle GetOppositeFaceConnectedToFullEdge(HalfEdgeHandle hFullEdge, FaceHandle hFace)
     {
         GetHalfEdgesConnectedToFullEdge(hFullEdge, out var hHalfEdgeA, out var hHalfEdgeB);
@@ -130,68 +177,101 @@ partial class HalfEdgeMesh
         return FaceHandle.Invalid;
     }
 
+    /// <summary>
+    /// Returns the face the half edge borders.
+    /// </summary>
     public static FaceHandle GetFaceConnectedToHalfEdge(HalfEdgeHandle hEdge)
     {
         if (!hEdge.IsValid)
+        {
             return FaceHandle.Invalid;
+        }
 
         return hEdge.Face;
     }
 
+    /// <summary>
+    /// Returns the first face a full edge borders.
+    /// </summary>
     public static FaceHandle GetFaceConnectedToFullEdge(HalfEdgeHandle hFullEdge)
     {
         if (!hFullEdge.IsValid)
+        {
             return FaceHandle.Invalid;
+        }
 
         if (hFullEdge.Face.IsValid)
+        {
             return hFullEdge.Face;
+        }
 
         return hFullEdge.OppositeEdge.Face;
     }
 
+    /// <summary>
+    /// Returns the face both full edges border.
+    /// </summary>
     public static FaceHandle FindFaceConnectingFullEdges(HalfEdgeHandle hEdgeA, HalfEdgeHandle hEdgeB)
     {
         GetFacesConnectedToFullEdge(hEdgeA, out var hFaceA1, out var hFaceA2);
         GetFacesConnectedToFullEdge(hEdgeB, out var hFaceB1, out var hFaceB2);
 
         if (hFaceA1.IsValid && ((hFaceA1 == hFaceB1) || (hFaceA1 == hFaceB2)))
+        {
             return hFaceA1;
+        }
 
         if (hFaceA2.IsValid && ((hFaceA2 == hFaceB1) || (hFaceA2 == hFaceB2)))
+        {
             return hFaceA2;
+        }
 
         return FaceHandle.Invalid;
     }
 
+    /// <summary>
+    /// Returns the vertex both full edges meet at.
+    /// </summary>
     public static VertexHandle FindVertexConnectingFullEdges(HalfEdgeHandle hEdgeA, HalfEdgeHandle hEdgeB)
     {
         GetVerticesConnectedToHalfEdge(hEdgeA, out var hVertexA1, out var hVertexA2);
         GetVerticesConnectedToHalfEdge(hEdgeB, out var hVertexB1, out var hVertexB2);
 
         if ((hVertexA1 == hVertexB1) || (hVertexA1 == hVertexB2))
+        {
             return hVertexA1;
+        }
 
         if ((hVertexA2 == hVertexB1) || (hVertexA2 == hVertexB2))
+        {
             return hVertexA2;
+        }
 
         return VertexHandle.Invalid;
     }
 
+    /// <summary>
+    /// Collects every vertex touched by a set of full edges.
+    /// </summary>
     public static void FindVerticesConnectedToFullEdges(IReadOnlyList<HalfEdgeHandle> edgeList, out VertexHandle[] outVertices)
     {
         var nNumEdges = edgeList.Count;
         var uniqueVertices = new Dictionary<VertexHandle, int>();
         var i = 0;
 
-        for (int iEdge = 0; iEdge < nNumEdges; ++iEdge)
+        for (var iEdge = 0; iEdge < nNumEdges; ++iEdge)
         {
             GetVerticesConnectedToFullEdge(edgeList[iEdge], out var hVertexA, out var hVertexB);
 
-            if (!uniqueVertices.ContainsKey(hVertexA))
-                uniqueVertices.Add(hVertexA, i++);
+            if (uniqueVertices.TryAdd(hVertexA, i))
+            {
+                i++;
+            }
 
-            if (!uniqueVertices.ContainsKey(hVertexB))
-                uniqueVertices.Add(hVertexB, i++);
+            if (uniqueVertices.TryAdd(hVertexB, i))
+            {
+                i++;
+            }
         }
 
         outVertices = new VertexHandle[uniqueVertices.Count];
@@ -201,6 +281,9 @@ partial class HalfEdgeMesh
         }
     }
 
+    /// <summary>
+    /// Collects the faces bordered by a set of half edges, along with a half edge bordering each face.
+    /// </summary>
     public static void FindFacesConnectedToHalfEdges(
         IReadOnlyList<HalfEdgeHandle> pHalfEdgeList,
         int nNumEdges,
@@ -212,11 +295,13 @@ partial class HalfEdgeMesh
 
         var faceTable = new HashSet<FaceHandle>(nNumEdges);
 
-        for (int iEdge = 0; iEdge < nNumEdges; ++iEdge)
+        for (var iEdge = 0; iEdge < nNumEdges; ++iEdge)
         {
             var hEdge = pHalfEdgeList[iEdge];
             if (!hEdge.IsValid)
+            {
                 continue;
+            }
 
             if (faceTable.Add(hEdge.Face))
             {
@@ -226,24 +311,35 @@ partial class HalfEdgeMesh
         }
     }
 
+    /// <summary>
+    /// Returns the edge across the face from the given one.
+    /// </summary>
     public static HalfEdgeHandle FindOppositeHalfEdgeInFace(HalfEdgeHandle hEdge, int nMaxFaceSides = -1)
     {
         if (!hEdge.IsValid)
+        {
             return HalfEdgeHandle.Invalid;
+        }
 
         if (hEdge.Face == FaceHandle.Invalid)
+        {
             return HalfEdgeHandle.Invalid;
+        }
 
         var nNumEdges = ComputeNumEdgesInFace(hEdge.Face);
         if (((nNumEdges % 2) != 0) || (nNumEdges < 3))
+        {
             return HalfEdgeHandle.Invalid;
+        }
 
         if ((nMaxFaceSides > 0) && (nNumEdges > nMaxFaceSides))
+        {
             return HalfEdgeHandle.Invalid;
+        }
 
         var nStepCount = nNumEdges / 2;
         var hCurrentEdge = hEdge;
-        for (int iStep = 0; iStep < nStepCount; ++iStep)
+        for (var iStep = 0; iStep < nStepCount; ++iStep)
         {
             hCurrentEdge = hCurrentEdge.NextEdge;
         }
@@ -251,45 +347,63 @@ partial class HalfEdgeMesh
         return hCurrentEdge;
     }
 
+    /// <summary>
+    /// Returns the next edge of an edge loop, carrying straight on through the vertex.
+    /// </summary>
     public static HalfEdgeHandle FindNextHalfEdgeInLoop(HalfEdgeHandle hEdge, int nMaxVertexEdges)
     {
         var hVertex = GetEndVertexConnectedToEdge(hEdge);
         var nNumEdges = ComputeNumEdgesConnectedToVertex(hVertex);
 
-        if (IsHalfEdgeInMesh(hEdge) == false)
+        if (!IsHalfEdgeInMesh(hEdge))
+        {
             return HalfEdgeHandle.Invalid;
+        }
 
         if ((nNumEdges <= 1) || ((nNumEdges % 2) != 0) || ((nMaxVertexEdges > 0) && (nNumEdges > nMaxVertexEdges)))
+        {
             return HalfEdgeHandle.Invalid;
+        }
 
-        int nOppositeEdge = nNumEdges / 2;
+        var nOppositeEdge = nNumEdges / 2;
         var hNextEdge = GetNextEdgeInFaceLoop(hEdge);
-        for (int i = 1; i < nOppositeEdge; ++i)
+        for (var i = 1; i < nOppositeEdge; ++i)
         {
             hNextEdge = GetNextEdgeInVertexLoop(hNextEdge);
         }
 
         if (!hNextEdge.IsValid)
+        {
             return HalfEdgeHandle.Invalid;
+        }
 
         if ((hNextEdge.Face == FaceHandle.Invalid) || (hNextEdge.OppositeEdge.Face == FaceHandle.Invalid))
+        {
             return HalfEdgeHandle.Invalid;
+        }
 
         Debug.Assert(hNextEdge != hEdge);
         if (hNextEdge == hEdge)
+        {
             return HalfEdgeHandle.Invalid;
+        }
 
         return hNextEdge;
     }
 
+    /// <summary>
+    /// Walks the edge loop that starts at the given edge.
+    /// </summary>
     public static void FindEdgeLoopStartingAtEdge(HalfEdgeHandle hStartEdge, int nMaxVertexEdges, out HalfEdgeHandle[]? pOutEdgeList)
     {
         pOutEdgeList = null;
 
         if (!IsHalfEdgeInMesh(hStartEdge))
+        {
             return;
+        }
 
-        int nEdgeCount = 0;
+        var nEdgeCount = 0;
         var hCurrentEdge = hStartEdge;
         do
         {
@@ -310,6 +424,9 @@ partial class HalfEdgeMesh
         while ((hCurrentEdge != HalfEdgeHandle.Invalid) && (hCurrentEdge != hStartEdge));
     }
 
+    /// <summary>
+    /// Collects the edge loop the given edge belongs to.
+    /// </summary>
     public void FindEdgeLoop(HalfEdgeHandle hEdge, int nMaxVertices, out List<HalfEdgeHandle>? pOutEdgeList)
     {
         GetHalfEdgesConnectedToFullEdge(hEdge, out var hHalfEdgeA, out var hHalfEdgeB);
@@ -329,16 +446,19 @@ partial class HalfEdgeMesh
         var nNumEdgesB = edgeLoopB is null ? 0 : edgeLoopB.Length;
         pOutEdgeList = new List<HalfEdgeHandle>(nNumEdgesA + nNumEdgesB);
 
-        for (int iEdge = (nNumEdgesB - 1); iEdge > 0; --iEdge)
+        for (var iEdge = (nNumEdgesB - 1); iEdge > 0; --iEdge)
         {
             pOutEdgeList.Add(GetFullEdgeForHalfEdge(edgeLoopB![iEdge]));
         }
-        for (int iEdge = 0; iEdge < nNumEdgesA; ++iEdge)
+        for (var iEdge = 0; iEdge < nNumEdgesA; ++iEdge)
         {
             pOutEdgeList.Add(GetFullEdgeForHalfEdge(edgeLoopA![iEdge]));
         }
     }
 
+    /// <summary>
+    /// Collects the edge ring the given edge belongs to.
+    /// </summary>
     public void FindEdgeRing(HalfEdgeHandle hEdge, out List<HalfEdgeHandle> outEdgeList)
     {
         GetHalfEdgesConnectedToFullEdge(hEdge, out var hStartHalfEdgeA, out var hStartHalfEdgeB);
@@ -346,10 +466,10 @@ partial class HalfEdgeMesh
         var edgesA = new List<HalfEdgeHandle>();
         var edgesB = new List<HalfEdgeHandle>();
 
-        for (int i = 0; i < 2; ++i)
+        for (var i = 0; i < 2; ++i)
         {
             var hCurrentEdge = hStartHalfEdgeA;
-            int nNumEdgesA = 0;
+            var nNumEdgesA = 0;
             do
             {
                 if (i == 1)
@@ -359,7 +479,9 @@ partial class HalfEdgeMesh
                 ++nNumEdgesA;
                 var hFaceOppositeEdge = FindOppositeHalfEdgeInFace(hCurrentEdge);
                 if (!hFaceOppositeEdge.IsValid)
+                {
                     break;
+                }
 
                 hCurrentEdge = hFaceOppositeEdge.OppositeEdge;
             }
@@ -368,14 +490,16 @@ partial class HalfEdgeMesh
 
             if ((hCurrentEdge != hStartHalfEdgeA) || (nNumEdgesA < 2))
             {
-                int nNumEdgesB = 0;
+                var nNumEdgesB = 0;
                 var hLastEdge = hCurrentEdge;
                 hCurrentEdge = hStartHalfEdgeB;
                 do
                 {
                     var hFaceOppositeEdge = FindOppositeHalfEdgeInFace(hCurrentEdge);
                     if (!hFaceOppositeEdge.IsValid || (hFaceOppositeEdge == hLastEdge))
+                    {
                         break;
+                    }
 
                     hCurrentEdge = hFaceOppositeEdge.OppositeEdge;
 
@@ -393,20 +517,23 @@ partial class HalfEdgeMesh
 
         outEdgeList = new List<HalfEdgeHandle>(edgesA.Count + edgesB.Count);
 
-        for (int iEdge = edgesB.Count - 1; iEdge >= 0; --iEdge)
+        for (var iEdge = edgesB.Count - 1; iEdge >= 0; --iEdge)
         {
             outEdgeList.Add(GetFullEdgeForHalfEdge(edgesB[iEdge]));
         }
 
-        for (int iEdge = 0; iEdge < edgesA.Count; ++iEdge)
+        for (var iEdge = 0; iEdge < edgesA.Count; ++iEdge)
         {
             outEdgeList.Add(GetFullEdgeForHalfEdge(edgesA[iEdge]));
         }
     }
 
+    /// <summary>
+    /// Splits a set of edges into connected groups.
+    /// </summary>
     public void FindEdgeIslands(IReadOnlyList<HalfEdgeHandle> pEdgeList, out List<List<HalfEdgeHandle>> pOutEdgeList)
     {
-        pOutEdgeList = new();
+        pOutEdgeList = [];
 
         var edgeSearchList = new List<HalfEdgeHandle>(pEdgeList);
 
@@ -415,7 +542,9 @@ partial class HalfEdgeMesh
             var hStartEdge = edgeSearchList[0];
             edgeSearchList.RemoveAt(0);
             if (!hStartEdge.IsValid)
+            {
                 continue;
+            }
 
             var islandEdgeList = new List<HalfEdgeHandle>(32);
             pOutEdgeList.Add(islandEdgeList);
@@ -433,13 +562,15 @@ partial class HalfEdgeMesh
                 edgesConnectedToEdge.AddRange(edgesConnectedToVertex);
 
                 var nNumConnectedEdges = edgesConnectedToEdge.Count;
-                for (int iEdge = 0; iEdge < nNumConnectedEdges; ++iEdge)
+                for (var iEdge = 0; iEdge < nNumConnectedEdges; ++iEdge)
                 {
                     var hConnectedEdge = edgesConnectedToEdge[iEdge];
                     if (hConnectedEdge == hCurrentEdge)
+                    {
                         continue;
+                    }
 
-                    int nIndexInSearchList = edgeSearchList.IndexOf(hConnectedEdge);
+                    var nIndexInSearchList = edgeSearchList.IndexOf(hConnectedEdge);
                     if (nIndexInSearchList != -1)
                     {
                         islandEdgeList.Add(hConnectedEdge);
@@ -452,19 +583,24 @@ partial class HalfEdgeMesh
         }
     }
 
+    /// <summary>
+    /// Classifies how a set of edges is connected, and returns them in order when they form a loop or list.
+    /// </summary>
     public static ComponentConnectivityType ClassifyEdgeListConnectivity(
         IReadOnlyList<HalfEdgeHandle> pEdgeList,
         int nNumEdges,
         out List<HalfEdgeHandle> pOutSortedHalfEdgeList)
     {
-        pOutSortedHalfEdgeList = new List<HalfEdgeHandle>();
+        pOutSortedHalfEdgeList = [];
 
         if ((pEdgeList is null) || (nNumEdges <= 0))
+        {
             return ComponentConnectivityType.None;
+        }
 
-        int nNumHalfEdges = nNumEdges * 2;
+        var nNumHalfEdges = nNumEdges * 2;
         var halfEdges = new HalfEdgeHandle[nNumHalfEdges];
-        for (int iEdge = 0; iEdge < nNumEdges; ++iEdge)
+        for (var iEdge = 0; iEdge < nNumEdges; ++iEdge)
         {
             GetHalfEdgesConnectedToFullEdge(pEdgeList[iEdge], out halfEdges[iEdge * 2], out halfEdges[iEdge * 2 + 1]);
         }
@@ -474,14 +610,14 @@ partial class HalfEdgeMesh
 
         if (nNumEdges > 1)
         {
-            for (int iEdge = 0; iEdge < nNumEdges; ++iEdge)
+            for (var iEdge = 0; iEdge < nNumEdges; ++iEdge)
             {
                 var hStartEdge = halfEdges[iEdge * 2];
                 var hStartEdgeOpposite = halfEdges[iEdge * 2 + 1];
                 var hCurrentEdge = hStartEdge;
-                int nNumConnectedHalfEdges = 0;
-                bool bVisitedOpposite = false;
-                bool bFoundSplit = false;
+                var nNumConnectedHalfEdges = 0;
+                var bVisitedOpposite = false;
+                var bFoundSplit = false;
 
                 do
                 {
@@ -515,11 +651,13 @@ partial class HalfEdgeMesh
                 while (hCurrentEdge != hStartEdge);
 
                 if (nNumConnectedHalfEdges <= 2)
+                {
                     continue;
+                }
 
                 if (iEdge == 0)
                 {
-                    if ((bVisitedOpposite == false) && (nNumConnectedHalfEdges == nNumEdges))
+                    if (!bVisitedOpposite && (nNumConnectedHalfEdges == nNumEdges))
                     {
                         connectivityType = ComponentConnectivityType.Loop;
                         break;
@@ -567,7 +705,9 @@ partial class HalfEdgeMesh
                     var hNextEdge = FindConnectedHalfEdgeInSet(hCurrentEdge, halfEdges, halfEdges.Length);
 
                     if (hNextEdge == hCurrentEdge.OppositeEdge)
+                    {
                         break;
+                    }
 
                     hCurrentEdge = hNextEdge;
                 }
@@ -582,7 +722,7 @@ partial class HalfEdgeMesh
                 var facesA = new HashSet<FaceHandle>(nNumSortedEdges);
                 var facesB = new HashSet<FaceHandle>(nNumSortedEdges);
 
-                for (int iEdge = 0; iEdge < nNumSortedEdges; ++iEdge)
+                for (var iEdge = 0; iEdge < nNumSortedEdges; ++iEdge)
                 {
                     var hHalfEdgeA = pOutSortedHalfEdgeList[iEdge];
                     var hHalfEdgeB = GetOppositeHalfEdge(hHalfEdgeA);
@@ -604,18 +744,23 @@ partial class HalfEdgeMesh
         return connectivityType;
     }
 
+    /// <summary>
+    /// Splits a set of edges into ribs and rails, and reports the edges that belong to neither.
+    /// </summary>
     public static int FindEdgeRibs(IReadOnlyList<HalfEdgeHandle> edges, int numEdges,
         out List<List<HalfEdgeHandle>> leftRibs, out List<List<HalfEdgeHandle>> rightRibs,
         out List<HalfEdgeHandle> spineEdges)
     {
         const int maxFaceEdges = 4;
 
-        leftRibs = new List<List<HalfEdgeHandle>>();
-        rightRibs = new List<List<HalfEdgeHandle>>();
+        leftRibs = [];
+        rightRibs = [];
 
         var connectivityType = ClassifyEdgeListConnectivity(edges, numEdges, out spineEdges);
         if ((connectivityType != ComponentConnectivityType.Loop) && (connectivityType != ComponentConnectivityType.List))
+        {
             return 0;
+        }
 
         var numSpineEdges = spineEdges.Count;
         var numRibs = numSpineEdges * 2;
@@ -623,8 +768,8 @@ partial class HalfEdgeMesh
 
         for (var i = 0; i < numRibs; i++)
         {
-            leftRibs.Add(new List<HalfEdgeHandle>());
-            rightRibs.Add(new List<HalfEdgeHandle>());
+            leftRibs.Add([]);
+            rightRibs.Add([]);
         }
 
         for (var i = 0; i < numSpineEdges; ++i)
@@ -641,7 +786,9 @@ partial class HalfEdgeMesh
             {
                 var hFaceOppositeEdge = FindOppositeHalfEdgeInFace(hCurrentEdge, maxFaceEdges);
                 if (!hFaceOppositeEdge.IsValid)
+                {
                     break;
+                }
 
                 leftRibEdgesTop.Add(FindPreviousEdgeInFaceLoop(hCurrentEdge));
                 leftRibEdgesBottom.Add(GetNextEdgeInFaceLoop(hCurrentEdge));
@@ -655,7 +802,9 @@ partial class HalfEdgeMesh
             {
                 var hFaceOppositeEdge = FindOppositeHalfEdgeInFace(hCurrentEdge, maxFaceEdges);
                 if (!hFaceOppositeEdge.IsValid)
+                {
                     break;
+                }
 
                 rightRibEdgesTop.Add(GetNextEdgeInFaceLoop(hCurrentEdge));
                 rightRibEdgesBottom.Add(FindPreviousEdgeInFaceLoop(hCurrentEdge));
@@ -669,6 +818,9 @@ partial class HalfEdgeMesh
         return numRibs;
     }
 
+    /// <summary>
+    /// Collects the faces bordered by a set of full edges, along with how many of those edges each face borders.
+    /// </summary>
     public static void FindFacesConnectedToFullEdges(IReadOnlyList<HalfEdgeHandle> edgeList, List<FaceHandle> outFaces, List<int> outFaceEdgeCounts)
     {
         outFaces.Clear();
@@ -676,45 +828,58 @@ partial class HalfEdgeMesh
 
         var uniqueFaces = new Dictionary<FaceHandle, int>();
 
-        for (int i = 0; i < edgeList.Count; i++)
+        for (var i = 0; i < edgeList.Count; i++)
         {
             GetFacesConnectedToFullEdge(edgeList[i], out var faceA, out var faceB);
 
-            if (faceA.IsValid && !uniqueFaces.ContainsKey(faceA))
-                uniqueFaces.Add(faceA, uniqueFaces.Count);
+            if (faceA.IsValid)
+            {
+                uniqueFaces.TryAdd(faceA, uniqueFaces.Count);
+            }
 
-            if (faceB.IsValid && !uniqueFaces.ContainsKey(faceB))
-                uniqueFaces.Add(faceB, uniqueFaces.Count);
+            if (faceB.IsValid)
+            {
+                uniqueFaces.TryAdd(faceB, uniqueFaces.Count);
+            }
         }
 
         foreach (var kv in uniqueFaces)
+        {
             outFaces.Add(kv.Key);
+        }
 
         if (outFaceEdgeCounts != null)
         {
             outFaceEdgeCounts.AddRange(new int[outFaces.Count]);
 
-            for (int i = 0; i < edgeList.Count; i++)
+            for (var i = 0; i < edgeList.Count; i++)
             {
                 GetFacesConnectedToFullEdge(edgeList[i], out var faceA, out var faceB);
 
                 if (faceA.IsValid && uniqueFaces.TryGetValue(faceA, out var indexA))
+                {
                     outFaceEdgeCounts[indexA]++;
+                }
 
                 if (faceB.IsValid && uniqueFaces.TryGetValue(faceB, out var indexB))
+                {
                     outFaceEdgeCounts[indexB]++;
+                }
             }
         }
     }
 
+    /// <summary>
+    /// Splits the open edges of a set into connected groups, both as half edges and as full edges.
+    /// </summary>
     public void FindOpenEdgeIslands(IReadOnlyList<HalfEdgeHandle> edges, out List<List<HalfEdgeHandle>> outHalfEdgeIslandList, out List<List<HalfEdgeHandle>> outFullEdgeIslandList)
     {
-        outHalfEdgeIslandList = new();
-        outFullEdgeIslandList = new();
+        outHalfEdgeIslandList = [];
+        outFullEdgeIslandList = [];
 
         var edgeSearchList = new List<HalfEdgeHandle>(edges.Count);
 
-        for (int iEdge = 0; iEdge < edges.Count; ++iEdge)
+        for (var iEdge = 0; iEdge < edges.Count; ++iEdge)
         {
             GetHalfEdgesConnectedToFullEdge(edges[iEdge], out var hHalfEdgeA, out var hHalfEdgeB);
 
@@ -735,22 +900,26 @@ partial class HalfEdgeMesh
         {
             var hLoopStartEdge = edgeSearchList[0];
             var hCurrentEdge = hLoopStartEdge;
-            int nCurrentEdgeIndex = 0;
+            var nCurrentEdgeIndex = 0;
 
             do
             {
-                int nPrevEdgeIndex = nCurrentEdgeIndex;
+                var nPrevEdgeIndex = nCurrentEdgeIndex;
                 hCurrentEdge = hCurrentEdge.NextEdge;
                 nCurrentEdgeIndex = edgeSearchList.IndexOf(hCurrentEdge);
 
                 if (nPrevEdgeIndex == -1 && nCurrentEdgeIndex != -1)
+                {
                     break;
+                }
             }
             while (hCurrentEdge != hLoopStartEdge);
 
             Debug.Assert(nCurrentEdgeIndex != -1);
             if (nCurrentEdgeIndex == -1)
+            {
                 break;
+            }
 
             var islandHalfEdgeList = new List<HalfEdgeHandle>();
             var islandFullEdgeList = new List<HalfEdgeHandle>();
